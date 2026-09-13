@@ -45,9 +45,15 @@ def load_price_data(whitelist: dict, start: str, end: str, refresh: bool = False
     for code in whitelist:
         cache_path = os.path.join(CACHE_DIR, f"{code}_{start}_{end}.csv")
 
+        df = None
         if not refresh and os.path.exists(cache_path):
             df = pd.read_csv(cache_path, index_col=0, parse_dates=True)
-        else:
+            if "Volume" not in df.columns:
+                # 舊版快取沒有存 Volume 欄位 (量能加權分數需要用到)，強制重新下載
+                print(f"  {code} 的快取是舊格式(缺Volume)，自動重新下載", flush=True)
+                df = None
+
+        if df is None:
             sym = _symbol_for(code)
             print(f"下載 {sym} ({whitelist[code]}) ...", flush=True)
             try:
@@ -58,7 +64,7 @@ def load_price_data(whitelist: dict, start: str, end: str, refresh: bool = False
             if raw is None or raw.empty:
                 print(f"  {sym} 沒有抓到任何資料，略過", flush=True)
                 continue
-            df = raw[["Open", "High", "Low", "Close"]].copy()
+            df = raw[["Open", "High", "Low", "Close", "Volume"]].copy()
             # 統一時區資訊，避免跟後面計算日期時因為 tz-aware/naive 不一致而出錯
             df.index = df.index.tz_localize(None)
             df.to_csv(cache_path)

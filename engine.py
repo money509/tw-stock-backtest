@@ -24,7 +24,34 @@ def compute_atr(df: pd.DataFrame, mode: str, period: int = 14) -> pd.Series:
     return tr.rolling(period).mean()
 
 
-def scan_candidates(price_data: dict, whitelist: dict, as_of_date, atr_mode: str):
+def compute_score(hist: pd.DataFrame, mode: str = "original") -> float:
+    """
+    mode == "original":        原版，只看現價相對5日均線的偏離程度
+    mode == "volume_weighted": 加入成交量權重，量能配合(當日量/20日均量)才給更高分數，
+                                用 min(倍數, 2.0) 封頂，避免單一天爆量把分數推得不合理的高
+    """
+    c_prev = hist["Close"].iloc[-1]
+    ma5 = hist["Close"].rolling(5).mean().iloc[-1]
+    base_score = (c_prev / ma5) * 10
+
+    if mode == "original":
+        return base_score
+    elif mode == "volume_weighted":
+        if "Volume" not in hist.columns:
+            return base_score  # 沒有量能資料時退回原版，避免直接壞掉
+        vol_now = hist["Volume"].iloc[-1]
+        vol_ma20 = hist["Volume"].rolling(20).mean().iloc[-1]
+        if pd.isna(vol_ma20) or vol_ma20 <= 0:
+            vol_ratio = 1.0
+        else:
+            vol_ratio = vol_now / vol_ma20
+        vol_ratio_capped = min(vol_ratio, 2.0)
+        return base_score * vol_ratio_capped
+    else:
+        raise ValueError(f"未知的 score mode: {mode}")
+
+
+def scan_candidates(price_data: dict, whitelist: dict, as_of_date, atr_mode: str, score_mode: str = "original"):
     """
     複製 main.py run_engine() 裡的選股邏輯：
     用「as_of_date 之前」的資料 (不含當天，模擬開盤前掃描)，找出符合多頭排列條件的候選股，
@@ -52,7 +79,7 @@ def scan_candidates(price_data: dict, whitelist: dict, as_of_date, atr_mode: str
         if pd.isna(atr) or atr <= 0:
             continue
 
-        score = (c_prev / ma5) * 10
+        score = compute_score(hist, score_mode)
         candidates.append({
             "code": code,
             "name": name,
@@ -82,12 +109,14 @@ def try_enter(price_data: dict, candidates: list, entry_date):
         if gap_pct > -0.005:
             e_price = open_p
             atr = cand["atr"]
+            sl_price = e_price - 0.8 * atr
             return {
                 "code": cand["code"],
                 "name": cand["name"],
                 "entry_date": entry_date,
                 "e_price": e_price,
-                "sl_price": e_price - 0.8 * atr,
+                "sl_price": sl_price,
+                "sl_price_initial": sl_price,  # 保留最初的停損價，t1觸發後sl_price會被移到保本價，這欄不會變動
                 "t1_price": e_price + 1.0 * atr,
                 "t2_price": e_price + 1.6 * atr,
                 "pos_stage": 1,
@@ -117,17 +146,19 @@ def check_day_exit(row, position):
     return None, None
 
 
-def run_backtest(price_data: dict, whitelist: dict, master_calendar: pd.DatetimeIndex, atr_mode: str):
+def run_backtest(price_data: dict, whitelist: dict, master_calendar: pd.DatetimeIndex,
+                  atr_mode: str, score_mode: str = "original"):
     """
     完整 day-by-day walk-forward 模擬，一次只持有一個部位（跟production一致）。
-    回傳交易紀錄列表，每筆交易包含進出場日期、標的、總報酬率(以%表示，已加權平均2口)。
+    回傳交易紀錄列表，每筆交易包含進出場日期、標的、總報酬率(以%表示，已加權平均2口)，
+    以及供後續套用不同部位大小規則重新計算損益用的分腿明細。
     """
     trades = []
     position = None
 
     for date in master_calendar:
         if position is None:
-            candidates = scan_candidates(price_data, whitelist, date, atr_mode)
+            candidates = scan_candidates(price_data, whitelist, date, atr_mode, score_mode)
             if candidates:
                 position = try_enter(price_data, candidates, date)
                 if position is not None:
@@ -153,21 +184,31 @@ def run_backtest(price_data: dict, whitelist: dict, master_calendar: pd.Datetime
 
 
 def _close_trade(position, exit_price, exit_reason, date, trades):
-    """統一結算一筆交易並寫入 trades 清單。"""
+    """統一結算一筆交易並寫入 trades 清單。
+    保留 return_pct (沿用原本固定2口、50/50加權的定義，維持跟舊版compare.py相容)，
+    同時額外記錄 leg1/leg2 分腿明細跟最初停損價，供之後套用不同部位大小規則重新計算損益。
+    """
     e_price = position["e_price"]
-    if position["pos_stage"] == 1:
+    leg1_hit = position["pos_stage"] == 2
+
+    if not leg1_hit:
         # 從沒到過第一階段目標，2口在同一價位一起出場
         total_return = (exit_price - e_price) / e_price
+        leg1_exit_price = None
     else:
         # 第一口已在 t1 出場 (leg1_return)，這裡結算第二口 (leg2)，兩口各佔一半權重
         leg1_return = position["leg1_return"]
         leg2_return = (exit_price - e_price) / e_price
         total_return = 0.5 * leg1_return + 0.5 * leg2_return
+        leg1_exit_price = position["t1_price"]
 
     trades.append({
         "code": position["code"], "name": position["name"],
         "entry_date": position["entry_date"], "exit_date": date,
         "e_price": e_price, "exit_price": exit_price,
+        "sl_price_initial": position["sl_price_initial"],
+        "leg1_hit": leg1_hit, "leg1_exit_price": leg1_exit_price,
+        "leg2_exit_price": exit_price,
         "exit_reason": exit_reason, "return_pct": total_return,
         "hold_days": position["hold_days"],
     })
@@ -199,12 +240,16 @@ def _process_day(position, row, date, trades):
     return position
 
 
-def summarize(trades: list) -> dict:
+def summarize(trades: list, starting_capital: float = None) -> dict:
     if not trades:
-        return {
+        base = {
             "trade_count": 0, "win_rate": 0.0, "avg_return_pct": 0.0,
             "cumulative_return_pct": 0.0, "max_drawdown_pct": 0.0,
         }
+        if starting_capital is not None:
+            base.update({"total_pnl_ntd": 0.0, "max_drawdown_ntd": 0.0})
+        return base
+
     returns = [t["return_pct"] for t in trades]
     wins = [r for r in returns if r > 0]
 
@@ -216,10 +261,26 @@ def summarize(trades: list) -> dict:
     drawdown = (equity - running_max) / running_max
     max_dd = drawdown.min()
 
-    return {
+    result = {
         "trade_count": len(trades),
         "win_rate": len(wins) / len(trades) * 100,
         "avg_return_pct": float(np.mean(returns)) * 100,
         "cumulative_return_pct": (equity[-1] - 1) * 100,
         "max_drawdown_pct": max_dd * 100,
     }
+
+    # 如果交易紀錄有經過 sizing.apply_sizing() 處理過 (含 pnl_ntd)，額外算金額口徑的統計，
+    # 這個口徑對「風險動態調整口數」的組合比較有意義，因為它反映了實際部位大小放大/縮小的效果
+    if starting_capital is not None and "pnl_ntd" in trades[0]:
+        pnl_list = [t["pnl_ntd"] for t in trades]
+        cum_equity_ntd = [starting_capital]
+        for p in pnl_list:
+            cum_equity_ntd.append(cum_equity_ntd[-1] + p)
+        cum_equity_ntd = np.array(cum_equity_ntd)
+        running_max_ntd = np.maximum.accumulate(cum_equity_ntd)
+        dd_ntd = (cum_equity_ntd - running_max_ntd)
+        result["total_pnl_ntd"] = float(sum(pnl_list))
+        result["max_drawdown_ntd"] = float(dd_ntd.min())
+        result["ending_equity_ntd"] = float(cum_equity_ntd[-1])
+
+    return result
