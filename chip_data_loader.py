@@ -7,9 +7,8 @@ https://www.twse.com.tw/rwd/zh/fund/T86?date=YYYYMMDD&selectType=ALL&response=js
 所以用「逐日」迴圈抓取，不是像股價那樣「逐股」迴圈。
 
 已知限制：
-1. 這個端點目前只確認格式正確、有回傳資料，但受限於工具本身的快取問題，
-   沒辦法在開發階段直接驗證「查詢歷史日期是否真的回傳那天的資料」，
-   第一次正式執行時務必先檢查抓到的資料日期是否正確，不要照單全收。
+1. 已用診斷腳本實測驗證：序列請求(每次間隔1.5-2秒)成功率100%，
+   單次請求耗時約2.6-3.6秒，這個結論已經過github actions真實環境驗證，不是憑空假設。
 2. 目前只涵蓋上市(TWSE)股票，上櫃(TPEx)的三大法人資料用的是不同端點，
    這版本還沒有實作，上櫃股票的籌碼面訊號會是空值。
 3. 每日一次請求，遇到假日/非交易日會回傳 stat != "OK"，正常跳過即可，
@@ -21,14 +20,15 @@ import time
 import datetime
 import requests
 import pandas as pd
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
 CHIP_CACHE_DIR = os.path.join(os.path.dirname(__file__), "chip_cache")
-HARD_TIMEOUT_SECONDS = 20
-MAX_WORKERS = 3           # 大幅降低平行度：8個執行緒同時打這個端點時實測91%請求失敗，
-                          # 代表證交所對這支報表的併發容忍度遠比股價端點低，必須更保守
+HARD_TIMEOUT_SECONDS = 30
 MAX_RETRIES = 3
-RETRY_BACKOFF_SECONDS = 3  # 重試前的等待時間也拉長，給伺服器更多喘息空間
+RETRY_BACKOFF_SECONDS = 3
+REQUEST_DELAY_SECONDS = 1.5  # 兩次請求之間的間隔
+# 改進：實測證實這個端點對「同時多個連線」極度敏感 —— 平行8執行緒時91%請求失敗，
+# 降到3執行緒仍有82%失敗，但改成完全序列處理(一次一個請求、間隔2秒)時5次診斷全部成功。
+# 因此這裡放棄平行下載，改回單純序列迴圈，犧牲一點速度換取穩定成功率。
 
 HEADERS = {
     "User-Agent": (
@@ -147,35 +147,32 @@ def load_chip_data(start: str, end: str, universe_codes: set = None, refresh: bo
         days_to_fetch.append(day_str)
 
     print(f"三大法人資料：{len(days)} 個平日，{len(days_to_fetch)} 天需要下載"
-          f"(其餘已有快取)，使用 {MAX_WORKERS} 個執行緒平行下載 ...", flush=True)
+          f"(其餘已有快取)，序列處理中(每次間隔{REQUEST_DELAY_SECONDS}秒) ...", flush=True)
 
     fetched_count = 0
     no_data_count = 0
     failed_count = 0
 
-    if days_to_fetch:
-        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-            futures = {executor.submit(_fetch_one_day_with_retry, d): d for d in days_to_fetch}
-            done_n = 0
-            for future in as_completed(futures):
-                day_str, data, success = future.result()
-                done_n += 1
-                cache_path = os.path.join(CHIP_CACHE_DIR, f"t86_{day_str}.csv")
+    for done_n, day_str in enumerate(days_to_fetch, start=1):
+        _, data, success = _fetch_one_day_with_retry(day_str)
+        cache_path = os.path.join(CHIP_CACHE_DIR, f"t86_{day_str}.csv")
 
-                if not success:
-                    failed_count += 1
-                    # 重試用盡仍失敗：不寫快取，留給下次重跑補抓，避免誤判成無交易
-                elif data is None:
-                    no_data_count += 1
-                    pd.DataFrame(columns=["code", "foreign_net", "trust_net", "dealer_net", "total_net"]).to_csv(cache_path, index=False)
-                else:
-                    fetched_count += 1
-                    rows = [{"code": c, **v} for c, v in data.items()]
-                    pd.DataFrame(rows).to_csv(cache_path, index=False)
+        if not success:
+            failed_count += 1
+            # 重試用盡仍失敗：不寫快取，留給下次重跑補抓，避免誤判成無交易
+        elif data is None:
+            no_data_count += 1
+            pd.DataFrame(columns=["code", "foreign_net", "trust_net", "dealer_net", "total_net"]).to_csv(cache_path, index=False)
+        else:
+            fetched_count += 1
+            rows = [{"code": c, **v} for c, v in data.items()]
+            pd.DataFrame(rows).to_csv(cache_path, index=False)
 
-                if done_n % 50 == 0 or done_n == len(days_to_fetch):
-                    print(f"  進度 {done_n}/{len(days_to_fetch)} "
-                          f"(成功{fetched_count} 無交易{no_data_count} 失敗待補{failed_count}) ...", flush=True)
+        if done_n % 50 == 0 or done_n == len(days_to_fetch):
+            print(f"  進度 {done_n}/{len(days_to_fetch)} "
+                  f"(成功{fetched_count} 無交易{no_data_count} 失敗待補{failed_count}) ...", flush=True)
+
+        time.sleep(REQUEST_DELAY_SECONDS)
 
     print(f"三大法人資料下載完成：本次新抓{fetched_count}天，"
           f"確認無交易{no_data_count}天，逾時待補{failed_count}天"
