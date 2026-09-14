@@ -64,18 +64,29 @@ def main():
     os.makedirs(RESULTS_DIR, exist_ok=True)
 
     universe = dict(STOCK_FUTURES_UNIVERSE)
+    INDEX_PROXY_CODE = "2330"
     if args.max_stocks > 0:
         universe = dict(list(universe.items())[: args.max_stocks])
+        # 確保大盤氛圍代理指標一定會被下載到，不會因為max_stocks截斷排序而漏掉
+        if INDEX_PROXY_CODE not in universe:
+            universe[INDEX_PROXY_CODE] = STOCK_FUTURES_UNIVERSE[INDEX_PROXY_CODE]
 
     print(f"下載/讀取歷史資料 ({args.start} ~ {args.end})，共 {len(universe)} 檔標的 ...")
     price_data = load_price_data(universe, args.start, args.end, refresh=args.refresh)
     print(f"成功取得 {len(price_data)} / {len(universe)} 檔股票的資料")
 
-    print("下載大盤氛圍代理指標 (0050.TW) ...")
-    index_data = load_price_data({"0050": {"otc": False}}, args.start, args.end, refresh=args.refresh)
-    if "0050" not in index_data:
-        raise RuntimeError("無法取得0050.TW資料，大盤氛圍濾網無法運作，請檢查網路連線")
-    index_df = index_data["0050"]
+    # 改進：不再另外發送一次對 0050 的下載請求 (這個額外請求被證實會卡住，
+    # 兩次不同的逾時修正方式都沒能解決，很可能是yfinance目前版本用的底層網路函式庫
+    # 沒有遵守Python層級設定的逾時所致)。
+    # 直接重複使用剛剛已經下載成功的台積電(2330)資料當大盤氛圍代理指標——
+    # 台積電是加權指數權重最大的成分股，用它的中長期均線位置近似大盤趨勢是合理的做法，
+    # 而且完全不需要多發一次下載請求，從根源上避開這個卡住的問題。
+    if INDEX_PROXY_CODE not in price_data:
+        raise RuntimeError(
+            f"大盤氛圍代理指標 {INDEX_PROXY_CODE} 沒有成功下載，無法繼續。"
+            f"請確認 --max-stocks 有涵蓋到這檔，或改用其他已確認能下載成功的高流動性股票代碼。"
+        )
+    index_df = price_data[INDEX_PROXY_CODE]
 
     master_calendar = index_df.index
     is_calendar, oos_calendar = split_is_oos(master_calendar)
