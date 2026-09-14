@@ -24,9 +24,11 @@ import pandas as pd
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 CHIP_CACHE_DIR = os.path.join(os.path.dirname(__file__), "chip_cache")
-HARD_TIMEOUT_SECONDS = 15
-MAX_WORKERS = 8          # 平行下載的執行緒數，加速用
-MAX_RETRIES = 2          # 請求失敗(非"確認無交易")時的重試次數
+HARD_TIMEOUT_SECONDS = 20
+MAX_WORKERS = 3           # 大幅降低平行度：8個執行緒同時打這個端點時實測91%請求失敗，
+                          # 代表證交所對這支報表的併發容忍度遠比股價端點低，必須更保守
+MAX_RETRIES = 3
+RETRY_BACKOFF_SECONDS = 3  # 重試前的等待時間也拉長，給伺服器更多喘息空間
 
 HEADERS = {
     "User-Agent": (
@@ -97,7 +99,7 @@ def _fetch_one_day_with_retry(day_str: str):
             return day_str, data, True
         except FetchFailed:
             if attempt < MAX_RETRIES:
-                time.sleep(1.5)
+                time.sleep(RETRY_BACKOFF_SECONDS)
                 continue
             return day_str, None, False
     return day_str, None, False
@@ -117,12 +119,18 @@ def _trading_days_between(start: str, end: str) -> list:
     return days
 
 
-def load_chip_data(start: str, end: str, refresh: bool = False) -> dict:
+def load_chip_data(start: str, end: str, universe_codes: set = None, refresh: bool = False) -> dict:
     """
     回傳 {code: DataFrame(foreign_net, trust_net, dealer_net, total_net, index=日期)}。
     每天的原始資料會快取成一個小檔案，重複執行不會重新打API。
     改用多執行緒平行下載加速；確認無交易(國定假日等)才會快取空白標記，
     請求逾時/失敗的日子不會被誤存成空白，會保留到下次重跑時自動補抓。
+
+    universe_codes: 只保留這個集合裡的股票代碼(建議傳入 taifex_universe.STOCK_FUTURES_UNIVERSE 的 keys())。
+    重要：證交所這份報表(selectType=ALL)預設包含權證、牛熊證等所有證券類型的買賣超資料，
+    不是只有普通股，代碼格式一樣是純數字，如果不過濾，會混進成千上萬筆完全不相關的雜訊
+    (實測曾經在3年期間混入超過4萬6千個不同代碼，全市場實際股票數不到2000檔就知道有多誇張)。
+    傳入 universe_codes=None 會保留全部代碼(不建議，僅供偵錯或特殊用途)。
     """
     os.makedirs(CHIP_CACHE_DIR, exist_ok=True)
     days = _trading_days_between(start, end)
@@ -187,6 +195,8 @@ def load_chip_data(start: str, end: str, refresh: bool = False) -> dict:
         date_ts = pd.Timestamp(datetime.datetime.strptime(day_str, "%Y%m%d"))
         for _, row in day_df.iterrows():
             code = str(row["code"])
+            if universe_codes is not None and code not in universe_codes:
+                continue  # 過濾掉權證/牛熊證等不在股票期貨標的清單裡的雜訊代碼
             per_stock_records.setdefault(code, []).append({
                 "date": date_ts,
                 "foreign_net": row["foreign_net"],

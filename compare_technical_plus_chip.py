@@ -68,7 +68,7 @@ def main():
     master_calendar = index_df.index
 
     print("\n下載三大法人籌碼面資料 (這步驟是逐日抓取，可能需要一些時間) ...")
-    chip_data = load_chip_data(args.start, args.end, refresh=args.refresh)
+    chip_data = load_chip_data(args.start, args.end, universe_codes=set(universe.keys()), refresh=args.refresh)
     print(f"取得 {len(chip_data)} 檔股票的籌碼面資料\n")
 
     print("預先計算技術指標與籌碼面連續天數 ...")
