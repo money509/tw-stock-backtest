@@ -2,23 +2,13 @@
 負責從 yfinance 下載歷史股價，並快取成本機 CSV 檔，避免每次跑回測都重新下載。
 """
 import os
-import socket
 import time
 import pandas as pd
 import yfinance as yf
 
 CACHE_DIR = os.path.join(os.path.dirname(__file__), "data_cache")
-REQUEST_DELAY_SECONDS = 0.6   # 每檔下載之間刻意停頓，降低被Yahoo判定異常流量而卡住/擋掉的機率
-HARD_TIMEOUT_SECONDS = 20     # socket底層逾時秒數
-
-# 改進：直接在socket底層設定逾時上限，取代原本用ThreadPoolExecutor包一層的做法。
-# 原本那個做法有個沒考慮到的問題：如果背景執行緒真的卡死(例如卡在等待網路回應)，
-# Python沒辦法從外部真正強制殺掉一個執行緒，只能「不等它」，但底層那個卡住的連線本身
-# 還是會維持逾時前的狀態，且在某些環境下反而拖慢後續其他次呼叫。
-# 用socket.setdefaulttimeout()是更底層、更可靠的做法：任何用到socket的網路連線
-# (包括yfinance內部去跟Yahoo要驗證cookie的那一步)，只要卡超過這個秒數就會直接
-# 拋出逾時例外，讓程式能確實接住並跳過，不會被卡死。
-socket.setdefaulttimeout(HARD_TIMEOUT_SECONDS)
+BATCH_SIZE = 30                # 每批一次打包幾檔股票一起下載
+BATCH_DELAY_SECONDS = 3        # 每批之間的間隔，避免仍然觸發限速
 
 # 上櫃標的清單 (Yahoo Finance 需要用 .TWO 後綴)
 # 已查證：目前 whitelist 中只有雙鴻(3324)、台燿(6274) 為上櫃股，其餘皆為上市股 (.TW)
@@ -55,64 +45,90 @@ def _symbol_for(code: str, entry=None) -> str:
     return f"{code}{suffix}"
 
 
-def _fetch_with_timeout(sym: str, start: str, end: str):
-    """單純呼叫yfinance，依賴模組層級設定的socket.setdefaulttimeout()在網路卡住時自動拋出例外。"""
-    try:
-        return yf.Ticker(sym).history(start=start, end=end, interval="1d")
-    except Exception as e:
-        print(f"  下載過程發生例外(可能是逾時): {e}", flush=True)
-        return None
-
-
 def load_price_data(whitelist: dict, start: str, end: str, refresh: bool = False) -> dict:
     """
-    回傳 {code: DataFrame(Open, High, Low, Close, index=日期)}。
+    回傳 {code: DataFrame(Open, High, Low, Close, Volume, index=日期)}。
     有本機快取，重複執行不會一直打 yfinance。refresh=True 會強制重新下載。
+
+    改進：不再一檔一檔分開請求 (那樣249檔就是249次個別請求，容易在請求200多次後
+    被Yahoo判定為異常流量而卡住/被限速，之前兩次修正逾時的嘗試都沒解決這個根本問題)。
+    改用 yf.download() 一次打包多檔一起下載，大幅減少總請求次數。
     """
     os.makedirs(CACHE_DIR, exist_ok=True)
     price_data = {}
+    to_download = []  # [(code, sym, entry), ...]
 
-    for code in whitelist:
+    for code, entry in whitelist.items():
         cache_path = os.path.join(CACHE_DIR, f"{code}_{start}_{end}.csv")
-
-        df = None
         if not refresh and os.path.exists(cache_path):
-            df = pd.read_csv(cache_path, index_col=0, parse_dates=True)
-            if "Volume" not in df.columns:
-                # 舊版快取沒有存 Volume 欄位 (量能加權分數需要用到)，強制重新下載
-                print(f"  {code} 的快取是舊格式(缺Volume)，自動重新下載", flush=True)
-                df = None
-
-        if df is None:
-            entry = whitelist[code]
-            sym = _symbol_for(code, entry)
-            display_name = entry if isinstance(entry, str) else code
-            print(f"下載 {sym} ({display_name}) ...", flush=True)
-
-            raw = None
-            for attempt in range(2):  # 最多重試1次，避免單一次網路瞬斷就整檔放棄
-                raw = _fetch_with_timeout(sym, start, end)
-                if raw is not None:
-                    break
-                print(f"  第{attempt+1}次嘗試逾時或失敗", flush=True)
-                time.sleep(2)  # 重試前多等一下，給Yahoo端喘息空間
-
-            time.sleep(REQUEST_DELAY_SECONDS)  # 不管成功失敗，都刻意放慢下一檔的請求速度
-
-            if raw is None:
-                print(f"  {sym} 重試後仍失敗/逾時，略過此標的", flush=True)
+            try:
+                cached_df = pd.read_csv(cache_path, index_col=0, parse_dates=True)
+            except Exception:
+                cached_df = None
+            if cached_df is not None and "Volume" in cached_df.columns and not cached_df.empty:
+                price_data[code] = cached_df
                 continue
-            if raw.empty:
-                print(f"  {sym} 沒有抓到任何資料，略過", flush=True)
-                continue
-            df = raw[["Open", "High", "Low", "Close", "Volume"]].copy()
-            # 統一時區資訊，避免跟後面計算日期時因為 tz-aware/naive 不一致而出錯
-            df.index = df.index.tz_localize(None)
-            df.to_csv(cache_path)
+        to_download.append((code, _symbol_for(code, entry), entry))
 
-        if df.empty:
+    if not to_download:
+        print("全部標的都已有快取，不需要下載", flush=True)
+        return price_data
+
+    print(f"需要下載 {len(to_download)} 檔股票，每批 {BATCH_SIZE} 檔批次下載中 ...", flush=True)
+
+    for batch_start in range(0, len(to_download), BATCH_SIZE):
+        batch = to_download[batch_start: batch_start + BATCH_SIZE]
+        batch_syms = [b[1] for b in batch]
+        batch_no = batch_start // BATCH_SIZE + 1
+        print(f"下載第 {batch_no} 批 ({len(batch_syms)}檔)：{batch_syms[0]} ~ {batch_syms[-1]} ...", flush=True)
+
+        raw = None
+        for attempt in range(2):  # 整批最多重試1次
+            try:
+                raw = yf.download(
+                    tickers=batch_syms, start=start, end=end, interval="1d",
+                    group_by="ticker", threads=True, progress=False, auto_adjust=False,
+                )
+                break
+            except Exception as e:
+                print(f"  第{attempt+1}次批次下載發生例外: {e}", flush=True)
+                raw = None
+                time.sleep(3)
+
+        if raw is None or raw.empty:
+            print(f"  第 {batch_no} 批整批失敗，略過這批 {len(batch_syms)} 檔", flush=True)
+            time.sleep(BATCH_DELAY_SECONDS)
             continue
-        price_data[code] = df
+
+        for code, sym, entry in batch:
+            try:
+                if len(batch_syms) == 1:
+                    sub = raw
+                elif sym in set(raw.columns.get_level_values(0)):
+                    sub = raw[sym]
+                else:
+                    print(f"  {sym} 這批結果裡找不到資料，略過", flush=True)
+                    continue
+
+                sub = sub.dropna(how="all")
+                if sub.empty or "Close" not in sub.columns:
+                    print(f"  {sym} 沒有抓到任何資料，略過", flush=True)
+                    continue
+
+                df = sub[["Open", "High", "Low", "Close", "Volume"]].copy()
+                idx = pd.DatetimeIndex(df.index)
+                if idx.tz is not None:
+                    idx = idx.tz_localize(None)
+                df.index = idx
+
+                cache_path = os.path.join(CACHE_DIR, f"{code}_{start}_{end}.csv")
+                df.to_csv(cache_path)
+                price_data[code] = df
+            except Exception as e:
+                print(f"  處理 {sym} 資料時發生錯誤: {e}", flush=True)
+                continue
+
+        time.sleep(BATCH_DELAY_SECONDS)
 
     return price_data
 
