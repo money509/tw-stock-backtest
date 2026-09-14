@@ -56,6 +56,9 @@ def main():
     parser.add_argument("--starting-capital", type=float, default=200_000)
     parser.add_argument("--max-stocks", type=int, default=0,
                          help="限制掃描股票數量(0=全部320檔，測試時可以設小一點加快速度)")
+    parser.add_argument("--rsi-threshold", type=float, default=30,
+                         help="RSI超賣/超買門檻，預設30(對應做空門檻100-30=70)。"
+                              "樣本數太少時可以調寬鬆一點，例如35，增加訊號出現頻率")
     args = parser.parse_args()
 
     os.makedirs(RESULTS_DIR, exist_ok=True)
@@ -95,6 +98,7 @@ def main():
                 price_data, index_df, universe, calendar,
                 max_hold_days=max_hold, starting_capital=args.starting_capital,
                 allow_short=allow_short, lots=2,
+                rsi_long_threshold=args.rsi_threshold, rsi_short_threshold=100 - args.rsi_threshold,
             )
             stats = summarize_mr(trades, args.starting_capital)
             long_short = f"{stats['long_count']}/{stats['short_count']}"

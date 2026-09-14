@@ -90,11 +90,14 @@ def compute_regime(index_df: pd.DataFrame, as_of_date, ma_period: int = 120) -> 
 
 
 def scan_mean_reversion_candidates(price_data: dict, universe: dict, as_of_date,
-                                    regime: str, excluded_codes: set, allow_short: bool = True):
+                                    regime: str, excluded_codes: set, allow_short: bool = True,
+                                    rsi_long_threshold: float = 30, rsi_short_threshold: float = 70):
     """
     掃描全市場候選標的，回傳依「偏離程度」排序的前3名多方候選、前3名空方候選。
     regime == 'bull' 時停用空方訊號；regime == 'bear' 時停用多方訊號；'neutral' 兩者都放行。
     allow_short=False 時，不管regime是什麼，永遠不產生空方候選 (獨立於氛圍濾網的開關)。
+    rsi_long_threshold/rsi_short_threshold 可以調鬆一點(例如35/65)來增加訊號出現頻率，
+    預設30/70是教科書常見門檻。
     """
     long_candidates = []
     short_candidates = []
@@ -122,8 +125,8 @@ def scan_mean_reversion_candidates(price_data: dict, universe: dict, as_of_date,
 
         # 做多：RSI超賣 + 跌破布林下軌 + 仍在60日均線之上
         if regime != "bear":
-            if rsi < 30 and last_close <= lower_v and last_close > ma60:
-                score = 30 - rsi  # 越超賣分數越高
+            if rsi < rsi_long_threshold and last_close <= lower_v and last_close > ma60:
+                score = rsi_long_threshold - rsi  # 越超賣分數越高
                 long_candidates.append({
                     "code": code, "side": "long", "score": score,
                     "c_prev": last_close, "mid": mid_v, "lower": lower_v, "atr": atr,
@@ -131,8 +134,8 @@ def scan_mean_reversion_candidates(price_data: dict, universe: dict, as_of_date,
 
         # 做空：RSI超買 + 站上布林上軌 + 仍在60日均線之下 (allow_short=False時完全不產生空方候選)
         if allow_short and regime != "bull":
-            if rsi > 70 and last_close >= upper_v and last_close < ma60:
-                score = rsi - 70
+            if rsi > rsi_short_threshold and last_close >= upper_v and last_close < ma60:
+                score = rsi - rsi_short_threshold
                 short_candidates.append({
                     "code": code, "side": "short", "score": score,
                     "c_prev": last_close, "mid": mid_v, "upper": upper_v, "atr": atr,
@@ -205,7 +208,8 @@ def check_exit(row, position):
 def run_mean_reversion_backtest(price_data: dict, index_df: pd.DataFrame, universe: dict,
                                  master_calendar: pd.DatetimeIndex, max_hold_days: int,
                                  starting_capital: float, allow_short: bool = True,
-                                 lots: int = 2):
+                                 lots: int = 2, rsi_long_threshold: float = 30,
+                                 rsi_short_threshold: float = 70):
     """
     完整 day-by-day walk-forward 模擬。
     max_hold_days: 短線版建議3-5，中期版建議10-20 (交易日)。
@@ -224,7 +228,8 @@ def run_mean_reversion_backtest(price_data: dict, index_df: pd.DataFrame, univer
 
             regime = compute_regime(index_df, date)
             candidates = scan_mean_reversion_candidates(
-                price_data, universe, date, regime, excluded_codes, allow_short=allow_short
+                price_data, universe, date, regime, excluded_codes, allow_short=allow_short,
+                rsi_long_threshold=rsi_long_threshold, rsi_short_threshold=rsi_short_threshold,
             )
             if candidates:
                 position = try_enter_mean_reversion(price_data, candidates, date, starting_capital, lots)

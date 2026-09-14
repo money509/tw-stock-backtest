@@ -66,12 +66,21 @@ def load_price_data(whitelist: dict, start: str, end: str, refresh: bool = False
             sym = _symbol_for(code, entry)
             display_name = entry if isinstance(entry, str) else code
             print(f"下載 {sym} ({display_name}) ...", flush=True)
-            try:
-                raw = yf.Ticker(sym).history(start=start, end=end, interval="1d")
-            except Exception as e:
-                print(f"  下載失敗: {e}", flush=True)
+
+            raw = None
+            for attempt in range(2):  # 最多重試1次，避免單一次網路瞬斷就整檔放棄
+                try:
+                    # 改進：明確設定逾時秒數，避免Yahoo端沒回應時整個流程卡死不動
+                    ticker = yf.Ticker(sym)
+                    raw = ticker.history(start=start, end=end, interval="1d", timeout=20)
+                    break
+                except Exception as e:
+                    print(f"  第{attempt+1}次嘗試失敗: {e}", flush=True)
+                    raw = None
+            if raw is None:
+                print(f"  {sym} 重試後仍失敗，略過此標的", flush=True)
                 continue
-            if raw is None or raw.empty:
+            if raw.empty:
                 print(f"  {sym} 沒有抓到任何資料，略過", flush=True)
                 continue
             df = raw[["Open", "High", "Low", "Close", "Volume"]].copy()
