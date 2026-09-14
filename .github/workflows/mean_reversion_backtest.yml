@@ -19,10 +19,6 @@ on:
         description: '限制掃描股票數量，0代表全部320檔(第一次測試建議先設50，跑比較快)'
         required: false
         default: '50'
-      rsi_threshold:
-        description: 'RSI超賣門檻(做空門檻=100減這個數字)。樣本數太少時可以調寬鬆，例如35'
-        required: false
-        default: '30'
 
 jobs:
   backtest:
@@ -42,9 +38,18 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
+      - name: Restore price data cache
+        uses: actions/cache@v4
+        with:
+          path: data_cache
+          key: price-data-cache-${{ github.run_id }}
+          restore-keys: |
+            price-data-cache-
+
       - name: Run mean reversion backtest
+        timeout-minutes: 90
         run: |
-          ARGS="--starting-capital ${{ github.event.inputs.starting_capital }} --max-stocks ${{ github.event.inputs.max_stocks }} --rsi-threshold ${{ github.event.inputs.rsi_threshold }}"
+          ARGS="--starting-capital ${{ github.event.inputs.starting_capital }} --max-stocks ${{ github.event.inputs.max_stocks }}"
           if [ -n "${{ github.event.inputs.start_date }}" ]; then
             ARGS="$ARGS --start ${{ github.event.inputs.start_date }}"
           fi
