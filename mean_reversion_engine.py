@@ -125,7 +125,8 @@ def _lookup_prior_row(ind_df: pd.DataFrame, as_of_date):
 
 def scan_mean_reversion_candidates(indicators_by_code: dict, as_of_date,
                                     regime: str, excluded_codes: set, allow_short: bool = True,
-                                    rsi_long_threshold: float = 30, rsi_short_threshold: float = 70):
+                                    rsi_long_threshold: float = 30, rsi_short_threshold: float = 70,
+                                    chip_streak_by_code: dict = None, min_chip_confirm_days: int = 0):
     """
     掃描全市場候選標的，回傳依「偏離程度」排序的前3名多方候選、前3名空方候選。
     regime == 'bull' 時停用空方訊號；regime == 'bear' 時停用多方訊號；'neutral' 兩者都放行。
@@ -134,6 +135,13 @@ def scan_mean_reversion_candidates(indicators_by_code: dict, as_of_date,
     預設30/70是教科書常見門檻。
 
     indicators_by_code: {code: precompute_indicators()的結果}，改用查表取代即時計算。
+
+    chip_streak_by_code / min_chip_confirm_days：籌碼面確認條件(可選)。
+    如果有提供 chip_streak_by_code (來自 chip_data_loader.precompute_chip_streak())，
+    且 min_chip_confirm_days > 0，會額外要求：
+    - 做多：外資連續買超天數 >= min_chip_confirm_days (機構籌碼認同這次超跌是機會，不是要崩了)
+    - 做空：外資連續賣超天數 >= min_chip_confirm_days (機構籌碼認同這次超漲是過熱，不是要噴了)
+    沒有籌碼資料的股票，在開啟這個條件時會被直接排除(視為沒有機構確認，保守處理)。
     """
     long_candidates = []
     short_candidates = []
@@ -154,23 +162,53 @@ def scan_mean_reversion_candidates(indicators_by_code: dict, as_of_date,
         if pd.isna(mid_v) or pd.isna(ma60) or pd.isna(atr) or atr <= 0:
             continue
 
-        # 做多：RSI超賣 + 跌破布林下軌 + 仍在60日均線之上
+        chip_streak_val = None
+        if min_chip_confirm_days > 0:
+            if chip_streak_by_code is None or code not in chip_streak_by_code:
+                continue  # 沒有籌碼資料，開啟籌碼確認時直接跳過這檔
+            chip_row, chip_pos = _lookup_prior_row(chip_streak_by_code[code], as_of_date)
+            # chip_streak_by_code[code] 是 precompute_chip_streak() 回傳的 Series (單一數值序列)，
+            # 不是像 indicators_by_code 那樣的 DataFrame，_lookup_prior_row 對 Series 用 iloc 取出的
+            # 直接就是純量數值，不能再呼叫 .iloc[0]，那是DataFrame欄位才需要的取法。
+            chip_streak_val = None if chip_row is None else chip_row
+
+        # 做多：RSI超賣 + 跌破布林下軌 + 仍在60日均線之上 (+可選：外資連續買超確認)
         if regime != "bear":
             if rsi < rsi_long_threshold and last_close <= lower_v and last_close > ma60:
-                score = rsi_long_threshold - rsi  # 越超賣分數越高
-                long_candidates.append({
-                    "code": code, "side": "long", "score": score,
-                    "c_prev": last_close, "mid": mid_v, "lower": lower_v, "upper": upper_v, "atr": atr,
-                })
+                if min_chip_confirm_days > 0:
+                    if chip_streak_val is None or chip_streak_val < min_chip_confirm_days:
+                        pass  # 沒過籌碼確認，不加入候選
+                    else:
+                        score = rsi_long_threshold - rsi
+                        long_candidates.append({
+                            "code": code, "side": "long", "score": score,
+                            "c_prev": last_close, "mid": mid_v, "lower": lower_v, "upper": upper_v, "atr": atr,
+                        })
+                else:
+                    score = rsi_long_threshold - rsi
+                    long_candidates.append({
+                        "code": code, "side": "long", "score": score,
+                        "c_prev": last_close, "mid": mid_v, "lower": lower_v, "upper": upper_v, "atr": atr,
+                    })
 
-        # 做空：RSI超買 + 站上布林上軌 + 仍在60日均線之下 (allow_short=False時完全不產生空方候選)
+        # 做空：RSI超買 + 站上布林上軌 + 仍在60日均線之下 (+可選：外資連續賣超確認)
         if allow_short and regime != "bull":
             if rsi > rsi_short_threshold and last_close >= upper_v and last_close < ma60:
-                score = rsi - rsi_short_threshold
-                short_candidates.append({
-                    "code": code, "side": "short", "score": score,
-                    "c_prev": last_close, "mid": mid_v, "upper": upper_v, "lower": lower_v, "atr": atr,
-                })
+                if min_chip_confirm_days > 0:
+                    if chip_streak_val is None or chip_streak_val > -min_chip_confirm_days:
+                        pass
+                    else:
+                        score = rsi - rsi_short_threshold
+                        short_candidates.append({
+                            "code": code, "side": "short", "score": score,
+                            "c_prev": last_close, "mid": mid_v, "upper": upper_v, "lower": lower_v, "atr": atr,
+                        })
+                else:
+                    score = rsi - rsi_short_threshold
+                    short_candidates.append({
+                        "code": code, "side": "short", "score": score,
+                        "c_prev": last_close, "mid": mid_v, "upper": upper_v, "lower": lower_v, "atr": atr,
+                    })
 
     long_candidates.sort(key=lambda x: x["score"], reverse=True)
     short_candidates.sort(key=lambda x: x["score"], reverse=True)
@@ -259,12 +297,14 @@ def run_mean_reversion_backtest(price_data: dict, indicators_by_code: dict, regi
                                  master_calendar: pd.DatetimeIndex, max_hold_days: int,
                                  starting_capital: float, allow_short: bool = True,
                                  lots: int = 2, rsi_long_threshold: float = 30,
-                                 rsi_short_threshold: float = 70, target_mode: str = "mid_band"):
+                                 rsi_short_threshold: float = 70, target_mode: str = "mid_band",
+                                 chip_streak_by_code: dict = None, min_chip_confirm_days: int = 0):
     """
     完整 day-by-day walk-forward 模擬。
     max_hold_days: 短線版建議3-5，中期版建議10-20，長版可測30 (交易日)。
     allow_short=False 時只做多，等同long-only版本。
     target_mode: "mid_band"(回中軌，保守) 或 "opposite_band"(回對側軌道，更有企圖心)。
+    chip_streak_by_code/min_chip_confirm_days: 可選的籌碼面確認條件，見 scan_mean_reversion_candidates 說明。
 
     indicators_by_code/regime_series 改成外部預先算好傳進來 (見 precompute_all_indicators /
     precompute_regime_series)，因為這兩者不受這次呼叫的參數影響，
@@ -285,6 +325,7 @@ def run_mean_reversion_backtest(price_data: dict, indicators_by_code: dict, regi
             candidates = scan_mean_reversion_candidates(
                 indicators_by_code, date, regime, excluded_codes, allow_short=allow_short,
                 rsi_long_threshold=rsi_long_threshold, rsi_short_threshold=rsi_short_threshold,
+                chip_streak_by_code=chip_streak_by_code, min_chip_confirm_days=min_chip_confirm_days,
             )
             if candidates:
                 position = try_enter_mean_reversion(
