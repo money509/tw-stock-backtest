@@ -12,17 +12,21 @@ https://www.twse.com.tw/rwd/zh/fund/T86?date=YYYYMMDD&selectType=ALL&response=js
    第一次正式執行時務必先檢查抓到的資料日期是否正確，不要照單全收。
 2. 目前只涵蓋上市(TWSE)股票，上櫃(TPEx)的三大法人資料用的是不同端點，
    這版本還沒有實作，上櫃股票的籌碼面訊號會是空值。
-3. 每日一次請求，遇到假日/非交易日會回傳 stat != "OK"，正常跳過即可。
+3. 每日一次請求，遇到假日/非交易日會回傳 stat != "OK"，正常跳過即可，
+   這跟「請求逾時/失敗」是兩件不同的事，必須分開處理(見下方重試邏輯)，
+   否則逾時的交易日會被誤存成「沒有資料」，永久遺失那天的真實資料。
 """
 import os
 import time
 import datetime
 import requests
 import pandas as pd
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 CHIP_CACHE_DIR = os.path.join(os.path.dirname(__file__), "chip_cache")
-REQUEST_DELAY_SECONDS = 0.5
 HARD_TIMEOUT_SECONDS = 15
+MAX_WORKERS = 8          # 平行下載的執行緒數，加速用
+MAX_RETRIES = 2          # 請求失敗(非"確認無交易")時的重試次數
 
 HEADERS = {
     "User-Agent": (
@@ -46,11 +50,17 @@ def _parse_int(s: str) -> int:
         return 0
 
 
-def fetch_t86_day(date_str: str) -> dict:
+class FetchFailed(Exception):
+    """代表這次請求本身失敗(逾時/連線錯誤)，跟「查到stat!=OK的確認無交易」要分開處理，
+    前者應該重試，後者不該重試(是正常的休市日)。"""
+    pass
+
+
+def fetch_t86_day(date_str: str):
     """
     抓取單一天的三大法人買賣超資料。
-    回傳 {code: {"foreign_net":, "trust_net":, "dealer_net":, "total_net":}}，
-    非交易日或查無資料時回傳空dict。
+    回傳 dict {code: {...}} 代表有資料；回傳 None 代表「確認當天無交易」(stat!=OK)；
+    request本身失敗時丟出 FetchFailed，由呼叫端決定要不要重試。
     """
     url = "https://www.twse.com.tw/rwd/zh/fund/T86"
     params = {"date": date_str, "selectType": "ALL", "response": "json"}
@@ -58,11 +68,10 @@ def fetch_t86_day(date_str: str) -> dict:
         resp = requests.get(url, params=params, headers=HEADERS, timeout=HARD_TIMEOUT_SECONDS)
         payload = resp.json()
     except Exception as e:
-        print(f"  {date_str} 三大法人資料抓取失敗: {e}", flush=True)
-        return {}
+        raise FetchFailed(str(e))
 
     if payload.get("stat") != "OK":
-        return {}  # 非交易日或當天查無資料，正常情況，不算錯誤
+        return None  # 確認是非交易日/查無資料，不是請求失敗，不用重試
 
     result = {}
     for row in payload.get("data", []):
@@ -76,6 +85,22 @@ def fetch_t86_day(date_str: str) -> dict:
             "total_net": _parse_int(row[COL_TOTAL_NET]),
         }
     return result
+
+
+def _fetch_one_day_with_retry(day_str: str):
+    """幫單一天套上重試邏輯，回傳 (day_str, data_dict_or_None, success_bool)。
+    success_bool=False 代表重試用盡仍失敗，呼叫端不該把這天當成「確認無交易」快取起來，
+    應該留到下次重跑再試，避免真實資料被永久誤判成空白。"""
+    for attempt in range(MAX_RETRIES + 1):
+        try:
+            data = fetch_t86_day(day_str)
+            return day_str, data, True
+        except FetchFailed:
+            if attempt < MAX_RETRIES:
+                time.sleep(1.5)
+                continue
+            return day_str, None, False
+    return day_str, None, False
 
 
 def _trading_days_between(start: str, end: str) -> list:
@@ -96,56 +121,79 @@ def load_chip_data(start: str, end: str, refresh: bool = False) -> dict:
     """
     回傳 {code: DataFrame(foreign_net, trust_net, dealer_net, total_net, index=日期)}。
     每天的原始資料會快取成一個小檔案，重複執行不會重新打API。
+    改用多執行緒平行下載加速；確認無交易(國定假日等)才會快取空白標記，
+    請求逾時/失敗的日子不會被誤存成空白，會保留到下次重跑時自動補抓。
     """
     os.makedirs(CHIP_CACHE_DIR, exist_ok=True)
     days = _trading_days_between(start, end)
 
     per_stock_records = {}  # code -> list of (date, dict)
+    days_to_fetch = []      # 還沒有快取(或明確標記過)、需要真的發請求的日期
 
-    print(f"下載三大法人買賣超資料，共 {len(days)} 個平日要檢查 ...", flush=True)
-    fetched_count = 0
-    skipped_count = 0
+    NO_DATA_MARKER = "__NO_DATA__"
 
-    for i, day_str in enumerate(days):
+    for day_str in days:
         cache_path = os.path.join(CHIP_CACHE_DIR, f"t86_{day_str}.csv")
-
         if not refresh and os.path.exists(cache_path):
-            try:
-                day_df = pd.read_csv(cache_path, dtype={"code": str})
-            except Exception:
-                day_df = None
-        else:
-            day_df = None
+            continue  # 已經有快取(不管是有資料還是確認無交易的標記檔)，不用重抓
+        days_to_fetch.append(day_str)
 
-        if day_df is None:
-            day_data = fetch_t86_day(day_str)
-            if day_data:
-                rows = [{"code": c, **v} for c, v in day_data.items()]
-                day_df = pd.DataFrame(rows)
-                day_df.to_csv(cache_path, index=False)
-                fetched_count += 1
-            else:
-                skipped_count += 1
-                # 建一個空檔案當作「這天已經檢查過、確定沒有資料」的標記，避免下次重跑又重新打一次API
-                pd.DataFrame(columns=["code", "foreign_net", "trust_net", "dealer_net", "total_net"]).to_csv(cache_path, index=False)
-            time.sleep(REQUEST_DELAY_SECONDS)
+    print(f"三大法人資料：{len(days)} 個平日，{len(days_to_fetch)} 天需要下載"
+          f"(其餘已有快取)，使用 {MAX_WORKERS} 個執行緒平行下載 ...", flush=True)
 
-        if day_df is not None and not day_df.empty:
-            date_ts = pd.Timestamp(datetime.datetime.strptime(day_str, "%Y%m%d"))
-            for _, row in day_df.iterrows():
-                code = str(row["code"])
-                per_stock_records.setdefault(code, []).append({
-                    "date": date_ts,
-                    "foreign_net": row["foreign_net"],
-                    "trust_net": row["trust_net"],
-                    "dealer_net": row["dealer_net"],
-                    "total_net": row["total_net"],
-                })
+    fetched_count = 0
+    no_data_count = 0
+    failed_count = 0
 
-        if (i + 1) % 50 == 0:
-            print(f"  進度 {i+1}/{len(days)} ...", flush=True)
+    if days_to_fetch:
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+            futures = {executor.submit(_fetch_one_day_with_retry, d): d for d in days_to_fetch}
+            done_n = 0
+            for future in as_completed(futures):
+                day_str, data, success = future.result()
+                done_n += 1
+                cache_path = os.path.join(CHIP_CACHE_DIR, f"t86_{day_str}.csv")
 
-    print(f"三大法人資料下載完成：成功{fetched_count}天，無資料(假日等){skipped_count}天", flush=True)
+                if not success:
+                    failed_count += 1
+                    # 重試用盡仍失敗：不寫快取，留給下次重跑補抓，避免誤判成無交易
+                elif data is None:
+                    no_data_count += 1
+                    pd.DataFrame(columns=["code", "foreign_net", "trust_net", "dealer_net", "total_net"]).to_csv(cache_path, index=False)
+                else:
+                    fetched_count += 1
+                    rows = [{"code": c, **v} for c, v in data.items()]
+                    pd.DataFrame(rows).to_csv(cache_path, index=False)
+
+                if done_n % 50 == 0 or done_n == len(days_to_fetch):
+                    print(f"  進度 {done_n}/{len(days_to_fetch)} "
+                          f"(成功{fetched_count} 無交易{no_data_count} 失敗待補{failed_count}) ...", flush=True)
+
+    print(f"三大法人資料下載完成：本次新抓{fetched_count}天，"
+          f"確認無交易{no_data_count}天，逾時待補{failed_count}天"
+          f"{'（下次重跑會自動補抓這些天）' if failed_count else ''}", flush=True)
+
+    # ---- 讀取全部快取(含這次新抓的+之前就有的)，組成最終結果 ----
+    for day_str in days:
+        cache_path = os.path.join(CHIP_CACHE_DIR, f"t86_{day_str}.csv")
+        if not os.path.exists(cache_path):
+            continue  # 逾時待補的日子，這次先跳過
+        try:
+            day_df = pd.read_csv(cache_path, dtype={"code": str})
+        except Exception:
+            continue
+        if day_df.empty:
+            continue
+        date_ts = pd.Timestamp(datetime.datetime.strptime(day_str, "%Y%m%d"))
+        for _, row in day_df.iterrows():
+            code = str(row["code"])
+            per_stock_records.setdefault(code, []).append({
+                "date": date_ts,
+                "foreign_net": row["foreign_net"],
+                "trust_net": row["trust_net"],
+                "dealer_net": row["dealer_net"],
+                "total_net": row["total_net"],
+            })
 
     chip_data = {}
     for code, records in per_stock_records.items():
