@@ -74,22 +74,56 @@ def is_near_settlement(date, days_before: int = 2) -> bool:
     return 0 <= days_to_settlement <= days_before
 
 
-def compute_regime(index_df: pd.DataFrame, as_of_date, ma_period: int = 120) -> str:
+def precompute_regime_series(index_df: pd.DataFrame, ma_period: int = 120) -> pd.DataFrame:
+    """把大盤代理指標的長期均線只算一次，避免day-by-day迴圈裡重複rolling運算。"""
+    ma = index_df["Close"].rolling(ma_period).mean()
+    return pd.DataFrame({"Close": index_df["Close"], "MA": ma}, index=index_df.index)
+
+
+def compute_regime(regime_series: pd.DataFrame, as_of_date) -> str:
     """
-    回傳 'bull' / 'bear'，依大盤代理指標 (預設0050) 相對長期均線的位置判斷。
+    回傳 'bull' / 'bear'，依大盤代理指標 (預設2330) 相對長期均線的位置判斷。
     找不到足夠資料時回傳 'neutral'，此時多空訊號都正常放行(不縮小也不停用)。
+    regime_series 是 precompute_regime_series() 預先算好的結果，這裡只做查表。
     """
-    hist = index_df[index_df.index < as_of_date]
-    if len(hist) < ma_period:
+    row, pos = _lookup_prior_row(regime_series, as_of_date)
+    if row is None or pd.isna(row["MA"]):
         return "neutral"
-    ma = hist["Close"].rolling(ma_period).mean().iloc[-1]
-    last_close = hist["Close"].iloc[-1]
-    if pd.isna(ma):
-        return "neutral"
-    return "bull" if last_close > ma else "bear"
+    return "bull" if row["Close"] > row["MA"] else "bear"
 
 
-def scan_mean_reversion_candidates(price_data: dict, universe: dict, as_of_date,
+def precompute_indicators(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    針對一檔股票的完整價格序列，一次算好RSI/布林通道/60日均線/ATR。
+    這些指標本質上都是「只看過去」的rolling計算，在完整序列上算一次，
+    跟「每天只用當天以前的資料切片重新算一次」在數學上結果完全一樣，
+    但前者是O(n)、後者等於在day-by-day迴圈裡對每檔股票重複算O(n)次、總共O(n²)，
+    在全市場300多檔、跑3年資料、12種組合的情境下，會慢到不合理。
+    這裡改成「先把每檔股票的指標一次算好存起來，之後day-by-day迴圈只是查表」。
+    """
+    close = df["Close"]
+    rsi = compute_rsi(close)
+    mid, upper, lower = compute_bollinger(close)
+    ma60 = close.rolling(60).mean()
+    atr = compute_atr_correct(df)
+    return pd.DataFrame({
+        "RSI": rsi, "BB_mid": mid, "BB_upper": upper, "BB_lower": lower,
+        "MA60": ma60, "ATR": atr, "Close": close,
+    }, index=df.index)
+
+
+def _lookup_prior_row(ind_df: pd.DataFrame, as_of_date):
+    """
+    用searchsorted做O(log n)查詢，找出ind_df裡「日期嚴格早於as_of_date」的最後一列，
+    等同於原本 df[df.index < as_of_date].iloc[-1]，但快很多，不用每次都重新切片整個序列。
+    """
+    pos = ind_df.index.searchsorted(as_of_date, side="left")
+    if pos == 0:
+        return None, pos
+    return ind_df.iloc[pos - 1], pos
+
+
+def scan_mean_reversion_candidates(indicators_by_code: dict, as_of_date,
                                     regime: str, excluded_codes: set, allow_short: bool = True,
                                     rsi_long_threshold: float = 30, rsi_short_threshold: float = 70):
     """
@@ -98,27 +132,24 @@ def scan_mean_reversion_candidates(price_data: dict, universe: dict, as_of_date,
     allow_short=False 時，不管regime是什麼，永遠不產生空方候選 (獨立於氛圍濾網的開關)。
     rsi_long_threshold/rsi_short_threshold 可以調鬆一點(例如35/65)來增加訊號出現頻率，
     預設30/70是教科書常見門檻。
+
+    indicators_by_code: {code: precompute_indicators()的結果}，改用查表取代即時計算。
     """
     long_candidates = []
     short_candidates = []
 
-    for code in universe:
+    for code, ind_df in indicators_by_code.items():
         if code in excluded_codes:
             continue
-        df = price_data.get(code)
-        if df is None:
-            continue
-        hist = df[df.index < as_of_date]
-        if len(hist) < 60:
+        row, pos = _lookup_prior_row(ind_df, as_of_date)
+        if row is None or pos < 60:
             continue
 
-        close = hist["Close"]
-        rsi = compute_rsi(close).iloc[-1]
-        mid, upper, lower = compute_bollinger(close)
-        mid_v, upper_v, lower_v = mid.iloc[-1], upper.iloc[-1], lower.iloc[-1]
-        ma60 = close.rolling(60).mean().iloc[-1]
-        last_close = close.iloc[-1]
-        atr = compute_atr_correct(hist).iloc[-1]
+        rsi = row["RSI"]
+        mid_v, upper_v, lower_v = row["BB_mid"], row["BB_upper"], row["BB_lower"]
+        ma60 = row["MA60"]
+        last_close = row["Close"]
+        atr = row["ATR"]
 
         if pd.isna(mid_v) or pd.isna(ma60) or pd.isna(atr) or atr <= 0:
             continue
@@ -129,7 +160,7 @@ def scan_mean_reversion_candidates(price_data: dict, universe: dict, as_of_date,
                 score = rsi_long_threshold - rsi  # 越超賣分數越高
                 long_candidates.append({
                     "code": code, "side": "long", "score": score,
-                    "c_prev": last_close, "mid": mid_v, "lower": lower_v, "atr": atr,
+                    "c_prev": last_close, "mid": mid_v, "lower": lower_v, "upper": upper_v, "atr": atr,
                 })
 
         # 做空：RSI超買 + 站上布林上軌 + 仍在60日均線之下 (allow_short=False時完全不產生空方候選)
@@ -138,7 +169,7 @@ def scan_mean_reversion_candidates(price_data: dict, universe: dict, as_of_date,
                 score = rsi - rsi_short_threshold
                 short_candidates.append({
                     "code": code, "side": "short", "score": score,
-                    "c_prev": last_close, "mid": mid_v, "upper": upper_v, "atr": atr,
+                    "c_prev": last_close, "mid": mid_v, "upper": upper_v, "lower": lower_v, "atr": atr,
                 })
 
     long_candidates.sort(key=lambda x: x["score"], reverse=True)
@@ -147,8 +178,12 @@ def scan_mean_reversion_candidates(price_data: dict, universe: dict, as_of_date,
 
 
 def try_enter_mean_reversion(price_data: dict, candidates: list, entry_date,
-                              starting_capital: float, lots: int = 2):
-    """依序檢查候選名單(已跳空風控+保證金上限過濾)，第一個通過的進場。"""
+                              starting_capital: float, lots: int = 2, target_mode: str = "mid_band"):
+    """
+    依序檢查候選名單(已跳空風控+保證金上限過濾)，第一個通過的進場。
+    target_mode == "mid_band":     出場目標是布林中軌(20日均線)，較保守，符合「小賺小賠」的均值回歸精神
+    target_mode == "opposite_band": 出場目標是對側軌道(例如做多目標設在上軌)，更有企圖心，賺得多但達標機率通常較低
+    """
     for cand in candidates:
         code = cand["code"]
         df = price_data.get(code)
@@ -174,10 +209,10 @@ def try_enter_mean_reversion(price_data: dict, candidates: list, entry_date,
         e_price = open_p
         side = cand["side"]
         if side == "long":
-            target_price = cand["mid"]
+            target_price = cand["upper"] if target_mode == "opposite_band" else cand["mid"]
             stop_price = cand["lower"] - 1.0 * atr
         else:
-            target_price = cand["mid"]
+            target_price = cand["lower"] if target_mode == "opposite_band" else cand["mid"]
             stop_price = cand["upper"] + 1.0 * atr
 
         return {
@@ -205,15 +240,35 @@ def check_exit(row, position):
     return None, None
 
 
-def run_mean_reversion_backtest(price_data: dict, index_df: pd.DataFrame, universe: dict,
+def precompute_all_indicators(price_data: dict, universe: dict) -> dict:
+    """
+    對universe裡每一檔股票的指標只算一次，回傳 {code: precompute_indicators()的結果}。
+    這份結果不受hold_days/rsi_threshold/target_mode影響，可以在12種組合、
+    IS/OOS共24次回測之間直接共用，不用每次重算。
+    """
+    result = {}
+    for code in universe:
+        df = price_data.get(code)
+        if df is None:
+            continue
+        result[code] = precompute_indicators(df)
+    return result
+
+
+def run_mean_reversion_backtest(price_data: dict, indicators_by_code: dict, regime_series: pd.DataFrame,
                                  master_calendar: pd.DatetimeIndex, max_hold_days: int,
                                  starting_capital: float, allow_short: bool = True,
                                  lots: int = 2, rsi_long_threshold: float = 30,
-                                 rsi_short_threshold: float = 70):
+                                 rsi_short_threshold: float = 70, target_mode: str = "mid_band"):
     """
     完整 day-by-day walk-forward 模擬。
-    max_hold_days: 短線版建議3-5，中期版建議10-20 (交易日)。
+    max_hold_days: 短線版建議3-5，中期版建議10-20，長版可測30 (交易日)。
     allow_short=False 時只做多，等同long-only版本。
+    target_mode: "mid_band"(回中軌，保守) 或 "opposite_band"(回對側軌道，更有企圖心)。
+
+    indicators_by_code/regime_series 改成外部預先算好傳進來 (見 precompute_all_indicators /
+    precompute_regime_series)，因為這兩者不受這次呼叫的參數影響，
+    在多組合比較時應該只算一次、重複使用，而不是每次呼叫都重新算。
     """
     trades = []
     position = None
@@ -226,13 +281,15 @@ def run_mean_reversion_backtest(price_data: dict, index_df: pd.DataFrame, univer
             if is_near_settlement(date, days_before=2):
                 continue  # 結算日前1-2天不開新倉
 
-            regime = compute_regime(index_df, date)
+            regime = compute_regime(regime_series, date)
             candidates = scan_mean_reversion_candidates(
-                price_data, universe, date, regime, excluded_codes, allow_short=allow_short,
+                indicators_by_code, date, regime, excluded_codes, allow_short=allow_short,
                 rsi_long_threshold=rsi_long_threshold, rsi_short_threshold=rsi_short_threshold,
             )
             if candidates:
-                position = try_enter_mean_reversion(price_data, candidates, date, starting_capital, lots)
+                position = try_enter_mean_reversion(
+                    price_data, candidates, date, starting_capital, lots, target_mode=target_mode
+                )
                 if position is not None:
                     df = price_data[position["code"]]
                     row = df.loc[date]
