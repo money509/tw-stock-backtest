@@ -29,8 +29,16 @@ STOCK_FUTURES_WHITELIST = {
 }
 
 
-def _symbol_for(code: str) -> str:
-    suffix = ".TWO" if code in OTC_STOCKS else ".TW"
+def _symbol_for(code: str, entry=None) -> str:
+    """
+    判斷這個代碼該用哪個yfinance後綴。
+    entry 可以是舊格式的字串(股票名稱，此時退回用OTC_STOCKS這份59檔清單判斷)，
+    或新格式的dict(含"otc"欄位，來自taifex_universe.py的320檔全市場清單，直接讀取判斷)。
+    """
+    if isinstance(entry, dict) and "otc" in entry:
+        suffix = ".TWO" if entry["otc"] else ".TW"
+    else:
+        suffix = ".TWO" if code in OTC_STOCKS else ".TW"
     return f"{code}{suffix}"
 
 
@@ -54,8 +62,10 @@ def load_price_data(whitelist: dict, start: str, end: str, refresh: bool = False
                 df = None
 
         if df is None:
-            sym = _symbol_for(code)
-            print(f"下載 {sym} ({whitelist[code]}) ...", flush=True)
+            entry = whitelist[code]
+            sym = _symbol_for(code, entry)
+            display_name = entry if isinstance(entry, str) else code
+            print(f"下載 {sym} ({display_name}) ...", flush=True)
             try:
                 raw = yf.Ticker(sym).history(start=start, end=end, interval="1d")
             except Exception as e:
