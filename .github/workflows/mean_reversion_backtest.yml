@@ -1,0 +1,47 @@
+name: Run Mean Reversion Backtest
+
+on:
+  workflow_dispatch:
+    inputs:
+      start_date:
+        description: '回測起始日期 (YYYY-MM-DD)，預設抓最近3年'
+        required: false
+        default: ''
+      end_date:
+        description: '回測結束日期，留空代表跑到今天'
+        required: false
+        default: ''
+      starting_capital:
+        description: '模擬帳戶起始資金(新台幣)'
+        required: false
+        default: '200000'
+      max_stocks:
+        description: '限制掃描股票數量，0代表全部320檔(第一次測試建議先設50，跑比較快)'
+        required: false
+        default: '50'
+
+jobs:
+  backtest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run mean reversion backtest
+        run: |
+          ARGS="--starting-capital ${{ github.event.inputs.starting_capital }} --max-stocks ${{ github.event.inputs.max_stocks }}"
+          if [ -n "${{ github.event.inputs.start_date }}" ]; then
+            ARGS="$ARGS --start ${{ github.event.inputs.start_date }}"
+          fi
+          if [ -n
