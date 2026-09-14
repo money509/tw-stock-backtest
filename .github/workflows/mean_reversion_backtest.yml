@@ -1,29 +1,29 @@
-name: Validate Best Combo (Different Time Period)
+name: Compare Technical Plus Chip Signal
 
 on:
   workflow_dispatch:
     inputs:
       start_date:
-        description: '驗證期間起始日期 (YYYY-MM-DD)，預設2021-01-01'
+        description: '回測起始日期 (YYYY-MM-DD)，預設抓最近3年'
         required: false
-        default: '2021-01-01'
+        default: ''
       end_date:
-        description: '驗證期間結束日期，預設2023-01-01'
+        description: '回測結束日期，留空代表跑到今天'
         required: false
-        default: '2023-01-01'
+        default: ''
       starting_capital:
         description: '模擬帳戶起始資金(新台幣)'
         required: false
         default: '200000'
       max_stocks:
-        description: '限制掃描股票數量，0代表全部320檔'
+        description: '限制掃描股票數量，0代表全部320檔(第一次測試建議先設50)'
         required: false
-        default: '0'
+        default: '50'
 
 jobs:
-  validate:
+  backtest:
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    timeout-minutes: 300
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -42,22 +42,32 @@ jobs:
         uses: actions/cache@v4
         with:
           path: data_cache
-          key: price-data-cache-validate-${{ github.run_id }}
+          key: price-data-cache-chip-${{ github.run_id }}
           restore-keys: |
-            price-data-cache-validate-
             price-data-cache-
 
-      - name: Run validation
+      - name: Restore chip data cache
+        uses: actions/cache@v4
+        with:
+          path: chip_cache
+          key: chip-data-cache-${{ github.run_id }}
+          restore-keys: |
+            chip-data-cache-
+
+      - name: Run technical plus chip comparison
         timeout-minutes: 90
         run: |
-          python validate_best_combo.py \
-            --start ${{ github.event.inputs.start_date }} \
-            --end ${{ github.event.inputs.end_date }} \
-            --starting-capital ${{ github.event.inputs.starting_capital }} \
-            --max-stocks ${{ github.event.inputs.max_stocks }}
+          ARGS="--starting-capital ${{ github.event.inputs.starting_capital }} --max-stocks ${{ github.event.inputs.max_stocks }}"
+          if [ -n "${{ github.event.inputs.start_date }}" ]; then
+            ARGS="$ARGS --start ${{ github.event.inputs.start_date }}"
+          fi
+          if [ -n "${{ github.event.inputs.end_date }}" ]; then
+            ARGS="$ARGS --end ${{ github.event.inputs.end_date }}"
+          fi
+          python compare_technical_plus_chip.py $ARGS
 
       - name: Upload results
         uses: actions/upload-artifact@v4
         with:
-          name: validation-results
-          path: results_validation/
+          name: chip-comparison-results
+          path: results_chip/
