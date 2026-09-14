@@ -55,7 +55,7 @@ jobs:
             chip-data-cache-
 
       - name: Run technical plus chip comparison
-        timeout-minutes: 90
+        timeout-minutes: 120
         run: |
           ARGS="--starting-capital ${{ github.event.inputs.starting_capital }} --max-stocks ${{ github.event.inputs.max_stocks }}"
           if [ -n "${{ github.event.inputs.start_date }}" ]; then
