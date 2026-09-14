@@ -2,10 +2,23 @@
 負責從 yfinance 下載歷史股價，並快取成本機 CSV 檔，避免每次跑回測都重新下載。
 """
 import os
+import socket
+import time
 import pandas as pd
 import yfinance as yf
 
 CACHE_DIR = os.path.join(os.path.dirname(__file__), "data_cache")
+REQUEST_DELAY_SECONDS = 0.6   # 每檔下載之間刻意停頓，降低被Yahoo判定異常流量而卡住/擋掉的機率
+HARD_TIMEOUT_SECONDS = 20     # socket底層逾時秒數
+
+# 改進：直接在socket底層設定逾時上限，取代原本用ThreadPoolExecutor包一層的做法。
+# 原本那個做法有個沒考慮到的問題：如果背景執行緒真的卡死(例如卡在等待網路回應)，
+# Python沒辦法從外部真正強制殺掉一個執行緒，只能「不等它」，但底層那個卡住的連線本身
+# 還是會維持逾時前的狀態，且在某些環境下反而拖慢後續其他次呼叫。
+# 用socket.setdefaulttimeout()是更底層、更可靠的做法：任何用到socket的網路連線
+# (包括yfinance內部去跟Yahoo要驗證cookie的那一步)，只要卡超過這個秒數就會直接
+# 拋出逾時例外，讓程式能確實接住並跳過，不會被卡死。
+socket.setdefaulttimeout(HARD_TIMEOUT_SECONDS)
 
 # 上櫃標的清單 (Yahoo Finance 需要用 .TWO 後綴)
 # 已查證：目前 whitelist 中只有雙鴻(3324)、台燿(6274) 為上櫃股，其餘皆為上市股 (.TW)
@@ -42,6 +55,15 @@ def _symbol_for(code: str, entry=None) -> str:
     return f"{code}{suffix}"
 
 
+def _fetch_with_timeout(sym: str, start: str, end: str):
+    """單純呼叫yfinance，依賴模組層級設定的socket.setdefaulttimeout()在網路卡住時自動拋出例外。"""
+    try:
+        return yf.Ticker(sym).history(start=start, end=end, interval="1d")
+    except Exception as e:
+        print(f"  下載過程發生例外(可能是逾時): {e}", flush=True)
+        return None
+
+
 def load_price_data(whitelist: dict, start: str, end: str, refresh: bool = False) -> dict:
     """
     回傳 {code: DataFrame(Open, High, Low, Close, index=日期)}。
@@ -69,16 +91,16 @@ def load_price_data(whitelist: dict, start: str, end: str, refresh: bool = False
 
             raw = None
             for attempt in range(2):  # 最多重試1次，避免單一次網路瞬斷就整檔放棄
-                try:
-                    # 改進：明確設定逾時秒數，避免Yahoo端沒回應時整個流程卡死不動
-                    ticker = yf.Ticker(sym)
-                    raw = ticker.history(start=start, end=end, interval="1d", timeout=20)
+                raw = _fetch_with_timeout(sym, start, end)
+                if raw is not None:
                     break
-                except Exception as e:
-                    print(f"  第{attempt+1}次嘗試失敗: {e}", flush=True)
-                    raw = None
+                print(f"  第{attempt+1}次嘗試逾時或失敗", flush=True)
+                time.sleep(2)  # 重試前多等一下，給Yahoo端喘息空間
+
+            time.sleep(REQUEST_DELAY_SECONDS)  # 不管成功失敗，都刻意放慢下一檔的請求速度
+
             if raw is None:
-                print(f"  {sym} 重試後仍失敗，略過此標的", flush=True)
+                print(f"  {sym} 重試後仍失敗/逾時，略過此標的", flush=True)
                 continue
             if raw.empty:
                 print(f"  {sym} 沒有抓到任何資料，略過", flush=True)

@@ -42,7 +42,16 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
+      - name: Restore price data cache
+        uses: actions/cache@v4
+        with:
+          path: data_cache
+          key: price-data-cache-${{ github.run_id }}
+          restore-keys: |
+            price-data-cache-
+
       - name: Run mean reversion backtest
+        timeout-minutes: 45
         run: |
           ARGS="--starting-capital ${{ github.event.inputs.starting_capital }} --max-stocks ${{ github.event.inputs.max_stocks }} --rsi-threshold ${{ github.event.inputs.rsi_threshold }}"
           if [ -n "${{ github.event.inputs.start_date }}" ]; then
