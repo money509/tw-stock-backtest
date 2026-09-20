@@ -339,11 +339,18 @@ def run_overnight_backtest(indicators_by_code, market_returns_df,
                             foreign_ratio_df, trust_ratio_df, day_trading_ratio_df,
                             trading_days, universe_codes=None, top_n=TOP_N,
                             tech_weight=TECH_WEIGHT, chip_weight=CHIP_WEIGHT,
-                            fee_per_trade=200):
+                            fee_per_trade=200,
+                            gap_stop_threshold=GAP_STOP_THRESHOLD,
+                            atr_stop_mult=ATR_STOP_MULT,
+                            atr_target_mult=ATR_TARGET_MULT):
     """
     對 trading_days（已排序的 YYYYMMDD 字串 list）逐日跑隔日衝策略。
     第 i 天收盤選股、進場；用第 i+1 天的 K 棒模擬出場。
     回傳交易紀錄 list[dict]。
+
+    gap_stop_threshold / atr_stop_mult / atr_target_mult 開放給呼叫端覆寫，
+    是給參數掃描（sweep_overnight_params.py）用的——沒有指定的話就是引擎預設值，
+    行為跟修改前完全一樣，不影響既有呼叫方式。
     """
     trades = []
 
@@ -373,7 +380,12 @@ def run_overnight_backtest(indicators_by_code, market_returns_df,
             entry_price = cand["close"]
             atr = cand["atr14"]
 
-            exit_price, reason = simulate_next_day_exit(entry_price, atr, next_bar)
+            exit_price, reason = simulate_next_day_exit(
+                entry_price, atr, next_bar,
+                gap_stop_threshold=gap_stop_threshold,
+                atr_stop_mult=atr_stop_mult,
+                atr_target_mult=atr_target_mult,
+            )
 
             mult = get_contract_multiplier(entry_price)
             pnl = (exit_price - entry_price) * mult - fee_per_trade

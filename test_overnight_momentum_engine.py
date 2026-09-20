@@ -282,6 +282,58 @@ class TestFullBacktestLoop(unittest.TestCase):
         expected_pnl = (exit_price - entry_price) * mult - 200
         self.assertAlmostEqual(trade["pnl"], expected_pnl)
 
+    def test_run_overnight_backtest_respects_overridden_exit_params(self):
+        """驗證 run_overnight_backtest 的 gap_stop_threshold/atr_stop_mult/atr_target_mult
+        真的有傳到 simulate_next_day_exit，不是被忽略的死參數。"""
+        closes = [100 + i * 0.3 for i in range(70)]
+        closes.append(closes[-1] * 1.05)
+        raw = make_price_series(closes)
+        raw.loc[raw.index[-1], "volume"] = 5_000_000
+        raw.loc[raw.index[-1], "low"] = closes[-2]
+        raw.loc[raw.index[-1], "high"] = closes[-1] * 1.001
+
+        # T+1 開盤跌 1.2%：用預設 gap_stop_threshold(-1.5%) 不會觸發跳空停損，
+        # 但如果把門檻放寬到 -1.0%，就應該觸發。
+        extra_day = pd.DataFrame([{
+            "date": (pd.bdate_range(start=pd.to_datetime("20260101", format="%Y%m%d"),
+                                     periods=len(closes) + 1)[-1]).strftime("%Y%m%d"),
+            "open": closes[-1] * 0.988,
+            "high": closes[-1] * 0.99,
+            "low": closes[-1] * 0.97,
+            "close": closes[-1] * 0.98,
+            "volume": 2_000_000,
+        }])
+        raw = pd.concat([raw, extra_day], ignore_index=True)
+
+        indicators = ome.precompute_overnight_indicators(raw)
+        indicators_by_code = {"TEST": indicators}
+
+        market_df = pd.DataFrame({
+            "date": raw["date"], "close": [150 + i * 0.05 for i in range(len(raw))],
+        })
+        market_returns = ome.precompute_market_returns(market_df)
+
+        entry_date = indicators["date"].iloc[70]
+        foreign_ratio_df = pd.DataFrame([{"date": entry_date, "code": "TEST", "ratio": 0.05}])
+        trust_ratio_df = pd.DataFrame([{"date": entry_date, "code": "TEST", "ratio": 0.03}])
+        day_trading_ratio_df = pd.DataFrame([
+            {"date": entry_date, "code": "TEST", "day_trading_ratio": 0.02}
+        ])
+        trading_days = [entry_date, indicators["date"].iloc[71]]
+
+        default_trades = ome.run_overnight_backtest(
+            indicators_by_code, market_returns, foreign_ratio_df, trust_ratio_df,
+            day_trading_ratio_df, trading_days, universe_codes=["TEST"], top_n=1,
+        )
+        self.assertNotEqual(default_trades[0]["exit_reason"], "gap_stop")
+
+        tightened_trades = ome.run_overnight_backtest(
+            indicators_by_code, market_returns, foreign_ratio_df, trust_ratio_df,
+            day_trading_ratio_df, trading_days, universe_codes=["TEST"], top_n=1,
+            gap_stop_threshold=-0.01,
+        )
+        self.assertEqual(tightened_trades[0]["exit_reason"], "gap_stop")
+
     def test_summarize_overnight_on_empty_trades(self):
         summary = ome.summarize_overnight([])
         self.assertEqual(summary["total_trades"], 0)
