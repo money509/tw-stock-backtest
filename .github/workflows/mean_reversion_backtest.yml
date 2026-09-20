@@ -3,6 +3,14 @@ name: 隔日衝策略回測
 on:
   workflow_dispatch:
     inputs:
+      mode:
+        description: "跑哪一種：backtest(單組參數IS/OOS回測) 或 sweep(參數掃描)"
+        required: true
+        default: "backtest"
+        type: choice
+        options:
+          - backtest
+          - sweep
       start_date:
         description: "回測起始日 (YYYY-MM-DD)"
         required: true
@@ -12,15 +20,15 @@ on:
         required: true
         default: "2026-09-14"
       top_n:
-        description: "每日選股檔數"
+        description: "每日選股檔數（僅 backtest 模式使用）"
         required: false
         default: "5"
       tech_weight:
-        description: "技術面權重 (0~1)"
+        description: "技術面權重 0~1（僅 backtest 模式使用）"
         required: false
         default: "0.35"
       chip_weight:
-        description: "籌碼面權重 (0~1)"
+        description: "籌碼面權重 0~1（僅 backtest 模式使用）"
         required: false
         default: "0.65"
       refresh:
@@ -39,7 +47,11 @@ jobs:
     runs-on: ubuntu-latest
     # 三個資料源都是序列下載(股價批次+三大法人逐日+當沖逐日)，時間可能拉得比較長，
     # 給足夠餘裕，同時避免 workflow 卡死佔用runner
-    timeout-minutes: 180
+    timeout-minutes: 300
+    env:
+      # 不加這個，Python 的 stdout 被 tee 接管後會整批緩衝，log 看起來像卡住，
+      # 其實還在跑，只是進度沒有即時吐出來——這個環境變數讓輸出即時顯示。
+      PYTHONUNBUFFERED: "1"
 
     steps:
       - name: Checkout
@@ -85,7 +97,7 @@ jobs:
         run: |
           python3 -m unittest discover -p "test_*.py" -v
 
-      - name: 執行隔日衝回測
+      - name: 執行隔日衝回測或參數掃描
         id: run_backtest
         continue-on-error: true
         run: |
@@ -93,14 +105,25 @@ jobs:
           if [ "${{ github.event.inputs.refresh }}" = "true" ]; then
             REFRESH_FLAG="--refresh"
           fi
-          python3 compare_overnight.py \
-            --start "${{ github.event.inputs.start_date }}" \
-            --end "${{ github.event.inputs.end_date }}" \
-            --top-n "${{ github.event.inputs.top_n }}" \
-            --tech-weight "${{ github.event.inputs.tech_weight }}" \
-            --chip-weight "${{ github.event.inputs.chip_weight }}" \
-            $REFRESH_FLAG \
-            2>&1 | tee overnight_backtest_result.log
+
+          if [ "${{ github.event.inputs.mode }}" = "sweep" ]; then
+            # sweep 模式：資料若已有快取(例如上次 backtest 模式跑過同樣的日期範圍)，
+            # 這裡不會重新下載，直接沿用，只在IS區間內跑很多組參數比較。
+            python3 sweep_overnight_params.py \
+              --start "${{ github.event.inputs.start_date }}" \
+              --end "${{ github.event.inputs.end_date }}" \
+              $REFRESH_FLAG \
+              2>&1 | tee overnight_backtest_result.log
+          else
+            python3 compare_overnight.py \
+              --start "${{ github.event.inputs.start_date }}" \
+              --end "${{ github.event.inputs.end_date }}" \
+              --top-n "${{ github.event.inputs.top_n }}" \
+              --tech-weight "${{ github.event.inputs.tech_weight }}" \
+              --chip-weight "${{ github.event.inputs.chip_weight }}" \
+              $REFRESH_FLAG \
+              2>&1 | tee overnight_backtest_result.log
+          fi
 
       # 不管上面成功或失敗，都要保留這次抓到的資料快取，
       # 下次重跑（例如上次逾時待補的日期）才不用整個重抓一次
