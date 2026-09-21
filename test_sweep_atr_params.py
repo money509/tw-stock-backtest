@@ -186,6 +186,41 @@ class TestRunSweep(unittest.TestCase):
         self.assertTrue(distributions_differ)
 
 
+    def test_run_sweep_passes_through_min_candidates_and_min_trust_ratio(self):
+        """驗證min_candidates/min_trust_ratio真的有傳到run_overnight_backtest，
+        不是被忽略的死參數——重掃ATR時要能固定住新鎖定的選股邏輯。"""
+        import overnight_momentum_engine as ome
+        captured = []
+        real_run = ome.run_overnight_backtest
+
+        def spy(**kwargs):
+            captured.append((kwargs.get("min_candidates"), kwargs.get("min_trust_ratio")))
+            return real_run(**kwargs)
+
+        ome.run_overnight_backtest = spy
+        try:
+            atr_sweep.run_sweep(
+                self.pipeline_inputs,
+                param_grid=[{"atr_stop_mult": 0.8, "atr_target_mult": 1.5}],
+                min_candidates=3, min_trust_ratio=0.02,
+            )
+        finally:
+            ome.run_overnight_backtest = real_run
+
+        self.assertEqual(len(captured), 1)
+        self.assertEqual(captured[0], (3, 0.02))
+
+    def test_run_sweep_default_none_keeps_old_behavior(self):
+        small_grid = [{"atr_stop_mult": 0.8, "atr_target_mult": 1.5}]
+        default_df, _, _ = atr_sweep.run_sweep(self.pipeline_inputs, param_grid=small_grid)
+        explicit_none_df, _, _ = atr_sweep.run_sweep(
+            self.pipeline_inputs, param_grid=small_grid,
+            min_candidates=None, min_trust_ratio=None,
+        )
+        self.assertAlmostEqual(
+            default_df.iloc[0]["total_pnl"], explicit_none_df.iloc[0]["total_pnl"])
+
+
 class TestRankResults(unittest.TestCase):
     def test_filters_low_trade_count_and_sorts_by_pf(self):
         df = pd.DataFrame([
@@ -220,6 +255,31 @@ class TestValidateBestOnOos(unittest.TestCase):
         summary = atr_sweep.validate_best_on_oos(self.pipeline_inputs, best_params, oos_days)
         for key in ["total_trades", "win_rate", "profit_factor", "total_pnl"]:
             self.assertIn(key, summary)
+
+    def test_validate_best_on_oos_passes_through_min_candidates_and_min_trust_ratio(self):
+        import overnight_momentum_engine as ome
+        captured = []
+        real_run = ome.run_overnight_backtest
+
+        def spy(**kwargs):
+            captured.append((kwargs.get("min_candidates"), kwargs.get("min_trust_ratio")))
+            return real_run(**kwargs)
+
+        ome.run_overnight_backtest = spy
+        try:
+            _, is_days, oos_days = atr_sweep.run_sweep(
+                self.pipeline_inputs,
+                param_grid=[{"atr_stop_mult": 0.8, "atr_target_mult": 1.5}],
+            )
+            best_params = {"atr_stop_mult": 0.8, "atr_target_mult": 1.5}
+            atr_sweep.validate_best_on_oos(
+                self.pipeline_inputs, best_params, oos_days,
+                min_candidates=3, min_trust_ratio=0.02,
+            )
+        finally:
+            ome.run_overnight_backtest = real_run
+
+        self.assertIn((3, 0.02), captured)
 
     def test_validate_best_on_oos_handles_numpy_float_from_dataframe_row(self):
         """同 sweep_overnight_params.py 的 regression：從 DataFrame.iloc[0].to_dict()

@@ -69,8 +69,15 @@ def build_atr_grid():
 def run_sweep(pipeline_inputs, is_ratio=IS_RATIO, param_grid=None,
               top_n=FIXED_TOP_N, tech_weight=FIXED_TECH_WEIGHT,
               chip_weight=FIXED_CHIP_WEIGHT,
-              gap_stop_threshold=FIXED_GAP_STOP_THRESHOLD):
-    """只在 IS 區間跑，回傳每個 ATR 組合的結果 DataFrame（不看 OOS，理由同 sweep_overnight_params.py）。"""
+              gap_stop_threshold=FIXED_GAP_STOP_THRESHOLD,
+              min_candidates=None, min_trust_ratio=None):
+    """只在 IS 區間跑，回傳每個 ATR 組合的結果 DataFrame（不看 OOS，理由同 sweep_overnight_params.py）。
+
+    min_candidates / min_trust_ratio：可選，往下傳給每次run_overnight_backtest()呼叫，
+    見overnight_momentum_engine.py的說明。不傳（維持None）就完全不啟用，向後相容。
+    用途：選股邏輯換了（例如新鎖定min_trust_ratio）之後，ATR停利停損的最佳倍數
+    很可能也跟著變，這裡讓呼叫端可以把新鎖定的選股參數固定住，只重新掃ATR這兩個維度。
+    """
     param_grid = param_grid or build_atr_grid()
     is_days, oos_days = split_is_oos(pipeline_inputs["trading_days"], is_ratio)
 
@@ -88,6 +95,8 @@ def run_sweep(pipeline_inputs, is_ratio=IS_RATIO, param_grid=None,
         tech_weight=tech_weight,
         chip_weight=chip_weight,
         gap_stop_threshold=gap_stop_threshold,
+        min_candidates=min_candidates,
+        min_trust_ratio=min_trust_ratio,
     )
 
     rows = []
@@ -148,6 +157,12 @@ def main():
     parser.add_argument("--end", required=True, help="YYYY-MM-DD")
     parser.add_argument("--top", type=int, default=10, help="列出前幾名組合")
     parser.add_argument("--refresh", action="store_true", help="忽略快取，強制重新下載所有資料")
+    parser.add_argument("--min-candidates", type=int, default=None,
+                         help="候選股數量門檻(預設不啟用)，固定住新鎖定的選股邏輯，"
+                              "只重新掃ATR倍數這兩個維度")
+    parser.add_argument("--min-trust-ratio", type=float, default=None,
+                         help="投信買超比重絕對門檻(預設不啟用)，固定住新鎖定的選股邏輯，"
+                              "只重新掃ATR倍數這兩個維度")
     args = parser.parse_args()
 
     start_date = datetime.datetime.strptime(args.start, "%Y-%m-%d").date()
@@ -161,8 +176,13 @@ def main():
     grid = build_atr_grid()
     print(f"\n共 {len(grid)} 組 ATR 倍數組合，其餘參數固定在 top_n={FIXED_TOP_N}, "
           f"tech/chip={FIXED_TECH_WEIGHT}/{FIXED_CHIP_WEIGHT}, "
-          f"gap_stop={FIXED_GAP_STOP_THRESHOLD}，只在樣本內(IS, 前70%)跑回測 ...\n")
-    result_df, is_days, oos_days = run_sweep(pipeline_inputs, param_grid=grid)
+          f"gap_stop={FIXED_GAP_STOP_THRESHOLD}, "
+          f"min_candidates={args.min_candidates}, min_trust_ratio={args.min_trust_ratio}，"
+          f"只在樣本內(IS, 前70%)跑回測 ...\n")
+    result_df, is_days, oos_days = run_sweep(
+        pipeline_inputs, param_grid=grid,
+        min_candidates=args.min_candidates, min_trust_ratio=args.min_trust_ratio,
+    )
 
     ranked = rank_results(result_df)
     print(f"\n=== IS 排名前 {args.top} 組合（依 profit_factor） ===")
@@ -181,7 +201,10 @@ def main():
     if not ranked.empty:
         best = ranked.iloc[0].to_dict()
         print(f"\n=== 排名第一的組合在 OOS 驗證（僅供參考，不能用來重新選參數） ===")
-        oos_summary = validate_best_on_oos(pipeline_inputs, best, oos_days)
+        oos_summary = validate_best_on_oos(
+            pipeline_inputs, best, oos_days,
+            min_candidates=args.min_candidates, min_trust_ratio=args.min_trust_ratio,
+        )
         print(f"組合: atr_stop={best['atr_stop_mult']}, atr_target={best['atr_target_mult']}")
         print(f"OOS 交易次數: {oos_summary['total_trades']}")
         print(f"OOS 勝率: {oos_summary['win_rate']:.1f}%")
@@ -194,7 +217,8 @@ def main():
 def validate_best_on_oos(pipeline_inputs, best_params, oos_days,
                           top_n=FIXED_TOP_N, tech_weight=FIXED_TECH_WEIGHT,
                           chip_weight=FIXED_CHIP_WEIGHT,
-                          gap_stop_threshold=FIXED_GAP_STOP_THRESHOLD):
+                          gap_stop_threshold=FIXED_GAP_STOP_THRESHOLD,
+                          min_candidates=None, min_trust_ratio=None):
     """把排名第一的 ATR 組合，拿到 OOS 跑一次，僅供參考、不能拿來重新挑參數。"""
     trades = ome.run_overnight_backtest(
         indicators_by_code=pipeline_inputs["indicators_by_code"],
@@ -210,6 +234,8 @@ def validate_best_on_oos(pipeline_inputs, best_params, oos_days,
         tech_weight=tech_weight,
         chip_weight=chip_weight,
         gap_stop_threshold=gap_stop_threshold,
+        min_candidates=min_candidates,
+        min_trust_ratio=min_trust_ratio,
         # 跟 sweep_overnight_params.py 一樣的保險：避免 DataFrame.iloc[0].to_dict()
         # 把數值型欄位轉成非預期的 dtype。
         atr_stop_mult=float(best_params["atr_stop_mult"]),
