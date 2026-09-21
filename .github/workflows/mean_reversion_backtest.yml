@@ -4,13 +4,16 @@ on:
   workflow_dispatch:
     inputs:
       mode:
-        description: "跑哪一種：backtest(單組參數IS/OOS回測) 或 sweep(參數掃描)"
+        description: "跑哪一種：backtest(單組參數IS/OOS回測)、sweep(權重/門檻參數掃描)、atr_sweep(ATR停利停損倍數掃描)、ablation(單一訊號拆解測試)、diagnose_open_gap(隔日沒開紅提早出場的假設驗證)"
         required: true
         default: "backtest"
         type: choice
         options:
           - backtest
           - sweep
+          - atr_sweep
+          - ablation
+          - diagnose_open_gap
       start_date:
         description: "回測起始日 (YYYY-MM-DD)"
         required: true
@@ -93,6 +96,14 @@ jobs:
           restore-keys: |
             day-trading-cache-
 
+      - name: 還原美股大盤快取
+        uses: actions/cache@v4
+        with:
+          path: us_market_cache
+          key: us-market-cache-${{ github.event.inputs.start_date }}-${{ github.event.inputs.end_date }}
+          restore-keys: |
+            us-market-cache-
+
       - name: 跑單元測試（先確認引擎邏輯沒有壞掉，再花時間跑真實資料）
         run: |
           python3 -m unittest discover -p "test_*.py" -v
@@ -106,14 +117,42 @@ jobs:
             REFRESH_FLAG="--refresh"
           fi
 
-          if [ "${{ github.event.inputs.mode }}" = "sweep" ]; then
+          MODE="${{ github.event.inputs.mode }}"
+
+          if [ "$MODE" = "sweep" ]; then
             # sweep 模式：資料若已有快取(例如上次 backtest 模式跑過同樣的日期範圍)，
-            # 這裡不會重新下載，直接沿用，只在IS區間內跑很多組參數比較。
+            # 這裡不會重新下載，直接沿用，只在IS區間內跑很多組權重/門檻參數比較。
             python3 sweep_overnight_params.py \
               --start "${{ github.event.inputs.start_date }}" \
               --end "${{ github.event.inputs.end_date }}" \
               $REFRESH_FLAG \
               2>&1 | tee overnight_backtest_result.log
+
+          elif [ "$MODE" = "atr_sweep" ]; then
+            # atr_sweep 模式：只掃 ATR 停利/停損倍數，其餘參數固定，只在IS區間內跑。
+            python3 sweep_atr_params.py \
+              --start "${{ github.event.inputs.start_date }}" \
+              --end "${{ github.event.inputs.end_date }}" \
+              $REFRESH_FLAG \
+              2>&1 | tee overnight_backtest_result.log
+
+          elif [ "$MODE" = "ablation" ]; then
+            # ablation 模式：8個訊號每次只開一個，看誰單獨測起來真的有效，只在IS區間內跑。
+            python3 sweep_signal_ablation.py \
+              --start "${{ github.event.inputs.start_date }}" \
+              --end "${{ github.event.inputs.end_date }}" \
+              --top-n "${{ github.event.inputs.top_n }}" \
+              $REFRESH_FLAG \
+              2>&1 | tee overnight_backtest_result.log
+
+          elif [ "$MODE" = "diagnose_open_gap" ]; then
+            # diagnose_open_gap 模式：純診斷，不改變策略邏輯，只在IS區間內跑。
+            python3 diagnose_open_gap.py \
+              --start "${{ github.event.inputs.start_date }}" \
+              --end "${{ github.event.inputs.end_date }}" \
+              $REFRESH_FLAG \
+              2>&1 | tee overnight_backtest_result.log
+
           else
             python3 compare_overnight.py \
               --start "${{ github.event.inputs.start_date }}" \
