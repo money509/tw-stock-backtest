@@ -1,0 +1,191 @@
+name: 隔日衝策略回測
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "跑哪一種：backtest(單組參數IS/OOS回測)、sweep(權重/門檻參數掃描)、atr_sweep(ATR停利停損倍數掃描)、ablation(單一訊號拆解測試)、diagnose_open_gap(隔日沒開紅提早出場的假設驗證)、combined(訊號權重x ATR參數合併測試)"
+        required: true
+        default: "backtest"
+        type: choice
+        options:
+          - backtest
+          - sweep
+          - atr_sweep
+          - ablation
+          - diagnose_open_gap
+          - combined
+      start_date:
+        description: "回測起始日 (YYYY-MM-DD)"
+        required: true
+        default: "2023-09-15"
+      end_date:
+        description: "回測結束日 (YYYY-MM-DD)"
+        required: true
+        default: "2026-09-14"
+      top_n:
+        description: "每日選股檔數（僅 backtest 模式使用）"
+        required: false
+        default: "5"
+      tech_weight:
+        description: "技術面權重 0~1（僅 backtest 模式使用）"
+        required: false
+        default: "0.35"
+      chip_weight:
+        description: "籌碼面權重 0~1（僅 backtest 模式使用）"
+        required: false
+        default: "0.65"
+      refresh:
+        description: "忽略快取，強制重新下載所有資料"
+        required: false
+        default: "false"
+        type: boolean
+
+# 避免同時有兩個回測在跑，互相搶著寫入同一份快取
+concurrency:
+  group: overnight-backtest
+  cancel-in-progress: false
+
+jobs:
+  backtest:
+    runs-on: ubuntu-latest
+    # 三個資料源都是序列下載(股價批次+三大法人逐日+當沖逐日)，時間可能拉得比較長，
+    # 給足夠餘裕，同時避免 workflow 卡死佔用runner
+    timeout-minutes: 300
+    env:
+      # 不加這個，Python 的 stdout 被 tee 接管後會整批緩衝，log 看起來像卡住，
+      # 其實還在跑，只是進度沒有即時吐出來——這個環境變數讓輸出即時顯示。
+      PYTHONUNBUFFERED: "1"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: 安裝套件
+        run: |
+          pip install --upgrade pip
+          pip install pandas numpy requests yfinance
+
+      # 三份快取分開存，互不影響：股價、三大法人、當沖比例
+      # 快取存在的話下次執行會跳過已經抓過的日期，大幅縮短執行時間
+      - name: 還原股價快取
+        uses: actions/cache@v4
+        with:
+          path: data_cache
+          key: data-cache-${{ github.event.inputs.start_date }}-${{ github.event.inputs.end_date }}
+          restore-keys: |
+            data-cache-
+
+      - name: 還原三大法人快取
+        uses: actions/cache@v4
+        with:
+          path: chip_cache
+          key: chip-cache-${{ github.event.inputs.start_date }}-${{ github.event.inputs.end_date }}
+          restore-keys: |
+            chip-cache-
+
+      - name: 還原當沖比例快取
+        uses: actions/cache@v4
+        with:
+          path: day_trading_cache
+          key: day-trading-cache-${{ github.event.inputs.start_date }}-${{ github.event.inputs.end_date }}
+          restore-keys: |
+            day-trading-cache-
+
+      - name: 還原美股大盤快取
+        uses: actions/cache@v4
+        with:
+          path: us_market_cache
+          key: us-market-cache-${{ github.event.inputs.start_date }}-${{ github.event.inputs.end_date }}
+          restore-keys: |
+            us-market-cache-
+
+      - name: 跑單元測試（先確認引擎邏輯沒有壞掉，再花時間跑真實資料）
+        run: |
+          python3 -m unittest discover -p "test_*.py" -v
+
+      - name: 執行隔日衝回測或參數掃描
+        id: run_backtest
+        continue-on-error: true
+        run: |
+          REFRESH_FLAG=""
+          if [ "${{ github.event.inputs.refresh }}" = "true" ]; then
+            REFRESH_FLAG="--refresh"
+          fi
+
+          MODE="${{ github.event.inputs.mode }}"
+
+          if [ "$MODE" = "sweep" ]; then
+            # sweep 模式：資料若已有快取(例如上次 backtest 模式跑過同樣的日期範圍)，
+            # 這裡不會重新下載，直接沿用，只在IS區間內跑很多組權重/門檻參數比較。
+            python3 sweep_overnight_params.py \
+              --start "${{ github.event.inputs.start_date }}" \
+              --end "${{ github.event.inputs.end_date }}" \
+              $REFRESH_FLAG \
+              2>&1 | tee overnight_backtest_result.log
+
+          elif [ "$MODE" = "atr_sweep" ]; then
+            # atr_sweep 模式：只掃 ATR 停利/停損倍數，其餘參數固定，只在IS區間內跑。
+            python3 sweep_atr_params.py \
+              --start "${{ github.event.inputs.start_date }}" \
+              --end "${{ github.event.inputs.end_date }}" \
+              $REFRESH_FLAG \
+              2>&1 | tee overnight_backtest_result.log
+
+          elif [ "$MODE" = "ablation" ]; then
+            # ablation 模式：8個訊號每次只開一個，看誰單獨測起來真的有效，只在IS區間內跑。
+            python3 sweep_signal_ablation.py \
+              --start "${{ github.event.inputs.start_date }}" \
+              --end "${{ github.event.inputs.end_date }}" \
+              --top-n "${{ github.event.inputs.top_n }}" \
+              $REFRESH_FLAG \
+              2>&1 | tee overnight_backtest_result.log
+
+          elif [ "$MODE" = "diagnose_open_gap" ]; then
+            # diagnose_open_gap 模式：純診斷，不改變策略邏輯，只在IS區間內跑。
+            python3 diagnose_open_gap.py \
+              --start "${{ github.event.inputs.start_date }}" \
+              --end "${{ github.event.inputs.end_date }}" \
+              $REFRESH_FLAG \
+              2>&1 | tee overnight_backtest_result.log
+
+          elif [ "$MODE" = "combined" ]; then
+            # combined 模式：把訊號拆解跟ATR掃描分別驗證過的好組合疊在一起測，只在IS區間內跑。
+            python3 sweep_combined_best.py \
+              --start "${{ github.event.inputs.start_date }}" \
+              --end "${{ github.event.inputs.end_date }}" \
+              --top-n "${{ github.event.inputs.top_n }}" \
+              $REFRESH_FLAG \
+              2>&1 | tee overnight_backtest_result.log
+
+          else
+            python3 compare_overnight.py \
+              --start "${{ github.event.inputs.start_date }}" \
+              --end "${{ github.event.inputs.end_date }}" \
+              --top-n "${{ github.event.inputs.top_n }}" \
+              --tech-weight "${{ github.event.inputs.tech_weight }}" \
+              --chip-weight "${{ github.event.inputs.chip_weight }}" \
+              $REFRESH_FLAG \
+              2>&1 | tee overnight_backtest_result.log
+          fi
+
+      # 不管上面成功或失敗，都要保留這次抓到的資料快取，
+      # 下次重跑（例如上次逾時待補的日期）才不用整個重抓一次
+      - name: 上傳回測結果 log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: overnight-backtest-result-${{ github.run_number }}
+          path: overnight_backtest_result.log
+          retention-days: 90
+
+      - name: 若回測步驟失敗，讓整個 workflow 顯示失敗
+        if: steps.run_backtest.outcome == 'failure'
+        run: |
+          echo "回測執行失敗，請查看上面的 log 或下載 artifact 排查"
+          exit 1
