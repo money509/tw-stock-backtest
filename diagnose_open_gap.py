@@ -121,6 +121,29 @@ def exit_reason_breakdown_for_group(enriched_df, opened_up_value=False):
     return (subset["exit_reason"].value_counts(normalize=True) * 100.0).round(1)
 
 
+def summarize_by_open_gap_and_exit_reason(enriched_df):
+    """
+    跟 summarize_by_open_gap() 一樣，但多依 exit_reason 再拆一層。
+
+    原因：summarize_by_open_gap() 算出來的「沒開紅」整組平均，其實混了兩種
+    完全不同的情況——一種是本來就已經觸發停損/跳空停損提早出場的交易（現有邏輯
+    本來就跟「提早出場」做的事差不多，不會有太大差異）；另一種是撐到收盤才被
+    強制平倉的交易（這才是「提早出場」這個規則真正能改變結果的地方）。
+    混在一起平均，會讓「強制平倉」那組真正的改善幅度被稀釋或放大，看不清楚。
+    """
+    if enriched_df.empty:
+        return pd.DataFrame(columns=[
+            "opened_up", "exit_reason", "trade_count",
+            "avg_actual_pnl", "avg_hypothetical_open_exit_pnl",
+        ])
+    grouped = enriched_df.groupby(["opened_up", "exit_reason"]).agg(
+        trade_count=("pnl", "count"),
+        avg_actual_pnl=("pnl", "mean"),
+        avg_hypothetical_open_exit_pnl=("hypothetical_open_exit_pnl", "mean"),
+    ).reset_index()
+    return grouped.sort_values(["opened_up", "exit_reason"]).reset_index(drop=True)
+
+
 def main():
     parser = argparse.ArgumentParser(description="診斷：隔日沒開紅就提早出場，值不值得做")
     parser.add_argument("--start", required=True, help="YYYY-MM-DD")
@@ -165,20 +188,50 @@ def main():
     else:
         print(breakdown.to_string())
 
+    print("\n=== 「沒開紅」這組，依現有出場原因再拆一層比較 ===")
+    print("（重要：停損/跳空停損本來就已經提早出場了，真正該看的是「強制平倉」這一列——"
+          "那才是現在撐到收盤、而「提早出場」規則真正能改變結果的地方）")
+    breakdown_pnl = summarize_by_open_gap_and_exit_reason(enriched)
+    not_opened_up_breakdown = breakdown_pnl[breakdown_pnl["opened_up"] == False]
+    if not_opened_up_breakdown.empty:
+        print("（沒有資料）")
+    else:
+        print(not_opened_up_breakdown[
+            ["exit_reason", "trade_count", "avg_actual_pnl", "avg_hypothetical_open_exit_pnl"]
+        ].to_string(index=False))
+
     not_opened_up = summary[summary["opened_up"] == False]
     if not not_opened_up.empty:
         row = not_opened_up.iloc[0]
-        print(f"\n判讀方式：")
+        print(f"\n判讀方式（整體）：")
         print(f"「沒開紅」這組共 {int(row['trade_count'])} 筆，"
               f"現有邏輯（跑完一整天）的平均損益是 {row['avg_actual_pnl']:,.0f}，"
               f"如果直接在開盤價出場，平均損益會是 {row['avg_hypothetical_open_exit_pnl']:,.0f}。")
-        if row["avg_hypothetical_open_exit_pnl"] > row["avg_actual_pnl"]:
-            print("→ 假設提早在開盤出場，這組的平均損益反而比較好（或虧得比較少），"
-                  "代表「沒開紅就跑」這個規則有機會帶來實質改善，值得做成正式規則並在 OOS 驗證。")
+        print("但這個整體平均混了停損/跳空停損（本來就提早出場，改善幅度理應很小）"
+              "跟強制平倉（現在撐到收盤，改善幅度才是重點）——請直接看上面「強制平倉」那一列：")
+
+        forced_close_row = not_opened_up_breakdown[
+            not_opened_up_breakdown["exit_reason"] == "forced_close"
+        ]
+        if not forced_close_row.empty:
+            fc = forced_close_row.iloc[0]
+            fc_diff = fc["avg_hypothetical_open_exit_pnl"] - fc["avg_actual_pnl"]
+            print(f"強制平倉這 {int(fc['trade_count'])} 筆，"
+                  f"現有邏輯平均損益 {fc['avg_actual_pnl']:,.0f}，"
+                  f"假設開盤就出場平均損益 {fc['avg_hypothetical_open_exit_pnl']:,.0f}，"
+                  f"差 {fc_diff:,.0f}。")
+            if fc_diff > 0:
+                print("→ 強制平倉這批單獨拆開來看，提早在開盤出場確實比較好，"
+                      "代表「沒開紅就跑」這個規則的效果不是被停損/跳空停損稀釋出來的假象，"
+                      "值得做成正式規則並在 OOS 驗證。")
+            else:
+                print("→ 強制平倉這批單獨拆開來看，提早在開盤出場反而比較差（或差不多），"
+                      "代表整體平均的改善主要是被停損/跳空停損那兩類「本來就提早出場」的交易帶動的，"
+                      "「沒開紅就跑」這個規則本身，對真正該改善的強制平倉這批，可能沒有實質幫助，"
+                      "不建議只憑這個結果就正式做進去。")
         else:
-            print("→ 假設提早在開盤出場，這組的平均損益反而比較差，"
-                  "代表現有邏輯繼續撐著（等停利/停損/強制平倉）已經比提早出場更好，"
-                  "「沒開紅就跑」不值得做成正式規則。")
+            print("（強制平倉這組沒有足夠資料可以單獨判讀）")
+
         print("\n⚠️ 這只是同一份 IS 資料上的假設性計算（不是真的改邏輯重跑），"
               "如果結果顯示值得做，還是要把規則真的寫進 run_overnight_backtest()，"
               "在 IS 選完之後拿 OOS 驗證一次，才能真正確認不是巧合。")

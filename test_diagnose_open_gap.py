@@ -216,6 +216,49 @@ class TestExitReasonBreakdown(unittest.TestCase):
         self.assertTrue(breakdown.empty)
 
 
+class TestSummarizeByOpenGapAndExitReason(unittest.TestCase):
+    def test_groups_by_opened_up_and_exit_reason_separately(self):
+        enriched = pd.DataFrame([
+            # 沒開紅 + 強制平倉：現有邏輯虧很多，開盤出場虧比較少 -> 該有改善
+            {"opened_up": False, "exit_reason": "forced_close", "pnl": -5000.0,
+             "hypothetical_open_exit_pnl": -1000.0},
+            {"opened_up": False, "exit_reason": "forced_close", "pnl": -3000.0,
+             "hypothetical_open_exit_pnl": -500.0},
+            # 沒開紅 + 停損：現有邏輯跟開盤出場差不多 -> 不該有太大改善
+            {"opened_up": False, "exit_reason": "stop", "pnl": -4000.0,
+             "hypothetical_open_exit_pnl": -3900.0},
+            # 有開紅：不該混進「沒開紅」的統計
+            {"opened_up": True, "exit_reason": "target", "pnl": 6000.0,
+             "hypothetical_open_exit_pnl": 1000.0},
+        ])
+        breakdown = diag.summarize_by_open_gap_and_exit_reason(enriched)
+
+        not_opened_up = breakdown[breakdown["opened_up"] == False]
+        self.assertEqual(set(not_opened_up["exit_reason"]), {"forced_close", "stop"})
+
+        fc_row = not_opened_up[not_opened_up["exit_reason"] == "forced_close"].iloc[0]
+        self.assertEqual(fc_row["trade_count"], 2)
+        self.assertAlmostEqual(fc_row["avg_actual_pnl"], -4000.0)
+        self.assertAlmostEqual(fc_row["avg_hypothetical_open_exit_pnl"], -750.0)
+
+        stop_row = not_opened_up[not_opened_up["exit_reason"] == "stop"].iloc[0]
+        self.assertEqual(stop_row["trade_count"], 1)
+        self.assertAlmostEqual(stop_row["avg_actual_pnl"], -4000.0)
+        self.assertAlmostEqual(stop_row["avg_hypothetical_open_exit_pnl"], -3900.0)
+
+        # 有開紅那組應該完全獨立分開，不能混進沒開紅的統計裡
+        opened_up = breakdown[breakdown["opened_up"] == True]
+        self.assertEqual(len(opened_up), 1)
+        self.assertEqual(opened_up.iloc[0]["exit_reason"], "target")
+
+    def test_empty_input_returns_empty_with_columns(self):
+        breakdown = diag.summarize_by_open_gap_and_exit_reason(pd.DataFrame())
+        self.assertTrue(breakdown.empty)
+        for col in ["opened_up", "exit_reason", "trade_count",
+                    "avg_actual_pnl", "avg_hypothetical_open_exit_pnl"]:
+            self.assertIn(col, breakdown.columns)
+
+
 class TestIntegrationWithSyntheticPipeline(unittest.TestCase):
     def test_full_run_does_not_crash_and_only_uses_is_days(self):
         pipeline_inputs = make_pipeline_inputs()
@@ -241,6 +284,12 @@ class TestIntegrationWithSyntheticPipeline(unittest.TestCase):
 
         summary = diag.summarize_by_open_gap(enriched)
         self.assertGreater(len(summary), 0)
+
+        breakdown = diag.summarize_by_open_gap_and_exit_reason(enriched)
+        self.assertGreater(len(breakdown), 0)
+        for col in ["opened_up", "exit_reason", "trade_count",
+                    "avg_actual_pnl", "avg_hypothetical_open_exit_pnl"]:
+            self.assertIn(col, breakdown.columns)
 
 
 if __name__ == "__main__":
