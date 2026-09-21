@@ -48,6 +48,14 @@ on:
         options:
           - "59"
           - "full"
+      min_candidates:
+        description: "候選股數量門檻（backtest / cross_period 模式使用）：留空=不啟用。當天通過硬門檻的候選股數量低於這個數字就整天不交易。⚠️新調的話請先在backtest模式(IS/OOS)上調好、鎖定，再拿去cross_period做最終確認，不要直接在cross_period上試調"
+        required: false
+        default: ""
+      min_trust_ratio:
+        description: "投信買超比重(trust_ratio，原始數值%，非分數)絕對門檻（backtest / cross_period 模式使用）：留空=不啟用。缺值或低於這個門檻的候選股直接剔除，不進入排名評分。⚠️新調的話請先在backtest模式(IS/OOS)上調好、鎖定，再拿去cross_period做最終確認，不要直接在cross_period上試調"
+        required: false
+        default: ""
       refresh:
         description: "忽略快取，強制重新下載所有資料"
         required: false
@@ -131,6 +139,16 @@ jobs:
             REFRESH_FLAG="--refresh"
           fi
 
+          MIN_CANDIDATES_FLAG=""
+          if [ -n "${{ github.event.inputs.min_candidates }}" ]; then
+            MIN_CANDIDATES_FLAG="--min-candidates ${{ github.event.inputs.min_candidates }}"
+          fi
+
+          MIN_TRUST_RATIO_FLAG=""
+          if [ -n "${{ github.event.inputs.min_trust_ratio }}" ]; then
+            MIN_TRUST_RATIO_FLAG="--min-trust-ratio ${{ github.event.inputs.min_trust_ratio }}"
+          fi
+
           MODE="${{ github.event.inputs.mode }}"
 
           if [ "$MODE" = "sweep" ]; then
@@ -186,6 +204,8 @@ jobs:
               --top-n "${{ github.event.inputs.top_n }}" \
               --slippage-pct "${{ github.event.inputs.slippage_pct }}" \
               --universe "${{ github.event.inputs.universe }}" \
+              $MIN_CANDIDATES_FLAG \
+              $MIN_TRUST_RATIO_FLAG \
               $REFRESH_FLAG \
               2>&1 | tee overnight_backtest_result.log
 
@@ -198,6 +218,8 @@ jobs:
               --chip-weight "${{ github.event.inputs.chip_weight }}" \
               --slippage-pct "${{ github.event.inputs.slippage_pct }}" \
               --universe "${{ github.event.inputs.universe }}" \
+              $MIN_CANDIDATES_FLAG \
+              $MIN_TRUST_RATIO_FLAG \
               $REFRESH_FLAG \
               2>&1 | tee overnight_backtest_result.log
           fi
