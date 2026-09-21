@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       mode:
-        description: "跑哪一種：backtest(單組參數IS/OOS回測)、sweep(權重/門檻參數掃描)、atr_sweep(ATR停利停損倍數掃描)、ablation(單一訊號拆解測試)、diagnose_open_gap(隔日沒開紅提早出場的假設驗證)、combined(訊號權重x ATR參數合併測試)"
+        description: "跑哪一種：backtest(單組參數IS/OOS回測)、sweep(權重/門檻參數掃描)、atr_sweep(ATR停利停損倍數掃描)、ablation(單一訊號拆解測試)、diagnose_open_gap(隔日沒開紅提早出場的假設驗證)、combined(訊號權重x ATR參數合併測試)、cross_period(用鎖定參數在全新獨立區間跨期驗證，start/end要填完全不重疊的期間)"
         required: true
         default: "backtest"
         type: choice
@@ -15,6 +15,7 @@ on:
           - ablation
           - diagnose_open_gap
           - combined
+          - cross_period
       start_date:
         description: "回測起始日 (YYYY-MM-DD)"
         required: true
@@ -157,6 +158,17 @@ jobs:
           elif [ "$MODE" = "combined" ]; then
             # combined 模式：把訊號拆解跟ATR掃描分別驗證過的好組合疊在一起測，只在IS區間內跑。
             python3 sweep_combined_best.py \
+              --start "${{ github.event.inputs.start_date }}" \
+              --end "${{ github.event.inputs.end_date }}" \
+              --top-n "${{ github.event.inputs.top_n }}" \
+              $REFRESH_FLAG \
+              2>&1 | tee overnight_backtest_result.log
+
+          elif [ "$MODE" = "cross_period" ]; then
+            # cross_period 模式：用鎖定的候選參數，在start/end指定的全新獨立區間上驗證。
+            # ⚠️ start_date/end_date這裡務必填一段跟平常用的2023-09-15~2026-09-14
+            # 完全不重疊的期間，不然就失去「跨期驗證」的意義了。
+            python3 cross_period_validation.py \
               --start "${{ github.event.inputs.start_date }}" \
               --end "${{ github.event.inputs.end_date }}" \
               --top-n "${{ github.event.inputs.top_n }}" \
