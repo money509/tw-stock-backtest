@@ -21,11 +21,19 @@ import datetime
 import requests
 import pandas as pd
 
+from network_utils import run_with_hard_timeout, HardTimeout
+
 CHIP_CACHE_DIR = os.path.join(os.path.dirname(__file__), "chip_cache")
 HARD_TIMEOUT_SECONDS = 30
 MAX_RETRIES = 3
 RETRY_BACKOFF_SECONDS = 3
 REQUEST_DELAY_SECONDS = 1.5  # 兩次請求之間的間隔
+# day_trading_loader.py 實測遇過 requests的timeout參數在極少數網路邊緣案例
+# (連線建立、資料卡住不傳)下沒有真的生效，導致單一天卡死超過1小時，整個
+# 序列下載流程卡住不動。這裡一樣用network_utils.run_with_hard_timeout()包一層，
+# 不管requests自己的timeout有沒有生效，都強制在THREAD_HARD_TIMEOUT_SECONDS
+# 秒之後放棄等待、視為這次嘗試失敗，讓外層重試邏輯接手。
+THREAD_HARD_TIMEOUT_SECONDS = HARD_TIMEOUT_SECONDS + 10
 # 改進：實測證實這個端點對「同時多個連線」極度敏感 —— 平行8執行緒時91%請求失敗，
 # 降到3執行緒仍有82%失敗，但改成完全序列處理(一次一個請求、間隔2秒)時5次診斷全部成功。
 # 因此這裡放棄平行下載，改回單純序列迴圈，犧牲一點速度換取穩定成功率。
@@ -158,12 +166,19 @@ def fetch_t86_day(date_str: str):
 def _fetch_one_day_with_retry(day_str: str):
     """幫單一天套上重試邏輯，回傳 (day_str, data_dict_or_None, success_bool)。
     success_bool=False 代表重試用盡仍失敗，呼叫端不該把這天當成「確認無交易」快取起來，
-    應該留到下次重跑再試，避免真實資料被永久誤判成空白。"""
+    應該留到下次重跑再試，避免真實資料被永久誤判成空白。
+
+    fetch_t86_day() 包在 run_with_hard_timeout() 裡執行：requests的timeout參數
+    在極少數網路邊緣案例下可能沒有真的生效(見network_utils.py說明)，這裡確保
+    單一天最多卡THREAD_HARD_TIMEOUT_SECONDS秒就會被視為失敗、進入重試邏輯，
+    不會拖住整個序列下載流程。HardTimeout也當成跟FetchFailed一樣可重試的失敗。
+    """
     for attempt in range(MAX_RETRIES + 1):
         try:
-            data = fetch_t86_day(day_str)
+            data = run_with_hard_timeout(
+                fetch_t86_day, args=(day_str,), timeout=THREAD_HARD_TIMEOUT_SECONDS)
             return day_str, data, True
-        except FetchFailed:
+        except (FetchFailed, HardTimeout):
             if attempt < MAX_RETRIES:
                 time.sleep(RETRY_BACKOFF_SECONDS)
                 continue

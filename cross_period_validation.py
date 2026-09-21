@@ -69,7 +69,8 @@ CANDIDATES = [
 
 
 def run_cross_period_validation(pipeline_inputs, candidates=None, top_n=5,
-                                 compare_chip_timing=True, slippage_pct=0.0):
+                                 compare_chip_timing=True, slippage_pct=0.0,
+                                 min_candidates=None, min_trust_ratio=None):
     """
     對每個鎖定的候選組合，在整段(未切IS/OOS)資料上跑一次回測。
 
@@ -91,6 +92,18 @@ def run_cross_period_validation(pipeline_inputs, candidates=None, top_n=5,
     (不另外拆成第4個比較軸，避免跑的次數再翻倍——如果想單獨看滑價的影響，
     對同一批候選組合分別用slippage_pct=0.0跟slippage_pct>0各跑一次這支函式，
     自行比較兩次結果即可)。
+
+    min_candidates：可選，往下傳給每次run_overnight_backtest()呼叫，見
+    overnight_momentum_engine.py的說明。不傳(維持None)就完全不啟用，向後相容。
+    ⚠️ 這個參數如果是新調的，應該先在原本的IS/OOS資料(2023-09-15~2026-09-14)
+    上調好、鎖定下來，再拿來這裡的獨立驗證區間做最終確認——不要直接在這裡
+    的資料上調參數，那樣就等於用樣本外資料選參數，失去「跨期驗證」的意義。
+
+    min_trust_ratio：可選，往下傳給每次run_overnight_backtest()呼叫，見
+    overnight_momentum_engine.py的說明。不傳(維持None)就完全不啟用，向後相容。
+    ⚠️ 這個參數如果是新調的，應該先在原本的IS/OOS資料(2023-09-15~2026-09-14)
+    上調好、鎖定下來，再拿來這裡的獨立驗證區間做最終確認，理由跟min_candidates
+    一模一樣。
     """
     candidates = candidates or CANDIDATES
     trading_days = pipeline_inputs["trading_days"]
@@ -107,6 +120,8 @@ def run_cross_period_validation(pipeline_inputs, candidates=None, top_n=5,
         trading_days=trading_days,
         top_n=top_n,
         slippage_pct=slippage_pct,
+        min_candidates=min_candidates,
+        min_trust_ratio=min_trust_ratio,
     )
 
     # (use_prior_day_chip_data, use_prior_day_us_market_data, 顯示用標籤)
@@ -161,6 +176,15 @@ def main():
                               "full=taifex_universe.py的249檔完整可交易清單"
                               "(全新、未驗證的股票池，鎖定的候選參數是用59檔清單挑出來的那組，"
                               "結果不能直接跟59檔版本比較，建議當成獨立實驗看待)")
+    parser.add_argument("--min-candidates", type=int, default=None,
+                         help="候選股數量門檻(預設不啟用)：當天通過硬門檻的候選股數量"
+                              "低於這個數字就整天不交易。⚠️這個值應該先在原本的IS/OOS"
+                              "資料上調好、鎖定下來，不要直接在這裡的獨立驗證區間上試調")
+    parser.add_argument("--min-trust-ratio", type=float, default=None,
+                         help="投信買超比重(trust_ratio，原始數值%%，非分數)絕對門檻"
+                              "(預設不啟用)：缺值或低於這個門檻的候選股直接剔除，"
+                              "不進入排名評分。⚠️這個值應該先在原本的IS/OOS資料上"
+                              "調好、鎖定下來，不要直接在這裡的獨立驗證區間上試調")
     args = parser.parse_args()
 
     start_date = datetime.datetime.strptime(args.start, "%Y-%m-%d").date()
@@ -185,7 +209,8 @@ def main():
 
     print(f"\n在整段獨立資料上（不切IS/OOS，因為這整段本身就是樣本外）跑鎖定的候選組合 ...\n")
     result_df = run_cross_period_validation(
-        pipeline_inputs, top_n=args.top_n, slippage_pct=args.slippage_pct)
+        pipeline_inputs, top_n=args.top_n, slippage_pct=args.slippage_pct,
+        min_candidates=args.min_candidates, min_trust_ratio=args.min_trust_ratio)
 
     print(f"\n=== 跨期驗證結果 ===")
     print(result_df.to_string(index=False))

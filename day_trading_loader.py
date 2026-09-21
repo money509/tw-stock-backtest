@@ -35,6 +35,8 @@ import datetime
 import pandas as pd
 import requests
 
+from network_utils import run_with_hard_timeout, HardTimeout
+
 # ---------------------------------------------------------------------------
 # 常數設定
 # ---------------------------------------------------------------------------
@@ -55,6 +57,9 @@ REQUEST_DELAY_SEC = 1.5          # 序列請求之間的延遲（已證實 100% 
 REQUEST_TIMEOUT_SEC = 15
 MAX_RETRIES = 3                  # 每個日期最多重試次數（不含第一次嘗試）
 RETRY_BACKOFF_BASE_SEC = 3.0     # 重試前的基礎延遲，每次重試遞增
+HARD_TIMEOUT_SEC = REQUEST_TIMEOUT_SEC + 10  # 見network_utils.py：requests自己的
+                                              # timeout在極少數情況下不會真的生效，
+                                              # 這裡是不管有沒有生效都強制放棄等待的上限
 
 # tables[1] 的欄位 index（已用實際回應驗證）
 COL_CODE = 0
@@ -147,12 +152,17 @@ def _fetch_one_day_with_retry(date_str):
     """
     對單一日期執行「序列請求 + 重試」邏輯。
     只有 FetchFailed（可重試錯誤）才會重試；「確定無資料」的 [] 直接回傳，不重試。
+
+    _fetch_one_day() 包在 run_with_hard_timeout() 裡執行：requests的timeout參數
+    實測遇過在極少數網路邊緣案例(連線建立、資料卡住不傳)下沒有真的生效，導致
+    單一天卡死超過整個流程能忍受的時間(實測發生過超過1小時)。HardTimeout也會
+    被當成跟FetchFailed一樣「可重試」的失敗處理。
     """
     last_err = None
     for attempt in range(MAX_RETRIES + 1):
         try:
-            return _fetch_one_day(date_str)
-        except FetchFailed as e:
+            return run_with_hard_timeout(_fetch_one_day, args=(date_str,), timeout=HARD_TIMEOUT_SEC)
+        except (FetchFailed, HardTimeout) as e:
             last_err = e
             if attempt < MAX_RETRIES:
                 backoff = RETRY_BACKOFF_BASE_SEC * (attempt + 1) + random.uniform(0, 1.0)

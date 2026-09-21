@@ -236,6 +236,64 @@ class TestFullPipelineIntegration(unittest.TestCase):
         self.assertEqual(len(captured), 2)  # IS + OOS 各跑一次
         self.assertTrue(all(v == 0.2 for v in captured))
 
+    def test_run_is_oos_backtest_passes_through_min_candidates(self):
+        """驗證 --min-candidates 真的有透過 run_is_oos_backtest 的 **backtest_kwargs
+        傳到 run_overnight_backtest，不是被忽略的死參數。"""
+        inputs = co.build_pipeline_inputs(
+            self.whitelist,
+            datetime.date(2026, 1, 1), datetime.date(2026, 6, 1),
+            price_loader=self.fake_price_loader,
+            chip_loader=self.fake_chip_loader,
+            day_trading_loader_fn=self.fake_day_trading_loader,
+            us_market_loader_fn=self.fake_us_market_loader,
+            dividend_loader_fn=self.fake_dividend_loader,
+        )
+
+        captured = []
+        real_run = ome.run_overnight_backtest
+
+        def spy(**kwargs):
+            captured.append(kwargs.get("min_candidates"))
+            return real_run(**kwargs)
+
+        ome.run_overnight_backtest = spy
+        try:
+            co.run_is_oos_backtest(inputs, top_n=2, min_candidates=2)
+        finally:
+            ome.run_overnight_backtest = real_run
+
+        self.assertEqual(len(captured), 2)  # IS + OOS 各跑一次
+        self.assertTrue(all(v == 2 for v in captured))
+
+    def test_run_is_oos_backtest_passes_through_min_trust_ratio(self):
+        """驗證 --min-trust-ratio 真的有透過 run_is_oos_backtest 的 **backtest_kwargs
+        傳到 run_overnight_backtest，不是被忽略的死參數。"""
+        inputs = co.build_pipeline_inputs(
+            self.whitelist,
+            datetime.date(2026, 1, 1), datetime.date(2026, 6, 1),
+            price_loader=self.fake_price_loader,
+            chip_loader=self.fake_chip_loader,
+            day_trading_loader_fn=self.fake_day_trading_loader,
+            us_market_loader_fn=self.fake_us_market_loader,
+            dividend_loader_fn=self.fake_dividend_loader,
+        )
+
+        captured = []
+        real_run = ome.run_overnight_backtest
+
+        def spy(**kwargs):
+            captured.append(kwargs.get("min_trust_ratio"))
+            return real_run(**kwargs)
+
+        ome.run_overnight_backtest = spy
+        try:
+            co.run_is_oos_backtest(inputs, top_n=2, min_trust_ratio=3.0)
+        finally:
+            ome.run_overnight_backtest = real_run
+
+        self.assertEqual(len(captured), 2)  # IS + OOS 各跑一次
+        self.assertTrue(all(v == 3.0 for v in captured))
+
 
 class TestUniverseChoices(unittest.TestCase):
     """--universe 選項：59檔舊清單 vs taifex_universe.py 的249檔完整清單。"""

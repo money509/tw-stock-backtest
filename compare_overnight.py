@@ -220,6 +220,19 @@ def main():
                               "結果不能直接跟59檔版本比較，建議當成獨立實驗看待)")
     parser.add_argument("--slippage-pct", type=float, default=0.0,
                          help="模擬滑價百分比(預設0=不模擬)，例如0.1代表買進多付0.1%%、賣出少拿0.1%%")
+    parser.add_argument("--min-candidates", type=int, default=None,
+                         help="候選股數量門檻(預設不啟用)：當天通過硬門檻的候選股數量"
+                              "低於這個數字，直接視為今天盤面太弱、整天不交易，"
+                              "不是靠分數本身反映(final_score是當天的相對排名分數，"
+                              "候選股很少時排第一名照樣會接近滿分，看不出「今天訊號其實很弱」)")
+    parser.add_argument("--min-trust-ratio", type=float, default=None,
+                         help="投信買超比重(trust_ratio，原始數值%%，非分數)絕對門檻"
+                              "(預設不啟用)：缺值或低於這個門檻的候選股直接剔除，"
+                              "不進入排名評分——避免percentile_score只看「當天排第幾名」"
+                              "看不出「今天最強的訊號，絕對值是不是其實很弱」的問題。"
+                              "⚠️ 新調的話請先在這份IS/OOS資料上調好、鎖定，"
+                              "再拿去跨期驗證(cross_period_validation.py)做最終確認，"
+                              "不要直接在跨期驗證資料上試調")
     args = parser.parse_args()
 
     start_date = datetime.datetime.strptime(args.start, "%Y-%m-%d").date()
@@ -245,6 +258,8 @@ def main():
         tech_weight=args.tech_weight, chip_weight=args.chip_weight,
         us_market_drop_threshold=args.us_drop_threshold,
         slippage_pct=args.slippage_pct,
+        min_candidates=args.min_candidates,
+        min_trust_ratio=args.min_trust_ratio,
     )
 
     print_summary("樣本內 IS (前70%)", is_summary)

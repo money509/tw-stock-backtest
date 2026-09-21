@@ -387,6 +387,281 @@ class TestChipDataLag(unittest.TestCase):
             self.assertTrue(pd.isna(cand_lag_first_day.iloc[0]["trust_ratio"]))
 
 
+class TestMinCandidates(unittest.TestCase):
+    """
+    驗證 min_candidates(scan_candidates_for_date) 跟往下傳的
+    run_overnight_backtest 同名參數：
+      1. 不傳/預設None，行為要跟改之前完全一樣(不篩選候選股數量)
+      2. 當天通過硬門檻的候選股數量 < min_candidates 時，整天直接回傳空
+         DataFrame(不交易)，即使那天原本有股票能通過硬門檻、能算出分數
+      3. 候選股數量 >= min_candidates 時，不受影響，維持正常選股
+    """
+
+    def _build_indicators(self, closes, volume=1_000_000):
+        raw = make_price_series(closes)
+        raw["volume"] = volume
+        return ome.precompute_overnight_indicators(raw)
+
+    def setUp(self):
+        # 3支股票，同樣的價量走勢設計，確保同一天都會通過硬門檻
+        # (站上均線、成交金額足夠)，方便控制「候選股數量」這個變數。
+        closes = [100 + i * 0.5 for i in range(80)]
+        self.stock_a = self._build_indicators(closes)
+        self.stock_b = self._build_indicators(closes)
+        self.stock_c = self._build_indicators(closes)
+        self.indicators_by_code = {"AAAA": self.stock_a, "BBBB": self.stock_b, "CCCC": self.stock_c}
+
+        market_df = pd.DataFrame({
+            "date": self.stock_a["date"], "close": [150 + i * 0.1 for i in range(80)]
+        })
+        self.market_returns = ome.precompute_market_returns(market_df)
+
+        self.dates = self.stock_a["date"].tolist()
+        self.today = self.dates[70]
+        self.empty_chip = pd.DataFrame(columns=["date", "code", "ratio"])
+        self.empty_dtr = pd.DataFrame(columns=["date", "code", "day_trading_ratio"])
+
+    def test_default_none_does_not_filter_by_pool_size(self):
+        cand = ome.scan_candidates_for_date(
+            self.today, self.indicators_by_code, self.market_returns,
+            self.empty_chip, self.empty_chip, self.empty_dtr,
+            universe_codes=["AAAA", "BBBB", "CCCC"],
+        )
+        self.assertEqual(len(cand), 3)
+
+    def test_pool_size_below_threshold_returns_empty(self):
+        # 3支股票都通過硬門檻，但min_candidates=5(門檻比實際候選數還高)，
+        # 應該整天直接不交易(空DataFrame)，不是「照樣選出3支裡最強的」。
+        cand = ome.scan_candidates_for_date(
+            self.today, self.indicators_by_code, self.market_returns,
+            self.empty_chip, self.empty_chip, self.empty_dtr,
+            universe_codes=["AAAA", "BBBB", "CCCC"],
+            min_candidates=5,
+        )
+        self.assertTrue(cand.empty)
+
+    def test_pool_size_at_or_above_threshold_is_unaffected(self):
+        cand = ome.scan_candidates_for_date(
+            self.today, self.indicators_by_code, self.market_returns,
+            self.empty_chip, self.empty_chip, self.empty_dtr,
+            universe_codes=["AAAA", "BBBB", "CCCC"],
+            min_candidates=3,
+        )
+        self.assertEqual(len(cand), 3)
+
+    def test_run_overnight_backtest_default_none_keeps_old_behavior(self):
+        trading_days = self.dates
+        trades_old = ome.run_overnight_backtest(
+            indicators_by_code=self.indicators_by_code,
+            market_returns_df=self.market_returns,
+            foreign_ratio_df=self.empty_chip,
+            trust_ratio_df=self.empty_chip,
+            day_trading_ratio_df=self.empty_dtr,
+            trading_days=trading_days,
+            universe_codes=["AAAA", "BBBB", "CCCC"],
+            top_n=3,
+        )
+        trades_explicit_none = ome.run_overnight_backtest(
+            indicators_by_code=self.indicators_by_code,
+            market_returns_df=self.market_returns,
+            foreign_ratio_df=self.empty_chip,
+            trust_ratio_df=self.empty_chip,
+            day_trading_ratio_df=self.empty_dtr,
+            trading_days=trading_days,
+            universe_codes=["AAAA", "BBBB", "CCCC"],
+            top_n=3,
+            min_candidates=None,
+        )
+        self.assertEqual(len(trades_old), len(trades_explicit_none))
+
+    def test_run_overnight_backtest_min_candidates_blocks_all_entries(self):
+        """把門檻設得比整個universe(3檔)還高，應該完全沒有任何交易產生。"""
+        trading_days = self.dates
+        trades = ome.run_overnight_backtest(
+            indicators_by_code=self.indicators_by_code,
+            market_returns_df=self.market_returns,
+            foreign_ratio_df=self.empty_chip,
+            trust_ratio_df=self.empty_chip,
+            day_trading_ratio_df=self.empty_dtr,
+            trading_days=trading_days,
+            universe_codes=["AAAA", "BBBB", "CCCC"],
+            top_n=3,
+            min_candidates=10,
+        )
+        self.assertEqual(trades, [])
+
+    def test_run_overnight_backtest_min_candidates_within_range_keeps_trading(self):
+        trading_days = self.dates
+        trades = ome.run_overnight_backtest(
+            indicators_by_code=self.indicators_by_code,
+            market_returns_df=self.market_returns,
+            foreign_ratio_df=self.empty_chip,
+            trust_ratio_df=self.empty_chip,
+            day_trading_ratio_df=self.empty_dtr,
+            trading_days=trading_days,
+            universe_codes=["AAAA", "BBBB", "CCCC"],
+            top_n=3,
+            min_candidates=3,
+        )
+        self.assertGreater(len(trades), 0)
+
+
+class TestMinTrustRatio(unittest.TestCase):
+    """
+    驗證 min_trust_ratio(scan_candidates_for_date) 跟往下傳的
+    run_overnight_backtest 同名參數：
+      1. 不傳/預設None，行為要跟改之前完全一樣(不篩選trust_ratio絕對值)
+      2. trust_ratio 缺值(NaN)或低於門檻的候選股要被剔除，不進入候選名單
+      3. trust_ratio 達到門檻的候選股不受影響，正常留在候選名單並參與評分
+      4. 全部候選股都被門檻剔除時，整天回傳空DataFrame(不交易)
+    """
+
+    def _build_indicators(self, closes, volume=1_000_000):
+        raw = make_price_series(closes)
+        raw["volume"] = volume
+        return ome.precompute_overnight_indicators(raw)
+
+    def setUp(self):
+        # 3支股票，同樣的價量走勢，確保同一天都會通過硬門檻，
+        # 差別只在投信買超比重(trust_ratio)的原始數值高低。
+        closes = [100 + i * 0.5 for i in range(80)]
+        self.stock_a = self._build_indicators(closes)  # 高trust_ratio
+        self.stock_b = self._build_indicators(closes)  # 低trust_ratio(但排名仍可能第2)
+        self.stock_c = self._build_indicators(closes)  # 無trust_ratio資料(NaN)
+        self.indicators_by_code = {"AAAA": self.stock_a, "BBBB": self.stock_b, "CCCC": self.stock_c}
+
+        market_df = pd.DataFrame({
+            "date": self.stock_a["date"], "close": [150 + i * 0.1 for i in range(80)]
+        })
+        self.market_returns = ome.precompute_market_returns(market_df)
+
+        self.dates = self.stock_a["date"].tolist()
+        self.today = self.dates[70]
+        self.empty_chip = pd.DataFrame(columns=["date", "code", "ratio"])
+        self.empty_dtr = pd.DataFrame(columns=["date", "code", "day_trading_ratio"])
+
+        # AAAA投信買超比重5%(高)、BBBB 0.1%(低，矬子裡拔將軍也可能排到高分)、
+        # CCCC完全沒有資料(merge後是NaN)。
+        self.trust_ratio_df = pd.DataFrame([
+            {"date": self.today, "code": "AAAA", "ratio": 5.0},
+            {"date": self.today, "code": "BBBB", "ratio": 0.1},
+        ])
+
+    def test_default_none_does_not_filter_by_trust_ratio(self):
+        cand = ome.scan_candidates_for_date(
+            self.today, self.indicators_by_code, self.market_returns,
+            self.empty_chip, self.trust_ratio_df, self.empty_dtr,
+            universe_codes=["AAAA", "BBBB", "CCCC"],
+        )
+        # 沒設門檻，3檔都應該留著(CCCC的trust_ratio是NaN，但percentile_score
+        # 會自己給它0分，不會被剔除出候選名單)。
+        self.assertEqual(len(cand), 3)
+
+    def test_threshold_excludes_low_and_nan_trust_ratio(self):
+        cand = ome.scan_candidates_for_date(
+            self.today, self.indicators_by_code, self.market_returns,
+            self.empty_chip, self.trust_ratio_df, self.empty_dtr,
+            universe_codes=["AAAA", "BBBB", "CCCC"],
+            min_trust_ratio=3.0,
+        )
+        # 只有AAAA(5%)達到門檻，BBBB(0.1%)跟CCCC(NaN)都應該被剔除。
+        self.assertEqual(len(cand), 1)
+        self.assertEqual(cand.iloc[0]["code"], "AAAA")
+
+    def test_threshold_keeps_qualifying_candidate_unaffected(self):
+        cand = ome.scan_candidates_for_date(
+            self.today, self.indicators_by_code, self.market_returns,
+            self.empty_chip, self.trust_ratio_df, self.empty_dtr,
+            universe_codes=["AAAA", "BBBB", "CCCC"],
+            min_trust_ratio=0.05,
+        )
+        # 門檻設得夠低，AAAA跟BBBB都該留著，只有NaN的CCCC被剔除。
+        self.assertEqual(len(cand), 2)
+        self.assertIn("AAAA", cand["code"].tolist())
+        self.assertIn("BBBB", cand["code"].tolist())
+
+    def test_threshold_blocks_all_candidates_returns_empty(self):
+        cand = ome.scan_candidates_for_date(
+            self.today, self.indicators_by_code, self.market_returns,
+            self.empty_chip, self.trust_ratio_df, self.empty_dtr,
+            universe_codes=["AAAA", "BBBB", "CCCC"],
+            min_trust_ratio=100.0,
+        )
+        self.assertTrue(cand.empty)
+
+    def test_run_overnight_backtest_default_none_keeps_old_behavior(self):
+        trading_days = self.dates
+        trades_old = ome.run_overnight_backtest(
+            indicators_by_code=self.indicators_by_code,
+            market_returns_df=self.market_returns,
+            foreign_ratio_df=self.empty_chip,
+            trust_ratio_df=self.trust_ratio_df,
+            day_trading_ratio_df=self.empty_dtr,
+            trading_days=trading_days,
+            universe_codes=["AAAA", "BBBB", "CCCC"],
+            top_n=3,
+        )
+        trades_explicit_none = ome.run_overnight_backtest(
+            indicators_by_code=self.indicators_by_code,
+            market_returns_df=self.market_returns,
+            foreign_ratio_df=self.empty_chip,
+            trust_ratio_df=self.trust_ratio_df,
+            day_trading_ratio_df=self.empty_dtr,
+            trading_days=trading_days,
+            universe_codes=["AAAA", "BBBB", "CCCC"],
+            top_n=3,
+            min_trust_ratio=None,
+        )
+        self.assertEqual(len(trades_old), len(trades_explicit_none))
+
+    def test_run_overnight_backtest_min_trust_ratio_blocks_all_entries(self):
+        trading_days = self.dates
+        trades = ome.run_overnight_backtest(
+            indicators_by_code=self.indicators_by_code,
+            market_returns_df=self.market_returns,
+            foreign_ratio_df=self.empty_chip,
+            trust_ratio_df=self.trust_ratio_df,
+            day_trading_ratio_df=self.empty_dtr,
+            trading_days=trading_days,
+            universe_codes=["AAAA", "BBBB", "CCCC"],
+            top_n=3,
+            min_trust_ratio=100.0,
+        )
+        self.assertEqual(trades, [])
+
+    def test_run_overnight_backtest_min_trust_ratio_within_range_keeps_trading(self):
+        trading_days = self.dates
+        trades = ome.run_overnight_backtest(
+            indicators_by_code=self.indicators_by_code,
+            market_returns_df=self.market_returns,
+            foreign_ratio_df=self.empty_chip,
+            trust_ratio_df=self.trust_ratio_df,
+            day_trading_ratio_df=self.empty_dtr,
+            trading_days=trading_days,
+            universe_codes=["AAAA", "BBBB", "CCCC"],
+            top_n=3,
+            min_trust_ratio=3.0,
+        )
+        self.assertGreater(len(trades), 0)
+        # 只有AAAA達到門檻，所有交易都應該只來自AAAA。
+        codes_traded = {t["code"] for t in trades}
+        self.assertEqual(codes_traded, {"AAAA"})
+
+    def test_min_candidates_and_min_trust_ratio_are_independently_composable(self):
+        # min_candidates用的是「通過技術面硬門檻的候選股數量」(3檔，不受
+        # min_trust_ratio影響)，min_trust_ratio則是在那之後才篩掉trust_ratio
+        # 不夠的候選股——兩者應該各自獨立judge，不互相污染對方的判斷基準。
+        cand = ome.scan_candidates_for_date(
+            self.today, self.indicators_by_code, self.market_returns,
+            self.empty_chip, self.trust_ratio_df, self.empty_dtr,
+            universe_codes=["AAAA", "BBBB", "CCCC"],
+            min_candidates=3,  # 3檔都通過技術面硬門檻，剛好等於門檻，不會被擋
+            min_trust_ratio=3.0,  # 之後才篩掉BBBB跟CCCC
+        )
+        self.assertEqual(len(cand), 1)
+        self.assertEqual(cand.iloc[0]["code"], "AAAA")
+
+
 class TestSignalWeights(unittest.TestCase):
     def _build_indicators(self, closes, volume=1_000_000):
         raw = make_price_series(closes)

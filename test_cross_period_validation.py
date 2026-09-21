@@ -245,6 +245,84 @@ class TestRunCrossPeriodValidation(unittest.TestCase):
         self.assertEqual(len(captured), 1)
         self.assertAlmostEqual(captured[0], 0.25)
 
+    def test_min_candidates_is_passed_through_to_engine(self):
+        """驗證min_candidates真的有傳到run_overnight_backtest，不是被忽略的死參數。"""
+        captured = []
+        import overnight_momentum_engine as ome
+        real_run = ome.run_overnight_backtest
+
+        def spy(**kwargs):
+            captured.append(kwargs.get("min_candidates"))
+            return real_run(**kwargs)
+
+        ome.run_overnight_backtest = spy
+        try:
+            small_candidates = [
+                {"label": "只用量比", "signal_weights": {"score_volume_ratio": 1.0},
+                 "atr_stop_mult": 0.8, "atr_target_mult": 1.2},
+            ]
+            cpv.run_cross_period_validation(
+                self.pipeline_inputs, candidates=small_candidates, top_n=2,
+                compare_chip_timing=False, min_candidates=3)
+        finally:
+            ome.run_overnight_backtest = real_run
+
+        self.assertEqual(len(captured), 1)
+        self.assertEqual(captured[0], 3)
+
+    def test_min_candidates_default_none_keeps_old_behavior(self):
+        small_candidates = [
+            {"label": "只用量比", "signal_weights": {"score_volume_ratio": 1.0},
+             "atr_stop_mult": 0.8, "atr_target_mult": 1.2},
+        ]
+        default_df = cpv.run_cross_period_validation(
+            self.pipeline_inputs, candidates=small_candidates, top_n=2,
+            compare_chip_timing=False)
+        explicit_none_df = cpv.run_cross_period_validation(
+            self.pipeline_inputs, candidates=small_candidates, top_n=2,
+            compare_chip_timing=False, min_candidates=None)
+        self.assertAlmostEqual(
+            default_df.iloc[0]["total_pnl"], explicit_none_df.iloc[0]["total_pnl"])
+
+    def test_min_trust_ratio_is_passed_through_to_engine(self):
+        """驗證min_trust_ratio真的有傳到run_overnight_backtest，不是被忽略的死參數。"""
+        captured = []
+        import overnight_momentum_engine as ome
+        real_run = ome.run_overnight_backtest
+
+        def spy(**kwargs):
+            captured.append(kwargs.get("min_trust_ratio"))
+            return real_run(**kwargs)
+
+        ome.run_overnight_backtest = spy
+        try:
+            small_candidates = [
+                {"label": "只用量比", "signal_weights": {"score_volume_ratio": 1.0},
+                 "atr_stop_mult": 0.8, "atr_target_mult": 1.2},
+            ]
+            cpv.run_cross_period_validation(
+                self.pipeline_inputs, candidates=small_candidates, top_n=2,
+                compare_chip_timing=False, min_trust_ratio=3.0)
+        finally:
+            ome.run_overnight_backtest = real_run
+
+        self.assertEqual(len(captured), 1)
+        self.assertEqual(captured[0], 3.0)
+
+    def test_min_trust_ratio_default_none_keeps_old_behavior(self):
+        small_candidates = [
+            {"label": "只用量比", "signal_weights": {"score_volume_ratio": 1.0},
+             "atr_stop_mult": 0.8, "atr_target_mult": 1.2},
+        ]
+        default_df = cpv.run_cross_period_validation(
+            self.pipeline_inputs, candidates=small_candidates, top_n=2,
+            compare_chip_timing=False)
+        explicit_none_df = cpv.run_cross_period_validation(
+            self.pipeline_inputs, candidates=small_candidates, top_n=2,
+            compare_chip_timing=False, min_trust_ratio=None)
+        self.assertAlmostEqual(
+            default_df.iloc[0]["total_pnl"], explicit_none_df.iloc[0]["total_pnl"])
+
 
 class TestCandidatesConstant(unittest.TestCase):
     def test_candidates_have_required_fields(self):

@@ -222,10 +222,27 @@ def scan_candidates_for_date(date_str, indicators_by_code, market_returns_df,
                               signal_weights=None,
                               ex_dividend_dates_by_code=None,
                               chip_date_str=None,
-                              us_market_date_str=None):
+                              us_market_date_str=None,
+                              min_candidates=None,
+                              min_trust_ratio=None):
     """
     對指定日期，回傳依最終分數排序的候選股 DataFrame（已套用硬門檻與評分）。
     若當天沒有任何股票通過硬門檻，回傳空 DataFrame。
+
+    min_candidates：可選，當天通過硬門檻的候選股數量門檻。不傳（維持None）
+    就完全不啟用，向後相容，跟改之前行為一模一樣。
+
+    背景：final_score用的是percentile_score，是「當天通過硬門檻的這批候選股
+    裡面排第幾名」的相對名次分數，不是絕對品質分數——代表就算今天只有2、3檔
+    股票通過硬門檻(盤面很弱、能買的標的很少)，裡面排名最高的那檔一樣會被算出
+    接近滿分，跟它放到歷史上、放到全市場比是不是真的強完全無關。這會讓策略
+    在盤面很弱的日子，還是被迫矬子裡拔將軍選一檔出來交易。
+
+    設min_candidates=N，代表「當天通過硬門檻的候選股數量 < N」時，直接視為
+    今天盤面太弱、候選池太窄，回傳空DataFrame（今天完全不交易），跟
+    us_market_drop_threshold那個「隔夜美股大跌就不進場」的開關是同一種概念：
+    用「今天的市場廣度不夠」當作額外的硬門檻，而不是靠分數本身去反映
+    （分數本身反映不出來，見上段說明）。
 
     us_market_returns_df：可選，us_market_loader.load_us_market_returns() 的輸出
     （欄位 date/close/return_pct）。這是隔夜跳空風險的源頭濾網——如果當天(date_str)
@@ -271,6 +288,30 @@ def scan_candidates_for_date(date_str, indicators_by_code, market_returns_df,
     us_market_date_str：可選，美股濾網實際要用「哪一天」的日期去查，跟
     date_str 分開處理，理由跟 chip_date_str 一模一樣（見上方⚠️說明）。
     不傳（維持 None）就沿用舊行為，直接查 date_str 當天。
+
+    min_trust_ratio：可選，投信買超金額佔成交金額比重（trust_ratio，原始數值，
+    不是分數）的絕對門檻。不傳（維持None）就完全不啟用，向後相容。
+
+    背景：score_trust用的也是percentile_score，是「當天候選股裡投信買超比重
+    排第幾名」的相對名次分數，只知道誰是當天第一名，不知道差距有多大——今天
+    最高的trust_ratio可能是5%（積極買超），也可能只是0.1%（幾乎沒買，但還是
+    矬子裡拔將軍變成當天第一名），percentile_score算出來的分數可能很接近。
+    這是min_candidates要解決的「候選股數量太少」問題以外，另一個獨立的問題：
+    就算候選股數量夠多，分數本身也看不出「今天最強的訊號，是不是連歷史上/
+    跟其他天比都算真的強」。
+
+    設min_trust_ratio=X，代表trust_ratio缺值(NaN)或低於X的候選股，
+    直接從候選名單剔除（不是扣分，是硬門檻），只有原始trust_ratio真的
+    達到這個絕對門檻的股票，才有資格被納入候選池繼續評分排名。
+
+    這個門檻是加在min_candidates的檢查「之後」（不影響min_candidates原本
+    「通過技術面硬門檻的候選股數量」這個判定基準，兩者是各自獨立、可疊加
+    的門檻）、技術面/籌碼面評分「之前」——被這個門檻剔除的候選股，不會進入
+    percentile_score排名，也就不會拉低/墊高其他候選股的相對名次分數。
+
+    ⚠️ 這個參數如果是新調的，應該先在原本的IS/OOS資料(2023-09-15~2026-09-14)
+    上調好、鎖定下來，再拿來跨期驗證區間做最終確認，不要直接在跨期驗證資料上
+    試調參數——否則跨期驗證就失去「獨立樣本外測試」的意義了。
     """
     us_market_lookup_date = us_market_date_str if us_market_date_str is not None else date_str
     if us_market_returns_df is not None and not us_market_returns_df.empty:
@@ -324,6 +365,11 @@ def scan_candidates_for_date(date_str, indicators_by_code, market_returns_df,
     if not rows:
         return pd.DataFrame()
 
+    if min_candidates is not None and len(rows) < min_candidates:
+        # 今天通過硬門檻的候選股數量太少(盤面太窄)，直接視為今天不交易，
+        # 不進入評分/排名階段——見上方docstring關於percentile_score相對名次的說明。
+        return pd.DataFrame()
+
     cand = pd.DataFrame(rows)
 
     # 併入籌碼面資料（當天沒有資料的股票，ratio 視為 NaN，percentile_score 會給0分）
@@ -339,6 +385,13 @@ def scan_candidates_for_date(date_str, indicators_by_code, market_returns_df,
     cand = cand.merge(dtr, on="code", how="left")
     cand = cand.merge(fr, on="code", how="left")
     cand = cand.merge(tr, on="code", how="left")
+
+    if min_trust_ratio is not None:
+        # 投信買超比重絕對門檻：缺值或低於門檻直接剔除，不進入排名分數計算，
+        # 見上方docstring關於percentile_score排名分數看不出絕對強弱的說明。
+        cand = cand[cand["trust_ratio"].notna() & (cand["trust_ratio"] >= min_trust_ratio)]
+        if cand.empty:
+            return pd.DataFrame()
 
     # 技術面評分
     cand["score_close_position"] = percentile_score(cand["close_position"], higher_is_better=True)
@@ -432,7 +485,9 @@ def run_overnight_backtest(indicators_by_code, market_returns_df,
                             ex_dividend_dates_by_code=None,
                             use_prior_day_chip_data=False,
                             use_prior_day_us_market_data=False,
-                            slippage_pct=0.0):
+                            slippage_pct=0.0,
+                            min_candidates=None,
+                            min_trust_ratio=None):
     """
     對 trading_days（已排序的 YYYYMMDD 字串 list）逐日跑隔日衝策略。
     第 i 天收盤選股、進場；用第 i+1 天的 K 棒模擬出場。
@@ -473,6 +528,12 @@ def run_overnight_backtest(indicators_by_code, market_returns_df,
     entry_price/exit_price本身（這兩欄仍然回報理論價，方便跟既有分析程式相容），
     也不影響simulate_next_day_exit()本身的判斷邏輯（停損/停利/出場理由的
     判斷依據仍然是理論價，滑價只在最後換算成pnl時才套用）。
+
+    min_candidates：可選，往下傳給scan_candidates_for_date()，見它的docstring
+    說明。不傳（維持None）就完全不啟用，向後相容。
+
+    min_trust_ratio：可選，往下傳給scan_candidates_for_date()，見它的docstring
+    說明。不傳（維持None）就完全不啟用，向後相容。
     """
     trades = []
 
@@ -504,6 +565,8 @@ def run_overnight_backtest(indicators_by_code, market_returns_df,
             ex_dividend_dates_by_code=ex_dividend_dates_by_code,
             chip_date_str=chip_date_str,
             us_market_date_str=us_market_date_str,
+            min_candidates=min_candidates,
+            min_trust_ratio=min_trust_ratio,
         )
         if candidates.empty:
             continue
