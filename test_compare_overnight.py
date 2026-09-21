@@ -137,10 +137,14 @@ class TestFullPipelineIntegration(unittest.TestCase):
                 "return_pct": [0.1] * self.n_days,  # 溫和正報酬，不會觸發濾網
             })
 
+        def fake_dividend_loader(whitelist, start, end, refresh=False):
+            return {code: set() for code in whitelist}
+
         self.fake_price_loader = fake_price_loader
         self.fake_chip_loader = fake_chip_loader
         self.fake_day_trading_loader = FakeDayTradingLoader(self.codes, self.n_days)
         self.fake_us_market_loader = fake_us_market_loader
+        self.fake_dividend_loader = fake_dividend_loader
 
         self.whitelist = {c: c for c in self.codes}
 
@@ -152,6 +156,7 @@ class TestFullPipelineIntegration(unittest.TestCase):
             chip_loader=self.fake_chip_loader,
             day_trading_loader_fn=self.fake_day_trading_loader,
             us_market_loader_fn=self.fake_us_market_loader,
+            dividend_loader_fn=self.fake_dividend_loader,
         )
 
         self.assertEqual(set(inputs["indicators_by_code"].keys()), set(self.codes))
@@ -161,6 +166,7 @@ class TestFullPipelineIntegration(unittest.TestCase):
         self.assertIn("ratio", inputs["trust_ratio_df"].columns)
         self.assertIn("day_trading_ratio", inputs["day_trading_ratio_df"].columns)
         self.assertEqual(inputs["universe_codes"], set(self.codes))
+        self.assertEqual(set(inputs["ex_dividend_dates_by_code"].keys()), set(self.codes))
 
     def test_missing_reference_code_raises(self):
         with self.assertRaises(RuntimeError):
@@ -180,6 +186,7 @@ class TestFullPipelineIntegration(unittest.TestCase):
             chip_loader=self.fake_chip_loader,
             day_trading_loader_fn=self.fake_day_trading_loader,
             us_market_loader_fn=self.fake_us_market_loader,
+            dividend_loader_fn=self.fake_dividend_loader,
         )
 
         is_trades, oos_trades, is_summary, oos_summary = co.run_is_oos_backtest(inputs, top_n=2)

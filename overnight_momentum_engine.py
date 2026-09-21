@@ -219,7 +219,8 @@ def scan_candidates_for_date(date_str, indicators_by_code, market_returns_df,
                               tech_weight=TECH_WEIGHT, chip_weight=CHIP_WEIGHT,
                               us_market_returns_df=None,
                               us_market_drop_threshold=US_MARKET_DROP_THRESHOLD_PCT,
-                              signal_weights=None):
+                              signal_weights=None,
+                              ex_dividend_dates_by_code=None):
     """
     對指定日期，回傳依最終分數排序的候選股 DataFrame（已套用硬門檻與評分）。
     若當天沒有任何股票通過硬門檻，回傳空 DataFrame。
@@ -238,6 +239,14 @@ def scan_candidates_for_date(date_str, indicators_by_code, market_returns_df,
     用途：單一訊號拆解測試（sweep_signal_ablation.py）——只給某一個訊號
     weight=1，其餘不列出，就能看這個訊號單獨拿來選股的效果。
     維持 None（預設）就完全不影響既有行為，向後相容。
+
+    ex_dividend_dates_by_code：可選，dict[str, set(str)]，
+    dividend_data_loader.load_dividend_events() 的輸出。如果某檔股票在
+    date_str 這天剛好是除權息/減資/分割日，直接把它從候選名單剔除——因為
+    data_loader.py 抓的是未還原股價，除權息當天收盤價會機械性跳空下跌，
+    這個跳動會被漲幅%評分、相對大盤強弱評分誤判成「轉弱了」，也會汙染
+    atr14，甚至可能誤觸隔天的跳空停損。不傳這個參數（維持 None）就完全
+    不啟用這個濾網，行為跟改之前一模一樣，向後相容。
     """
     if us_market_returns_df is not None and not us_market_returns_df.empty:
         us_row = us_market_returns_df[us_market_returns_df["date"] == date_str]
@@ -269,6 +278,9 @@ def scan_candidates_for_date(date_str, indicators_by_code, market_returns_df,
             continue
         if pd.isna(r["atr14"]):
             continue
+        if ex_dividend_dates_by_code is not None and \
+                date_str in ex_dividend_dates_by_code.get(code, set()):
+            continue  # 除權息/減資/分割日，未還原股價會機械性跳空，訊號不可靠，直接跳過
 
         rel_strength = r["gain_pct"] - market_ret if not pd.isna(market_ret) else np.nan
 
@@ -388,7 +400,8 @@ def run_overnight_backtest(indicators_by_code, market_returns_df,
                             atr_target_mult=ATR_TARGET_MULT,
                             us_market_returns_df=None,
                             us_market_drop_threshold=US_MARKET_DROP_THRESHOLD_PCT,
-                            signal_weights=None):
+                            signal_weights=None,
+                            ex_dividend_dates_by_code=None):
     """
     對 trading_days（已排序的 YYYYMMDD 字串 list）逐日跑隔日衝策略。
     第 i 天收盤選股、進場；用第 i+1 天的 K 棒模擬出場。
@@ -402,6 +415,8 @@ def run_overnight_backtest(indicators_by_code, market_returns_df,
     （見 scan_candidates_for_date 的說明），不傳就完全不影響既有行為。
 
     signal_weights：見 scan_candidates_for_date 的說明，往下傳給它。
+
+    ex_dividend_dates_by_code：見 scan_candidates_for_date 的說明，往下傳給它。
     """
     trades = []
 
@@ -417,6 +432,7 @@ def run_overnight_backtest(indicators_by_code, market_returns_df,
             us_market_returns_df=us_market_returns_df,
             us_market_drop_threshold=us_market_drop_threshold,
             signal_weights=signal_weights,
+            ex_dividend_dates_by_code=ex_dividend_dates_by_code,
         )
         if candidates.empty:
             continue

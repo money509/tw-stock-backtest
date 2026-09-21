@@ -21,6 +21,7 @@ import data_loader
 import chip_data_loader
 import day_trading_loader
 import us_market_loader
+import dividend_data_loader
 import overnight_chip_adapter as adapter
 import overnight_momentum_engine as ome
 
@@ -79,13 +80,14 @@ def build_volume_df(price_data):
 
 def build_pipeline_inputs(whitelist, start_date, end_date, market_reference_code="2330",
                            refresh=False, price_loader=None, chip_loader=None,
-                           day_trading_loader_fn=None, us_market_loader_fn=None):
+                           day_trading_loader_fn=None, us_market_loader_fn=None,
+                           dividend_loader_fn=None):
     """
     組出跑 overnight_momentum_engine.run_overnight_backtest() 所需的全部輸入。
-    price_loader / chip_loader / day_trading_loader_fn / us_market_loader_fn
-    可用於測試時注入假資料源，預設分別是 data_loader.load_price_data /
+    price_loader / chip_loader / day_trading_loader_fn / us_market_loader_fn /
+    dividend_loader_fn 可用於測試時注入假資料源，預設分別是 data_loader.load_price_data /
     chip_data_loader.load_chip_data / day_trading_loader.load_day_trading_data /
-    us_market_loader.load_us_market_returns。
+    us_market_loader.load_us_market_returns / dividend_data_loader.load_dividend_events。
 
     start_date / end_date: datetime.date
     """
@@ -93,6 +95,7 @@ def build_pipeline_inputs(whitelist, start_date, end_date, market_reference_code
     chip_loader = chip_loader or chip_data_loader.load_chip_data
     day_trading_loader_fn = day_trading_loader_fn or day_trading_loader.load_day_trading_data
     us_market_loader_fn = us_market_loader_fn or us_market_loader.load_us_market_returns
+    dividend_loader_fn = dividend_loader_fn or dividend_data_loader.load_dividend_events
 
     start_dash = start_date.strftime("%Y-%m-%d")
     end_dash = end_date.strftime("%Y-%m-%d")
@@ -122,6 +125,8 @@ def build_pipeline_inputs(whitelist, start_date, end_date, market_reference_code
 
     us_market_returns_df = us_market_loader_fn(start_dash, end_dash, refresh=refresh)
 
+    ex_dividend_dates_by_code = dividend_loader_fn(whitelist, start_dash, end_dash, refresh=refresh)
+
     return {
         "indicators_by_code": indicators_by_code,
         "market_returns_df": market_returns_df,
@@ -131,6 +136,7 @@ def build_pipeline_inputs(whitelist, start_date, end_date, market_reference_code
         "trading_days": trading_days,
         "universe_codes": universe_codes,
         "us_market_returns_df": us_market_returns_df,
+        "ex_dividend_dates_by_code": ex_dividend_dates_by_code,
     }
 
 
@@ -153,6 +159,7 @@ def run_is_oos_backtest(pipeline_inputs, is_ratio=IS_RATIO, **backtest_kwargs):
         day_trading_ratio_df=pipeline_inputs["day_trading_ratio_df"],
         universe_codes=pipeline_inputs["universe_codes"],
         us_market_returns_df=pipeline_inputs.get("us_market_returns_df"),
+        ex_dividend_dates_by_code=pipeline_inputs.get("ex_dividend_dates_by_code"),
     )
     common_args.update(backtest_kwargs)
 

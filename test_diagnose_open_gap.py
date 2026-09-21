@@ -89,12 +89,16 @@ def make_pipeline_inputs(n_days=100, codes=("2330", "2317", "2454")):
             "return_pct": [0.1] * n_days,
         })
 
+    def fake_dividend_loader(whitelist, start, end, refresh=False):
+        return {code: set() for code in whitelist}
+
     whitelist = {c: c for c in codes}
     return co.build_pipeline_inputs(
         whitelist, datetime.date(2026, 1, 1), datetime.date(2026, 6, 1),
         price_loader=fake_price_loader, chip_loader=fake_chip_loader,
         day_trading_loader_fn=FakeDayTradingLoader(list(codes), n_days),
         us_market_loader_fn=fake_us_market_loader,
+        dividend_loader_fn=fake_dividend_loader,
     )
 
 

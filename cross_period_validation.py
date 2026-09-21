@@ -80,6 +80,7 @@ def run_cross_period_validation(pipeline_inputs, candidates=None, top_n=5):
         day_trading_ratio_df=pipeline_inputs["day_trading_ratio_df"],
         universe_codes=pipeline_inputs["universe_codes"],
         us_market_returns_df=pipeline_inputs.get("us_market_returns_df"),
+        ex_dividend_dates_by_code=pipeline_inputs.get("ex_dividend_dates_by_code"),
         trading_days=trading_days,
         top_n=top_n,
     )

@@ -170,6 +170,83 @@ class TestHardFilters(unittest.TestCase):
         self.assertNotIn("DOWN", cand["code"].tolist())
 
 
+class TestExDividendFilter(unittest.TestCase):
+    """驗證 ex_dividend_dates_by_code 濾網：除權息當天該股票要被剔除候選，
+    其他日期/其他股票不受影響；不傳這個參數時行為完全不變（向後相容）。"""
+
+    def _build_indicators(self, closes, volume=1_000_000):
+        raw = make_price_series(closes)
+        raw["volume"] = volume
+        return ome.precompute_overnight_indicators(raw)
+
+    def setUp(self):
+        closes_a = [100 + i * 0.5 for i in range(80)]
+        closes_b = [80 + i * 0.4 for i in range(80)]
+        self.stock_a = self._build_indicators(closes_a)
+        self.stock_b = self._build_indicators(closes_b)
+        self.indicators_by_code = {"AAAA": self.stock_a, "BBBB": self.stock_b}
+        market_df = pd.DataFrame({
+            "date": self.stock_a["date"], "close": [150 + i * 0.1 for i in range(80)]
+        })
+        self.market_returns = ome.precompute_market_returns(market_df)
+        self.empty_chip = pd.DataFrame(columns=["date", "code", "ratio"])
+        self.empty_dtr = pd.DataFrame(columns=["date", "code", "day_trading_ratio"])
+        self.target_date = self.stock_a["date"].iloc[70]
+
+    def _scan(self, ex_dividend_dates_by_code=None):
+        return ome.scan_candidates_for_date(
+            self.target_date, self.indicators_by_code, self.market_returns,
+            self.empty_chip, self.empty_chip, self.empty_dtr,
+            universe_codes=["AAAA", "BBBB"],
+            ex_dividend_dates_by_code=ex_dividend_dates_by_code,
+        )
+
+    def test_stock_on_its_own_ex_dividend_date_is_excluded(self):
+        cand_before = self._scan()
+        self.assertIn("AAAA", cand_before["code"].tolist())  # 先確認不加濾網時本來會入選
+
+        ex_div = {"AAAA": {self.target_date}, "BBBB": set()}
+        cand_after = self._scan(ex_dividend_dates_by_code=ex_div)
+        self.assertNotIn("AAAA", cand_after["code"].tolist())
+        self.assertIn("BBBB", cand_after["code"].tolist())  # 另一檔不受影響
+
+    def test_ex_dividend_on_other_date_does_not_affect_today(self):
+        other_date = self.stock_a["date"].iloc[10]
+        ex_div = {"AAAA": {other_date}, "BBBB": set()}
+        cand = self._scan(ex_dividend_dates_by_code=ex_div)
+        self.assertIn("AAAA", cand["code"].tolist())
+
+    def test_none_default_keeps_old_behavior(self):
+        cand_default = self._scan()
+        cand_explicit_none = self._scan(ex_dividend_dates_by_code=None)
+        self.assertEqual(cand_default["code"].tolist(), cand_explicit_none["code"].tolist())
+
+    def test_missing_code_in_dict_not_excluded(self):
+        # 字典裡根本沒有這檔股票的 entry，get(code, set()) 應該回傳空集合，不擋
+        ex_div = {"BBBB": {self.target_date}}
+        cand = self._scan(ex_dividend_dates_by_code=ex_div)
+        self.assertIn("AAAA", cand["code"].tolist())
+        self.assertNotIn("BBBB", cand["code"].tolist())
+
+    def test_run_overnight_backtest_respects_ex_dividend_filter(self):
+        trading_days = self.stock_a["date"].tolist()
+        ex_div = {"AAAA": set(trading_days), "BBBB": set()}  # AAAA每天都被剔除
+
+        trades = ome.run_overnight_backtest(
+            indicators_by_code=self.indicators_by_code,
+            market_returns_df=self.market_returns,
+            foreign_ratio_df=self.empty_chip,
+            trust_ratio_df=self.empty_chip,
+            day_trading_ratio_df=self.empty_dtr,
+            trading_days=trading_days,
+            universe_codes=["AAAA", "BBBB"],
+            top_n=2,
+            ex_dividend_dates_by_code=ex_div,
+        )
+        codes_traded = {t["code"] for t in trades}
+        self.assertNotIn("AAAA", codes_traded)
+
+
 class TestSignalWeights(unittest.TestCase):
     def _build_indicators(self, closes, volume=1_000_000):
         raw = make_price_series(closes)

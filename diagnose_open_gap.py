@@ -45,7 +45,8 @@ def run_backtest_with_open_diagnostics(indicators_by_code, market_returns_df,
                                         atr_target_mult=ome.ATR_TARGET_MULT,
                                         us_market_returns_df=None,
                                         us_market_drop_threshold=ome.US_MARKET_DROP_THRESHOLD_PCT,
-                                        signal_weights=None):
+                                        signal_weights=None,
+                                        ex_dividend_dates_by_code=None):
     """
     跑一次正常的隔日衝回測，再對每一筆交易額外查出「隔天開盤價」，
     算出「有沒有開紅」(opened_up) 跟「假設在開盤價出場的損益」(hypothetical_open_exit_pnl)。
@@ -69,6 +70,7 @@ def run_backtest_with_open_diagnostics(indicators_by_code, market_returns_df,
         us_market_returns_df=us_market_returns_df,
         us_market_drop_threshold=us_market_drop_threshold,
         signal_weights=signal_weights,
+        ex_dividend_dates_by_code=ex_dividend_dates_by_code,
     )
 
     enriched_rows = []
@@ -170,6 +172,7 @@ def main():
         day_trading_ratio_df=pipeline_inputs["day_trading_ratio_df"],
         universe_codes=pipeline_inputs["universe_codes"],
         us_market_returns_df=pipeline_inputs.get("us_market_returns_df"),
+        ex_dividend_dates_by_code=pipeline_inputs.get("ex_dividend_dates_by_code"),
         trading_days=is_days,
     )
 

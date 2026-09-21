@@ -68,6 +68,7 @@ def run_sweep(pipeline_inputs, is_ratio=IS_RATIO, param_grid=None):
         day_trading_ratio_df=pipeline_inputs["day_trading_ratio_df"],
         universe_codes=pipeline_inputs["universe_codes"],
         us_market_returns_df=pipeline_inputs.get("us_market_returns_df"),
+        ex_dividend_dates_by_code=pipeline_inputs.get("ex_dividend_dates_by_code"),
         trading_days=is_days,
     )
 
@@ -111,6 +112,7 @@ def validate_best_on_oos(pipeline_inputs, best_params, oos_days):
         day_trading_ratio_df=pipeline_inputs["day_trading_ratio_df"],
         universe_codes=pipeline_inputs["universe_codes"],
         us_market_returns_df=pipeline_inputs.get("us_market_returns_df"),
+        ex_dividend_dates_by_code=pipeline_inputs.get("ex_dividend_dates_by_code"),
         trading_days=oos_days,
         # 強制轉 int：呼叫端如果是從 DataFrame.iloc[0].to_dict() 拿到 best_params，
         # top_n 常常會被連帶轉成 float（例如 8.0），這裡再保險一次，不依賴呼叫端記得處理。
