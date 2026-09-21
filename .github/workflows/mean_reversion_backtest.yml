@@ -36,6 +36,18 @@ on:
         description: "籌碼面權重 0~1（僅 backtest 模式使用）"
         required: false
         default: "0.65"
+      slippage_pct:
+        description: "模擬滑價百分比（backtest / cross_period 模式使用，0=不模擬，例如0.1代表買進多付0.1%、賣出少拿0.1%）"
+        required: false
+        default: "0"
+      universe:
+        description: "選股池（backtest / cross_period 模式使用）：59=目前已驗證過的59檔舊清單；full=taifex_universe.py的249檔完整清單(全新、未驗證，訊號/ATR參數仍沿用59檔挑出來的那組)"
+        required: false
+        default: "59"
+        type: choice
+        options:
+          - "59"
+          - "full"
       refresh:
         description: "忽略快取，強制重新下載所有資料"
         required: false
@@ -172,6 +184,8 @@ jobs:
               --start "${{ github.event.inputs.start_date }}" \
               --end "${{ github.event.inputs.end_date }}" \
               --top-n "${{ github.event.inputs.top_n }}" \
+              --slippage-pct "${{ github.event.inputs.slippage_pct }}" \
+              --universe "${{ github.event.inputs.universe }}" \
               $REFRESH_FLAG \
               2>&1 | tee overnight_backtest_result.log
 
@@ -182,6 +196,8 @@ jobs:
               --top-n "${{ github.event.inputs.top_n }}" \
               --tech-weight "${{ github.event.inputs.tech_weight }}" \
               --chip-weight "${{ github.event.inputs.chip_weight }}" \
+              --slippage-pct "${{ github.event.inputs.slippage_pct }}" \
+              --universe "${{ github.event.inputs.universe }}" \
               $REFRESH_FLAG \
               2>&1 | tee overnight_backtest_result.log
           fi
