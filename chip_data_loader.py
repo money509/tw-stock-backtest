@@ -38,6 +38,12 @@ HEADERS = {
 }
 
 # T86 回傳欄位裡，我們關心的幾個索引位置 (對照官方fields順序)
+# 注意：這幾個寫死的index只適用於「目前(2023年後)」的T86格式。實測發現(2026-09)，
+# 用這組index去抓2015~2019年的舊資料會在某些天直接 IndexError（list index out of range）——
+# 證交所這份報表的欄位隨時間變動過(自營商買賣超後來被拆成「自行買賣」/「避險」兩組明細欄位，
+# 導致欄位總數跟各欄位的位置往後偏移了)，寫死index沒辦法同時兼容新舊格式。
+# 因此正式抓取邏輯(fetch_t86_day)改成動態從當天payload附帶的"fields"欄位名稱陣列去
+# 「查名字找位置」，這幾個常數只在完全查不到fields時當最後手段的備援值。
 COL_CODE = 0
 COL_FOREIGN_NET = 4    # 外陸資買賣超股數(不含外資自營商)
 COL_TRUST_NET = 10     # 投信買賣超股數
@@ -50,6 +56,51 @@ def _parse_int(s: str) -> int:
         return int(str(s).replace(",", ""))
     except (ValueError, TypeError):
         return 0
+
+
+def _first_field_index(fields, exact=None, contains=None):
+    """在 fields(欄位名稱字串list)裡找第一個符合條件的欄位索引。
+    優先用 exact(完全比對)，找不到再用 contains(tuple，欄位名稱要同時包含裡面每個子字串)。
+    都找不到回傳 None。"""
+    if exact is not None:
+        for i, f in enumerate(fields):
+            if str(f).strip() == exact:
+                return i
+    if contains is not None:
+        for i, f in enumerate(fields):
+            if all(s in str(f) for s in contains):
+                return i
+    return None
+
+
+def _resolve_column_indices(fields):
+    """
+    根據當天payload實際回傳的fields(欄位名稱陣列)，動態找出我們需要的4個欄位
+    (外資/投信/自營商/三大法人合計)分別在第幾個位置，取代寫死index——
+    這樣不管證交所哪一年的T86格式欄位順序或總數怎麼變，都能正確對到欄位，
+    不會抓錯欄或超出範圍。任何一個欄位真的找不到就回傳 None，由呼叫端
+    決定怎麼安全處理(通常是那個欄位當天填0，不整天中斷)。
+    """
+    foreign_i = _first_field_index(
+        fields, exact="外陸資買賣超股數(不含外資自營商)", contains=("外陸資", "買賣超"))
+    if foreign_i is None:
+        foreign_i = _first_field_index(fields, contains=("外資", "買賣超"))
+
+    trust_i = _first_field_index(fields, exact="投信買賣超股數", contains=("投信", "買賣超"))
+
+    dealer_i = _first_field_index(fields, exact="自營商買賣超股數", contains=("自營商", "買賣超"))
+
+    total_i = _first_field_index(
+        fields, exact="三大法人買賣超股數合計", contains=("三大法人", "合計"))
+    if total_i is None and fields:
+        total_i = len(fields) - 1  # 保底慣例：合計欄通常是報表最後一欄
+
+    return {
+        "foreign_net": foreign_i,
+        "trust_net": trust_i,
+        "dealer_net": dealer_i,
+        "total_net": total_i,
+    }
 
 
 class FetchFailed(Exception):
@@ -75,16 +126,31 @@ def fetch_t86_day(date_str: str):
     if payload.get("stat") != "OK":
         return None  # 確認是非交易日/查無資料，不是請求失敗，不用重試
 
+    fields = payload.get("fields") or []
+    if fields:
+        col = _resolve_column_indices(fields)
+    else:
+        # 理論上不該發生(正常回應一定會附fields)，保底退回舊的寫死index
+        col = {
+            "foreign_net": COL_FOREIGN_NET, "trust_net": COL_TRUST_NET,
+            "dealer_net": COL_DEALER_NET, "total_net": COL_TOTAL_NET,
+        }
+
+    def _safe_get(row, idx):
+        if idx is None or idx >= len(row):
+            return 0
+        return _parse_int(row[idx])
+
     result = {}
     for row in payload.get("data", []):
         code = str(row[COL_CODE]).strip()
         if not code.isdigit():
             continue
         result[code] = {
-            "foreign_net": _parse_int(row[COL_FOREIGN_NET]),
-            "trust_net": _parse_int(row[COL_TRUST_NET]),
-            "dealer_net": _parse_int(row[COL_DEALER_NET]),
-            "total_net": _parse_int(row[COL_TOTAL_NET]),
+            "foreign_net": _safe_get(row, col["foreign_net"]),
+            "trust_net": _safe_get(row, col["trust_net"]),
+            "dealer_net": _safe_get(row, col["dealer_net"]),
+            "total_net": _safe_get(row, col["total_net"]),
         }
     return result
 
