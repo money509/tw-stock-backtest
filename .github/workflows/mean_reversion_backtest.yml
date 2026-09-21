@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       mode:
-        description: "跑哪一種：backtest(單組參數IS/OOS回測)、sweep(權重/門檻參數掃描)、atr_sweep(ATR停利停損倍數掃描)、ablation(單一訊號拆解測試)、diagnose_open_gap(隔日沒開紅提早出場的假設驗證)"
+        description: "跑哪一種：backtest(單組參數IS/OOS回測)、sweep(權重/門檻參數掃描)、atr_sweep(ATR停利停損倍數掃描)、ablation(單一訊號拆解測試)、diagnose_open_gap(隔日沒開紅提早出場的假設驗證)、combined(訊號權重x ATR參數合併測試)"
         required: true
         default: "backtest"
         type: choice
@@ -14,6 +14,7 @@ on:
           - atr_sweep
           - ablation
           - diagnose_open_gap
+          - combined
       start_date:
         description: "回測起始日 (YYYY-MM-DD)"
         required: true
@@ -150,6 +151,15 @@ jobs:
             python3 diagnose_open_gap.py \
               --start "${{ github.event.inputs.start_date }}" \
               --end "${{ github.event.inputs.end_date }}" \
+              $REFRESH_FLAG \
+              2>&1 | tee overnight_backtest_result.log
+
+          elif [ "$MODE" = "combined" ]; then
+            # combined 模式：把訊號拆解跟ATR掃描分別驗證過的好組合疊在一起測，只在IS區間內跑。
+            python3 sweep_combined_best.py \
+              --start "${{ github.event.inputs.start_date }}" \
+              --end "${{ github.event.inputs.end_date }}" \
+              --top-n "${{ github.event.inputs.top_n }}" \
               $REFRESH_FLAG \
               2>&1 | tee overnight_backtest_result.log
 
