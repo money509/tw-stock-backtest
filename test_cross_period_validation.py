@@ -111,14 +111,35 @@ class TestRunCrossPeriodValidation(unittest.TestCase):
             {"label": "只用投信", "signal_weights": {"score_trust": 1.0},
              "atr_stop_mult": 0.5, "atr_target_mult": 3.0},
         ]
+        # 預設 compare_chip_timing=True，每個候選組合都跑3個時間點版本
+        # (完全T日當天 / 只錯開三大法人 / 三大法人+美股濾網都錯開)，
+        # 所以2個候選組合會變成6列結果
         result_df = cpv.run_cross_period_validation(
             self.pipeline_inputs, candidates=small_candidates, top_n=2)
 
-        self.assertEqual(len(result_df), 2)
-        for col in ["label", "total_trades", "win_rate", "profit_factor",
+        self.assertEqual(len(result_df), 6)
+        for col in ["label", "chip_timing", "use_prior_day_chip_data",
+                    "use_prior_day_us_market_data",
+                    "total_trades", "win_rate", "profit_factor",
                     "total_pnl", "avg_pnl"]:
             self.assertIn(col, result_df.columns)
-        self.assertEqual(list(result_df["label"]), ["只用量比", "只用投信"])
+        self.assertEqual(set(result_df["label"]), {"只用量比", "只用投信"})
+        self.assertEqual(set(result_df["use_prior_day_chip_data"]), {True, False})
+        self.assertEqual(set(result_df["use_prior_day_us_market_data"]), {True, False})
+
+    def test_compare_chip_timing_false_runs_only_old_version(self):
+        small_candidates = [
+            {"label": "只用量比", "signal_weights": {"score_volume_ratio": 1.0},
+             "atr_stop_mult": 0.8, "atr_target_mult": 1.2},
+            {"label": "只用投信", "signal_weights": {"score_trust": 1.0},
+             "atr_stop_mult": 0.5, "atr_target_mult": 3.0},
+        ]
+        result_df = cpv.run_cross_period_validation(
+            self.pipeline_inputs, candidates=small_candidates, top_n=2,
+            compare_chip_timing=False)
+
+        self.assertEqual(len(result_df), 2)
+        self.assertTrue((result_df["use_prior_day_chip_data"] == False).all())
 
     def test_uses_full_trading_days_not_split(self):
         """驗證這支腳本用的是整段 trading_days，不像 sweep 那樣切 IS/OOS。"""
@@ -138,7 +159,8 @@ class TestRunCrossPeriodValidation(unittest.TestCase):
                  "atr_stop_mult": 0.8, "atr_target_mult": 1.2},
             ]
             cpv.run_cross_period_validation(
-                self.pipeline_inputs, candidates=small_candidates, top_n=2)
+                self.pipeline_inputs, candidates=small_candidates, top_n=2,
+                compare_chip_timing=False)
         finally:
             ome.run_overnight_backtest = real_run
 
@@ -153,13 +175,75 @@ class TestRunCrossPeriodValidation(unittest.TestCase):
              "atr_stop_mult": 0.5, "atr_target_mult": 3.0},
         ]
         result_df = cpv.run_cross_period_validation(
-            self.pipeline_inputs, candidates=small_candidates, top_n=2)
-        row_a = result_df.iloc[0]
-        row_b = result_df.iloc[1]
+            self.pipeline_inputs, candidates=small_candidates, top_n=2,
+            compare_chip_timing=False)
+        row_a = result_df[result_df["label"] == "只用量比"].iloc[0]
+        row_b = result_df[result_df["label"] == "只用投信"].iloc[0]
         self.assertFalse(
             row_a["total_pnl"] == row_b["total_pnl"] and
             row_a["total_trades"] == row_b["total_trades"]
         )
+
+    def test_lag_timing_can_change_results_for_same_candidate(self):
+        """同一個候選組合，三個時間點版本用的是不同時間點的三大法人/美股資料，
+        結果不保證完全一樣（這裡只驗證三個版本都能正常跑出結果，
+        不強求數值一定不同——訊號本身在合成資料上剛好一樣也是有可能的）。"""
+        small_candidates = [
+            {"label": "只用投信", "signal_weights": {"score_trust": 1.0},
+             "atr_stop_mult": 0.5, "atr_target_mult": 3.0},
+        ]
+        result_df = cpv.run_cross_period_validation(
+            self.pipeline_inputs, candidates=small_candidates, top_n=2)
+        self.assertEqual(len(result_df), 3)
+        row_no_lag = result_df[
+            (result_df["use_prior_day_chip_data"] == False) &
+            (result_df["use_prior_day_us_market_data"] == False)
+        ].iloc[0]
+        row_full_lag = result_df[
+            (result_df["use_prior_day_chip_data"] == True) &
+            (result_df["use_prior_day_us_market_data"] == True)
+        ].iloc[0]
+        self.assertEqual(row_no_lag["label"], row_full_lag["label"])
+
+    def test_slippage_pct_default_zero_keeps_old_behavior(self):
+        """不傳slippage_pct，結果應該跟明確傳0.0完全一樣（向後相容）。"""
+        small_candidates = [
+            {"label": "只用量比", "signal_weights": {"score_volume_ratio": 1.0},
+             "atr_stop_mult": 0.8, "atr_target_mult": 1.2},
+        ]
+        default_df = cpv.run_cross_period_validation(
+            self.pipeline_inputs, candidates=small_candidates, top_n=2,
+            compare_chip_timing=False)
+        explicit_zero_df = cpv.run_cross_period_validation(
+            self.pipeline_inputs, candidates=small_candidates, top_n=2,
+            compare_chip_timing=False, slippage_pct=0.0)
+        self.assertAlmostEqual(
+            default_df.iloc[0]["total_pnl"], explicit_zero_df.iloc[0]["total_pnl"])
+
+    def test_slippage_pct_is_passed_through_to_engine(self):
+        """驗證slippage_pct真的有傳到run_overnight_backtest，不是被忽略的死參數。"""
+        captured = []
+        import overnight_momentum_engine as ome
+        real_run = ome.run_overnight_backtest
+
+        def spy(**kwargs):
+            captured.append(kwargs.get("slippage_pct"))
+            return real_run(**kwargs)
+
+        ome.run_overnight_backtest = spy
+        try:
+            small_candidates = [
+                {"label": "只用量比", "signal_weights": {"score_volume_ratio": 1.0},
+                 "atr_stop_mult": 0.8, "atr_target_mult": 1.2},
+            ]
+            cpv.run_cross_period_validation(
+                self.pipeline_inputs, candidates=small_candidates, top_n=2,
+                compare_chip_timing=False, slippage_pct=0.25)
+        finally:
+            ome.run_overnight_backtest = real_run
+
+        self.assertEqual(len(captured), 1)
+        self.assertAlmostEqual(captured[0], 0.25)
 
 
 class TestCandidatesConstant(unittest.TestCase):

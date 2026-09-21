@@ -31,7 +31,8 @@ import pandas as pd
 
 import data_loader
 import overnight_momentum_engine as ome
-from compare_overnight import build_pipeline_inputs
+import taifex_universe
+from compare_overnight import build_pipeline_inputs, UNIVERSE_CHOICES
 
 # 鎖定候選參數：來自訊號拆解 + ATR掃描 + 合併測試選出來的最佳組合，
 # 這裡不再調整，只是原封不動拿去一段全新的資料上驗證。
@@ -67,8 +68,30 @@ CANDIDATES = [
 ]
 
 
-def run_cross_period_validation(pipeline_inputs, candidates=None, top_n=5):
-    """對每個鎖定的候選組合，在整段(未切IS/OOS)資料上跑一次回測。"""
+def run_cross_period_validation(pipeline_inputs, candidates=None, top_n=5,
+                                 compare_chip_timing=True, slippage_pct=0.0):
+    """
+    對每個鎖定的候選組合，在整段(未切IS/OOS)資料上跑一次回測。
+
+    compare_chip_timing：預設True，每個候選組合都會跑三個版本，一次看清楚
+    兩個「偷看未來」的問題(三大法人資料、美股濾網)分別修正之後的效果：
+      1. 「完全T日當天(舊版，不可能實測)」——三大法人跟美股濾網都查T日自己
+         當天的資料，這在實務上不可能做到(見overnight_momentum_engine.py的
+         說明：T86收盤後才公布、美股當晚才開盤)。保留只是方便跟之前
+         (2020-2023 / 2015-2019)已經拿到的結果直接對照。
+      2. 「只錯開三大法人(美股濾網仍用T日)」——只修三大法人那部分，美股濾網
+         還沒修，用來單獨看三大法人這個修正本身的影響有多大。
+      3. 「三大法人+美股濾網都錯開(真正能實測)」——兩個問題都改用T-1日已知
+         的資料，這才是真的能在收盤前執行的版本。如果要拿去實盤，判讀應該
+         看這個版本的PF，不是前面兩個。
+    設False的話，只跑第1個版本(跟最早的行為一樣)，通常不建議，僅供除錯用。
+
+    slippage_pct：預設0.0，維持舊行為(不模擬滑價)，往下傳給每一次
+    run_overnight_backtest()呼叫，均勻套用在所有候選組合、所有時間點變體上
+    (不另外拆成第4個比較軸，避免跑的次數再翻倍——如果想單獨看滑價的影響，
+    對同一批候選組合分別用slippage_pct=0.0跟slippage_pct>0各跑一次這支函式，
+    自行比較兩次結果即可)。
+    """
     candidates = candidates or CANDIDATES
     trading_days = pipeline_inputs["trading_days"]
 
@@ -83,28 +106,44 @@ def run_cross_period_validation(pipeline_inputs, candidates=None, top_n=5):
         ex_dividend_dates_by_code=pipeline_inputs.get("ex_dividend_dates_by_code"),
         trading_days=trading_days,
         top_n=top_n,
+        slippage_pct=slippage_pct,
     )
 
+    # (use_prior_day_chip_data, use_prior_day_us_market_data, 顯示用標籤)
+    timing_variants = [(False, False, "完全T日當天(舊版，不可能實測)")]
+    if compare_chip_timing:
+        timing_variants.append((True, False, "只錯開三大法人(美股濾網仍用T日)"))
+        timing_variants.append((True, True, "三大法人+美股濾網都錯開(真正能實測)"))
+
     rows = []
-    for i, cand in enumerate(candidates, start=1):
-        trades = ome.run_overnight_backtest(
-            **common_args,
-            signal_weights=cand["signal_weights"],
-            atr_stop_mult=cand["atr_stop_mult"],
-            atr_target_mult=cand["atr_target_mult"],
-        )
-        summary = ome.summarize_overnight(trades)
-        rows.append({
-            "label": cand["label"],
-            "total_trades": summary["total_trades"],
-            "win_rate": summary["win_rate"],
-            "profit_factor": summary["profit_factor"],
-            "total_pnl": summary["total_pnl"],
-            "avg_pnl": summary["avg_pnl"],
-        })
-        print(f"[{i}/{len(candidates)}] {cand['label']} "
-              f"-> {summary['total_trades']}筆, PF={summary['profit_factor']:.2f}, "
-              f"勝率={summary['win_rate']:.1f}%, 損益={summary['total_pnl']:,.0f}", flush=True)
+    total_runs = len(candidates) * len(timing_variants)
+    done = 0
+    for cand in candidates:
+        for use_chip_lag, use_us_lag, timing_label in timing_variants:
+            done += 1
+            trades = ome.run_overnight_backtest(
+                **common_args,
+                signal_weights=cand["signal_weights"],
+                atr_stop_mult=cand["atr_stop_mult"],
+                atr_target_mult=cand["atr_target_mult"],
+                use_prior_day_chip_data=use_chip_lag,
+                use_prior_day_us_market_data=use_us_lag,
+            )
+            summary = ome.summarize_overnight(trades)
+            rows.append({
+                "label": cand["label"],
+                "chip_timing": timing_label,
+                "use_prior_day_chip_data": use_chip_lag,
+                "use_prior_day_us_market_data": use_us_lag,
+                "total_trades": summary["total_trades"],
+                "win_rate": summary["win_rate"],
+                "profit_factor": summary["profit_factor"],
+                "total_pnl": summary["total_pnl"],
+                "avg_pnl": summary["avg_pnl"],
+            })
+            print(f"[{done}/{total_runs}] {cand['label']} ({timing_label}) "
+                  f"-> {summary['total_trades']}筆, PF={summary['profit_factor']:.2f}, "
+                  f"勝率={summary['win_rate']:.1f}%, 損益={summary['total_pnl']:,.0f}", flush=True)
 
     return pd.DataFrame(rows)
 
@@ -115,20 +154,38 @@ def main():
     parser.add_argument("--end", required=True, help="YYYY-MM-DD（務必跟原本的區間不重疊）")
     parser.add_argument("--top-n", type=int, default=5)
     parser.add_argument("--refresh", action="store_true", help="忽略快取，強制重新下載所有資料")
+    parser.add_argument("--slippage-pct", type=float, default=0.0,
+                         help="模擬滑價百分比(預設0=不模擬)，例如0.1代表買進多付0.1%%、賣出少拿0.1%%")
+    parser.add_argument("--universe", choices=list(UNIVERSE_CHOICES.keys()), default="59",
+                         help="選股池：59=目前已驗證過的59檔舊清單(預設)；"
+                              "full=taifex_universe.py的249檔完整可交易清單"
+                              "(全新、未驗證的股票池，鎖定的候選參數是用59檔清單挑出來的那組，"
+                              "結果不能直接跟59檔版本比較，建議當成獨立實驗看待)")
     args = parser.parse_args()
 
     start_date = datetime.datetime.strptime(args.start, "%Y-%m-%d").date()
     end_date = datetime.datetime.strptime(args.end, "%Y-%m-%d").date()
 
+    whitelist = UNIVERSE_CHOICES[args.universe]
+    if args.universe == "full":
+        print(f"⚠️ 使用 --universe full：{len(whitelist)}檔完整清單，"
+              f"這是全新、還沒驗證過的股票池，CANDIDATES裡鎖定的訊號權重/ATR參數"
+              f"仍是用59檔清單挑出來的那組，結果請當成獨立實驗看待。")
+
     print(f"載入獨立驗證區間資料 ({args.start} ~ {args.end}) ...")
     print("⚠️ 這段區間如果跟原本的2023-09-15~2026-09-14重疊，就不是真正獨立的驗證，"
           "請確認 --start/--end 填的是全新的期間。")
     pipeline_inputs = build_pipeline_inputs(
-        data_loader.STOCK_FUTURES_WHITELIST, start_date, end_date, refresh=args.refresh,
+        whitelist, start_date, end_date, refresh=args.refresh,
     )
 
+    if args.slippage_pct:
+        print(f"⚠️ 有套用滑價模擬：slippage_pct={args.slippage_pct}%（買進多付、賣出少拿），"
+              f"這會讓每筆交易的pnl比理論值更保守。")
+
     print(f"\n在整段獨立資料上（不切IS/OOS，因為這整段本身就是樣本外）跑鎖定的候選組合 ...\n")
-    result_df = run_cross_period_validation(pipeline_inputs, top_n=args.top_n)
+    result_df = run_cross_period_validation(
+        pipeline_inputs, top_n=args.top_n, slippage_pct=args.slippage_pct)
 
     print(f"\n=== 跨期驗證結果 ===")
     print(result_df.to_string(index=False))
@@ -141,6 +198,17 @@ def main():
           f"多層選擇撐起來的巧合；如果PF掉到1以下或接近對照組，"
           f"代表前面的結果沒有真正的跨期穩健性，還需要回頭重新設計，"
           f"不能直接拿去實盤用。")
+
+    print(f"\n⚠️ 關於這三個版本：")
+    print(f"「完全T日當天」用的是T日自己當天的三大法人買賣超資料+美股報酬率選股，"
+          f"這兩件事在實務上都不可能做到——三大法人買賣超日報(T86)是T日收盤後才"
+          f"公布；美股要等到台北時間T日晚上9點半後才開盤。保留這個版本只是方便跟"
+          f"之前已經拿到的結果對照差多少。")
+    print(f"「只錯開三大法人」讓你單獨看三大法人這個修正本身的影響有多大"
+          f"(美股濾網還沒修)。")
+    print(f"「三大法人+美股濾網都錯開」才是真的能在收盤前執行的版本(兩個都改用"
+          f"T-1日已知的資料)。如果要拿去實盤，判讀請看這個版本的PF，不是前面兩個"
+          f"——即使數字很接近，實際能用的也只有這一個。")
 
 
 if __name__ == "__main__":

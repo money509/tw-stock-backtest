@@ -24,8 +24,20 @@ import us_market_loader
 import dividend_data_loader
 import overnight_chip_adapter as adapter
 import overnight_momentum_engine as ome
+import taifex_universe
 
 IS_RATIO = 0.7
+
+# --universe 59：目前已驗證過(訊號拆解/ATR掃描/合併測試/跨期驗證都在這份上做的)的
+# 舊清單，59檔，只涵蓋部分熱門股期貨標的。
+# --universe full：taifex_universe.py 的完整台股期貨可交易清單(249檔)，還沒有
+# 用這份清單重新跑過任何選股策略挑選——只是把「能選的股票池」擴大，訊號權重/
+# ATR參數仍然沿用59檔清單挑出來的那組，属於全新、未驗證的組合，建議先當成
+# 獨立實驗跑一次IS/OOS或跨期驗證，不要直接假設它跟59檔清單的結果具有可比性。
+UNIVERSE_CHOICES = {
+    "59": data_loader.STOCK_FUTURES_WHITELIST,
+    "full": taifex_universe.STOCK_FUTURES_UNIVERSE,
+}
 
 
 # ---------------------------------------------------------------------------
@@ -201,14 +213,27 @@ def main():
                          help="停用隔夜美股大跌濾網，方便跟啟用時的結果對照比較")
     parser.add_argument("--us-drop-threshold", type=float, default=ome.US_MARKET_DROP_THRESHOLD_PCT,
                          help="美股隔夜跌幅超過這個%%(負數)就不進場，預設-1.5")
+    parser.add_argument("--universe", choices=list(UNIVERSE_CHOICES.keys()), default="59",
+                         help="選股池：59=目前已驗證過的59檔舊清單(預設)；"
+                              "full=taifex_universe.py的249檔完整可交易清單"
+                              "(全新、未驗證的股票池，訊號/ATR參數仍沿用59檔挑出來的那組，"
+                              "結果不能直接跟59檔版本比較，建議當成獨立實驗看待)")
+    parser.add_argument("--slippage-pct", type=float, default=0.0,
+                         help="模擬滑價百分比(預設0=不模擬)，例如0.1代表買進多付0.1%%、賣出少拿0.1%%")
     args = parser.parse_args()
 
     start_date = datetime.datetime.strptime(args.start, "%Y-%m-%d").date()
     end_date = datetime.datetime.strptime(args.end, "%Y-%m-%d").date()
 
+    whitelist = UNIVERSE_CHOICES[args.universe]
+    if args.universe == "full":
+        print(f"⚠️ 使用 --universe full：{len(whitelist)}檔完整清單，"
+              f"這是全新、還沒驗證過的股票池，訊號權重/ATR參數仍是用59檔清單挑出來的那組，"
+              f"結果請當成獨立實驗看待，不要直接拿來跟59檔版本的PF比較。")
+
     print(f"下載/整理資料 ({args.start} ~ {args.end}) ...")
     pipeline_inputs = build_pipeline_inputs(
-        data_loader.STOCK_FUTURES_WHITELIST, start_date, end_date, refresh=args.refresh,
+        whitelist, start_date, end_date, refresh=args.refresh,
     )
     if args.no_us_filter:
         pipeline_inputs["us_market_returns_df"] = None
@@ -219,6 +244,7 @@ def main():
         pipeline_inputs, top_n=args.top_n,
         tech_weight=args.tech_weight, chip_weight=args.chip_weight,
         us_market_drop_threshold=args.us_drop_threshold,
+        slippage_pct=args.slippage_pct,
     )
 
     print_summary("樣本內 IS (前70%)", is_summary)

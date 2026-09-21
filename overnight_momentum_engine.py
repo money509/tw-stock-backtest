@@ -220,7 +220,9 @@ def scan_candidates_for_date(date_str, indicators_by_code, market_returns_df,
                               us_market_returns_df=None,
                               us_market_drop_threshold=US_MARKET_DROP_THRESHOLD_PCT,
                               signal_weights=None,
-                              ex_dividend_dates_by_code=None):
+                              ex_dividend_dates_by_code=None,
+                              chip_date_str=None,
+                              us_market_date_str=None):
     """
     對指定日期，回傳依最終分數排序的候選股 DataFrame（已套用硬門檻與評分）。
     若當天沒有任何股票通過硬門檻，回傳空 DataFrame。
@@ -231,6 +233,15 @@ def scan_candidates_for_date(date_str, indicators_by_code, market_returns_df,
     直接跳過整天不進場，回傳空 DataFrame，而不是等進場後被動被跳空停損打到。
     不傳這個參數（維持 None）就完全不啟用這個濾網，行為跟改之前一模一樣，
     向後相容，不影響任何既有呼叫方式或測試。
+
+    ⚠️ 這個濾網原本查的是「date_str當天」的美股報酬率，但根據us_market_loader.py
+    自己註解的時區換算：「美股日期X」的交易時段，是落在「台股日期X收盤後」到
+    「台股日期X+1開盤前」這段空窗期——也就是說，在date_str當天13:30做進場決策
+    的當下，date_str自己這天的美股行情其實還沒發生(要等到當天晚上9點半後才開盤)，
+    直接查date_str當天等於是用了未來才會出現的資料，跟三大法人資料是同一種
+    時間軸兜不起來的問題。要跑「真的能在收盤前執行」的版本，呼叫端應該把
+    us_market_date_str傳成T-1的日期字串（見下方us_market_date_str參數，以及
+    run_overnight_backtest的use_prior_day_us_market_data參數）。
 
     signal_weights：可選，dict[str, float]，key 是 SIGNAL_NAMES 裡的欄位名稱
     （8個子訊號各自的分數欄位名）。傳入的話會**取代**掉 tech_weight/chip_weight
@@ -247,9 +258,23 @@ def scan_candidates_for_date(date_str, indicators_by_code, market_returns_df,
     這個跳動會被漲幅%評分、相對大盤強弱評分誤判成「轉弱了」，也會汙染
     atr14，甚至可能誤觸隔天的跳空停損。不傳這個參數（維持 None）就完全
     不啟用這個濾網，行為跟改之前一模一樣，向後相容。
+
+    chip_date_str：可選，三大法人/當沖比例資料實際要用「哪一天」的日期去查，
+    跟 date_str（技術面用的日期，也就是進場當天）分開處理。不傳（維持 None）
+    就沿用舊行為，直接用 date_str 當天的籌碼資料——但這件事在實務上其實不可能
+    做到：證交所的三大法人買賣超日報(T86)是當天收盤後才公布，不可能在
+    date_str 當天收盤前選股當下，就已經知道 date_str「自己當天」的三大法人
+    買賣超數字。真正能在收盤前拿到的，只有前一個交易日（T-1）收盤後公布的
+    資料。要跑「真的能在實務上執行」的版本，呼叫端應該傳入 T-1 的日期字串
+    （見 run_overnight_backtest 的 use_prior_day_chip_data 參數）。
+
+    us_market_date_str：可選，美股濾網實際要用「哪一天」的日期去查，跟
+    date_str 分開處理，理由跟 chip_date_str 一模一樣（見上方⚠️說明）。
+    不傳（維持 None）就沿用舊行為，直接查 date_str 當天。
     """
+    us_market_lookup_date = us_market_date_str if us_market_date_str is not None else date_str
     if us_market_returns_df is not None and not us_market_returns_df.empty:
-        us_row = us_market_returns_df[us_market_returns_df["date"] == date_str]
+        us_row = us_market_returns_df[us_market_returns_df["date"] == us_market_lookup_date]
         if len(us_row):
             us_return = us_row["return_pct"].iloc[0]
             if pd.notna(us_return) and us_return <= us_market_drop_threshold:
@@ -302,10 +327,13 @@ def scan_candidates_for_date(date_str, indicators_by_code, market_returns_df,
     cand = pd.DataFrame(rows)
 
     # 併入籌碼面資料（當天沒有資料的股票，ratio 視為 NaN，percentile_score 會給0分）
-    dtr = day_trading_ratio_df[day_trading_ratio_df["date"] == date_str][["code", "day_trading_ratio"]]
-    fr = foreign_ratio_df[foreign_ratio_df["date"] == date_str][["code", "ratio"]].rename(
+    # chip_lookup_date：預設等於date_str(舊行為)，傳入chip_date_str的話改用那一天
+    # (通常是T-1，見上面docstring關於「T86收盤後才公布」的說明)
+    chip_lookup_date = chip_date_str if chip_date_str is not None else date_str
+    dtr = day_trading_ratio_df[day_trading_ratio_df["date"] == chip_lookup_date][["code", "day_trading_ratio"]]
+    fr = foreign_ratio_df[foreign_ratio_df["date"] == chip_lookup_date][["code", "ratio"]].rename(
         columns={"ratio": "foreign_ratio"})
-    tr = trust_ratio_df[trust_ratio_df["date"] == date_str][["code", "ratio"]].rename(
+    tr = trust_ratio_df[trust_ratio_df["date"] == chip_lookup_date][["code", "ratio"]].rename(
         columns={"ratio": "trust_ratio"})
 
     cand = cand.merge(dtr, on="code", how="left")
@@ -401,7 +429,10 @@ def run_overnight_backtest(indicators_by_code, market_returns_df,
                             us_market_returns_df=None,
                             us_market_drop_threshold=US_MARKET_DROP_THRESHOLD_PCT,
                             signal_weights=None,
-                            ex_dividend_dates_by_code=None):
+                            ex_dividend_dates_by_code=None,
+                            use_prior_day_chip_data=False,
+                            use_prior_day_us_market_data=False,
+                            slippage_pct=0.0):
     """
     對 trading_days（已排序的 YYYYMMDD 字串 list）逐日跑隔日衝策略。
     第 i 天收盤選股、進場；用第 i+1 天的 K 棒模擬出場。
@@ -417,12 +448,50 @@ def run_overnight_backtest(indicators_by_code, market_returns_df,
     signal_weights：見 scan_candidates_for_date 的說明，往下傳給它。
 
     ex_dividend_dates_by_code：見 scan_candidates_for_date 的說明，往下傳給它。
+
+    use_prior_day_chip_data：預設False，維持舊行為（用進場當天T自己的三大法人
+    資料選股）——這是回測裡的簡化，實務上不可能做到，因為T86是T日收盤後才公布，
+    你不可能在T日收盤前選股時就已經知道T日自己的三大法人買賣超。
+    設成True，會改成用T-1日（前一個交易日，已經公布過的）三大法人/當沖比例資料
+    來選股，技術面訊號仍然用T日當天自己的資料——這樣才是「真的能在收盤前執行」
+    的版本。因為訊號時間點不一樣，跑出來的結果不會跟False版本一樣，需要重新驗證。
+
+    use_prior_day_us_market_data：預設False，維持舊行為（查T日當天對應的美股
+    報酬率）——這也是回測裡的簡化，實務上不可能做到，因為T日當天的美股行情
+    要等到台北時間當晚9點半後才開盤，不可能在T日13:30進場決策時就已經知道。
+    設成True，會改成查T-1日的美股報酬率（前一晚已經收盤、已知的資料，當作
+    「昨晚已經大跌，今晚接續大跌風險較高」的保守替代訊號），才是真的能在
+    收盤前執行的版本。
+
+    slippage_pct：預設0.0，維持舊行為（假設進出場都能剛好成交在理論價位）。
+    回測用的entry_price/exit_price都是K棒上的理論價位（收盤價、停損價、
+    停利價...），實際下單時，尤其是期貨流動性沒有現貨好、隔日衝這種策略
+    又偏好挑近期強勢股（更容易有人搶進搶出、價差變大），成交價幾乎不可能
+    剛好等於理論價——買進通常要多付一點、賣出通常要少拿一點，統稱「滑價」。
+    設成例如0.1，代表假設買進要多付0.1%、賣出要少拿0.1%（用「對自己不利」
+    的方向調整，屬於保守估計）；只影響pnl的計算，不影響trades紀錄裡
+    entry_price/exit_price本身（這兩欄仍然回報理論價，方便跟既有分析程式相容），
+    也不影響simulate_next_day_exit()本身的判斷邏輯（停損/停利/出場理由的
+    判斷依據仍然是理論價，滑價只在最後換算成pnl時才套用）。
     """
     trades = []
 
     for i in range(len(trading_days) - 1):
         t_date = trading_days[i]
         t1_date = trading_days[i + 1]
+
+        if use_prior_day_chip_data:
+            # 用前一個交易日的籌碼資料；如果t_date已經是這段資料裡最早的一天
+            # (i==0，沒有更早一天可查)，故意給一個保證查不到的日期字串，
+            # 讓那天的籌碼分數自然變成0，而不是誤用成T日自己當天的資料。
+            chip_date_str = trading_days[i - 1] if i >= 1 else ""
+        else:
+            chip_date_str = None  # 沿用舊行為：內部會自動退回用t_date當天
+
+        if use_prior_day_us_market_data:
+            us_market_date_str = trading_days[i - 1] if i >= 1 else ""
+        else:
+            us_market_date_str = None  # 沿用舊行為：內部會自動退回用t_date當天
 
         candidates = scan_candidates_for_date(
             t_date, indicators_by_code, market_returns_df,
@@ -433,6 +502,8 @@ def run_overnight_backtest(indicators_by_code, market_returns_df,
             us_market_drop_threshold=us_market_drop_threshold,
             signal_weights=signal_weights,
             ex_dividend_dates_by_code=ex_dividend_dates_by_code,
+            chip_date_str=chip_date_str,
+            us_market_date_str=us_market_date_str,
         )
         if candidates.empty:
             continue
@@ -458,7 +529,12 @@ def run_overnight_backtest(indicators_by_code, market_returns_df,
             )
 
             mult = get_contract_multiplier(entry_price)
-            pnl = (exit_price - entry_price) * mult - fee_per_trade
+
+            # 滑價：買進多付一點、賣出少拿一點（對自己不利的方向），只用來算pnl，
+            # 不覆蓋trades紀錄裡回報的entry_price/exit_price理論價。
+            actual_entry_price = entry_price * (1 + slippage_pct / 100.0)
+            actual_exit_price = exit_price * (1 - slippage_pct / 100.0)
+            pnl = (actual_exit_price - actual_entry_price) * mult - fee_per_trade
 
             trades.append({
                 "entry_date": t_date,
