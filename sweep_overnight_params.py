@@ -67,6 +67,7 @@ def run_sweep(pipeline_inputs, is_ratio=IS_RATIO, param_grid=None):
         trust_ratio_df=pipeline_inputs["trust_ratio_df"],
         day_trading_ratio_df=pipeline_inputs["day_trading_ratio_df"],
         universe_codes=pipeline_inputs["universe_codes"],
+        us_market_returns_df=pipeline_inputs.get("us_market_returns_df"),
         trading_days=is_days,
     )
 
@@ -109,8 +110,11 @@ def validate_best_on_oos(pipeline_inputs, best_params, oos_days):
         trust_ratio_df=pipeline_inputs["trust_ratio_df"],
         day_trading_ratio_df=pipeline_inputs["day_trading_ratio_df"],
         universe_codes=pipeline_inputs["universe_codes"],
+        us_market_returns_df=pipeline_inputs.get("us_market_returns_df"),
         trading_days=oos_days,
-        top_n=best_params["top_n"],
+        # 強制轉 int：呼叫端如果是從 DataFrame.iloc[0].to_dict() 拿到 best_params，
+        # top_n 常常會被連帶轉成 float（例如 8.0），這裡再保險一次，不依賴呼叫端記得處理。
+        top_n=int(best_params["top_n"]),
         tech_weight=best_params["tech_weight"],
         chip_weight=best_params["chip_weight"],
         gap_stop_threshold=best_params["gap_stop_threshold"],
@@ -144,6 +148,11 @@ def main():
 
     if not ranked.empty:
         best = ranked.iloc[0].to_dict()
+        # ranked 是 DataFrame，iloc[0].to_dict() 會把整列轉成同一種 dtype，
+        # 導致 top_n 這種整數欄位被浮點化(例如 8 變成 8.0)。
+        # scan_candidates_for_date() 裡的 cand.head(top_n) 需要真正的 int，
+        # 浮點數會讓 pandas 的 iloc 切片直接丟例外，這裡強制轉回 int 修正。
+        best["top_n"] = int(best["top_n"])
         print(f"\n=== 用排名第一的組合在 OOS 驗證（僅供參考，不能用來重新選參數） ===")
         print(f"組合: top_n={best['top_n']}, tech/chip={best['tech_weight']}/{best['chip_weight']}, "
               f"gap_stop={best['gap_stop_threshold']}")

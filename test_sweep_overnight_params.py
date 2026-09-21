@@ -80,11 +80,20 @@ def make_pipeline_inputs(n_days=100, codes=("2330", "2317", "2454")):
             data = {c: df for c, df in data.items() if c in universe_codes}
         return data
 
+    def fake_us_market_loader(start, end, refresh=False):
+        dates = pd.bdate_range(start="2026-01-01", periods=n_days)
+        return pd.DataFrame({
+            "date": [d.strftime("%Y%m%d") for d in dates],
+            "close": [4000.0] * n_days,
+            "return_pct": [0.1] * n_days,
+        })
+
     whitelist = {c: c for c in codes}
     return co.build_pipeline_inputs(
         whitelist, datetime.date(2026, 1, 1), datetime.date(2026, 6, 1),
         price_loader=fake_price_loader, chip_loader=fake_chip_loader,
         day_trading_loader_fn=FakeDayTradingLoader(list(codes), n_days),
+        us_market_loader_fn=fake_us_market_loader,
     )
 
 
@@ -147,6 +156,25 @@ class TestRankResults(unittest.TestCase):
 class TestValidateBestOnOos(unittest.TestCase):
     def setUp(self):
         self.pipeline_inputs = make_pipeline_inputs()
+
+    def test_validate_best_on_oos_handles_float_top_n_from_dataframe_row(self):
+        """回歸測試：ranked.iloc[0].to_dict() 會把 top_n 這種整數欄位連帶轉成 float
+        （因為同一列混了 win_rate/profit_factor 等浮點欄位，pandas 統一成同一種 dtype）。
+        這個路徑之前在真實跑 sweep 時炸過：
+        TypeError: cannot do positional indexing on RangeIndex with these indexers [8.0]
+        這裡直接模擬那個轉換過程，確保 validate_best_on_oos 能吃 float 型的 top_n。"""
+        result_df, is_days, oos_days = sweep.run_sweep(
+            self.pipeline_inputs,
+            param_grid=[{"top_n": 2, "tech_weight": 0.5, "chip_weight": 0.5,
+                         "gap_stop_threshold": -0.015}],
+        )
+        ranked = sweep.rank_results(result_df, min_trades=0)
+        best = ranked.iloc[0].to_dict()
+        self.assertIsInstance(best["top_n"], float)  # 先確認真的會被轉成 float，不是這個測試自己假設
+
+        # 不應該丟出 TypeError
+        summary = sweep.validate_best_on_oos(self.pipeline_inputs, best, oos_days)
+        self.assertIn("total_trades", summary)
 
     def test_validate_best_on_oos_runs_and_returns_summary(self):
         _, is_days, oos_days = sweep.run_sweep(

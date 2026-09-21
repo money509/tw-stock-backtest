@@ -170,6 +170,172 @@ class TestHardFilters(unittest.TestCase):
         self.assertNotIn("DOWN", cand["code"].tolist())
 
 
+class TestSignalWeights(unittest.TestCase):
+    def _build_indicators(self, closes, volume=1_000_000):
+        raw = make_price_series(closes)
+        raw["volume"] = volume
+        return ome.precompute_overnight_indicators(raw)
+
+    def setUp(self):
+        # 兩檔股票，刻意讓技術面指標一樣，但籌碼面完全相反，
+        # 這樣才能用 signal_weights 單獨測「只看某個訊號」時排名會不會跟著換。
+        closes = [100 + i * 0.5 for i in range(80)]
+        self.ind_a = self._build_indicators(closes)
+        self.ind_b = self._build_indicators(closes)
+        self.indicators_by_code = {"A": self.ind_a, "B": self.ind_b}
+
+        market_df = pd.DataFrame({
+            "date": self.ind_a["date"], "close": [200 + i * 0.3 for i in range(80)],
+        })
+        self.market_returns = ome.precompute_market_returns(market_df)
+        self.target_date = self.ind_a["date"].iloc[70]
+
+        # A 的當沖比例低(好)，B 的當沖比例高(差)；技術面完全一樣(同樣的K線)
+        self.dtr = pd.DataFrame([
+            {"date": self.target_date, "code": "A", "day_trading_ratio": 0.01},
+            {"date": self.target_date, "code": "B", "day_trading_ratio": 0.50},
+        ])
+        self.empty_chip = pd.DataFrame(columns=["date", "code", "ratio"])
+
+    def test_signal_weights_none_keeps_old_behavior(self):
+        """不傳 signal_weights，跟舊的 tech_weight/chip_weight 邏輯完全一樣。"""
+        cand = ome.scan_candidates_for_date(
+            self.target_date, self.indicators_by_code, self.market_returns,
+            self.empty_chip, self.empty_chip, self.dtr,
+            universe_codes=["A", "B"], tech_weight=0.35, chip_weight=0.65,
+        )
+        self.assertIn("technical_score", cand.columns)
+        self.assertIn("chip_score", cand.columns)
+
+    def test_isolating_day_trading_signal_ranks_by_it_alone(self):
+        """只給 score_day_trading 權重，A(當沖比例低)應該排第一。"""
+        cand = ome.scan_candidates_for_date(
+            self.target_date, self.indicators_by_code, self.market_returns,
+            self.empty_chip, self.empty_chip, self.dtr,
+            universe_codes=["A", "B"],
+            signal_weights={"score_day_trading": 1.0},
+        )
+        self.assertEqual(cand.iloc[0]["code"], "A")
+
+    def test_isolating_signal_with_equal_underlying_values_ties(self):
+        """兩檔技術面完全相同，只看某個技術面訊號時分數應該相等（互為平手）。"""
+        cand = ome.scan_candidates_for_date(
+            self.target_date, self.indicators_by_code, self.market_returns,
+            self.empty_chip, self.empty_chip, self.dtr,
+            universe_codes=["A", "B"],
+            signal_weights={"score_close_position": 1.0},
+        )
+        scores = cand["final_score"].tolist()
+        self.assertAlmostEqual(scores[0], scores[1])
+
+    def test_zero_total_weight_raises(self):
+        with self.assertRaises(ValueError):
+            ome.scan_candidates_for_date(
+                self.target_date, self.indicators_by_code, self.market_returns,
+                self.empty_chip, self.empty_chip, self.dtr,
+                universe_codes=["A", "B"], signal_weights={"score_day_trading": 0.0},
+            )
+
+    def test_run_overnight_backtest_accepts_signal_weights(self):
+        exit_date = self.ind_a["date"].iloc[71]
+        trades = ome.run_overnight_backtest(
+            self.indicators_by_code, self.market_returns,
+            self.empty_chip, self.empty_chip, self.dtr,
+            [self.target_date, exit_date], universe_codes=["A", "B"], top_n=1,
+            signal_weights={"score_day_trading": 1.0},
+        )
+        self.assertEqual(len(trades), 1)
+        self.assertEqual(trades[0]["code"], "A")
+
+
+class TestUsMarketFilter(unittest.TestCase):
+    def _build_indicators(self, closes, volume=1_000_000):
+        raw = make_price_series(closes)
+        raw["volume"] = volume
+        return ome.precompute_overnight_indicators(raw)
+
+    def setUp(self):
+        closes = [100 + i * 0.5 for i in range(80)]
+        self.indicators = self._build_indicators(closes)
+        self.indicators_by_code = {"TEST": self.indicators}
+        market_df = pd.DataFrame({
+            "date": self.indicators["date"], "close": [200 + i * 0.3 for i in range(80)],
+        })
+        self.market_returns = ome.precompute_market_returns(market_df)
+        self.empty_chip = pd.DataFrame(columns=["date", "code", "ratio"])
+        self.empty_dtr = pd.DataFrame(columns=["date", "code", "day_trading_ratio"])
+        self.target_date = self.indicators["date"].iloc[70]
+
+    def test_no_us_market_df_behaves_exactly_as_before(self):
+        """不傳 us_market_returns_df，行為要跟這個參數不存在時完全一樣（向後相容）。"""
+        cand = ome.scan_candidates_for_date(
+            self.target_date, self.indicators_by_code, self.market_returns,
+            self.empty_chip, self.empty_chip, self.empty_dtr,
+            universe_codes=["TEST"],
+        )
+        self.assertIn("TEST", cand["code"].tolist())
+
+    def test_us_market_big_drop_blocks_entry_entirely(self):
+        us_df = pd.DataFrame([{"date": self.target_date, "close": 4000, "return_pct": -2.5}])
+        cand = ome.scan_candidates_for_date(
+            self.target_date, self.indicators_by_code, self.market_returns,
+            self.empty_chip, self.empty_chip, self.empty_dtr,
+            universe_codes=["TEST"], us_market_returns_df=us_df,
+        )
+        self.assertTrue(cand.empty, "美股大跌超過門檻，當天不該有任何候選股")
+
+    def test_us_market_mild_move_does_not_block_entry(self):
+        us_df = pd.DataFrame([{"date": self.target_date, "close": 4000, "return_pct": -0.3}])
+        cand = ome.scan_candidates_for_date(
+            self.target_date, self.indicators_by_code, self.market_returns,
+            self.empty_chip, self.empty_chip, self.empty_dtr,
+            universe_codes=["TEST"], us_market_returns_df=us_df,
+        )
+        self.assertIn("TEST", cand["code"].tolist())
+
+    def test_missing_date_in_us_market_df_does_not_block(self):
+        """美股資料裡沒有這一天(例如美股假日但台股照常開盤)，不該誤擋。"""
+        us_df = pd.DataFrame([{"date": "20990101", "close": 4000, "return_pct": -5.0}])
+        cand = ome.scan_candidates_for_date(
+            self.target_date, self.indicators_by_code, self.market_returns,
+            self.empty_chip, self.empty_chip, self.empty_dtr,
+            universe_codes=["TEST"], us_market_returns_df=us_df,
+        )
+        self.assertIn("TEST", cand["code"].tolist())
+
+    def test_threshold_is_configurable(self):
+        us_df = pd.DataFrame([{"date": self.target_date, "close": 4000, "return_pct": -0.8}])
+        # 預設門檻-1.5%不會擋到-0.8%的跌幅
+        cand_default = ome.scan_candidates_for_date(
+            self.target_date, self.indicators_by_code, self.market_returns,
+            self.empty_chip, self.empty_chip, self.empty_dtr,
+            universe_codes=["TEST"], us_market_returns_df=us_df,
+        )
+        self.assertFalse(cand_default.empty)
+
+        # 把門檻收緊到-0.5%，-0.8%的跌幅就該被擋
+        cand_strict = ome.scan_candidates_for_date(
+            self.target_date, self.indicators_by_code, self.market_returns,
+            self.empty_chip, self.empty_chip, self.empty_dtr,
+            universe_codes=["TEST"], us_market_returns_df=us_df,
+            us_market_drop_threshold=-0.5,
+        )
+        self.assertTrue(cand_strict.empty)
+
+    def test_run_overnight_backtest_skips_entry_day_on_us_market_crash(self):
+        entry_date = self.indicators["date"].iloc[70]
+        exit_date = self.indicators["date"].iloc[71]
+        us_df = pd.DataFrame([{"date": entry_date, "close": 4000, "return_pct": -3.0}])
+
+        trades = ome.run_overnight_backtest(
+            self.indicators_by_code, self.market_returns,
+            self.empty_chip, self.empty_chip, self.empty_dtr,
+            [entry_date, exit_date], universe_codes=["TEST"], top_n=1,
+            us_market_returns_df=us_df,
+        )
+        self.assertEqual(trades, [], "美股大跌那天不該產生任何交易")
+
+
 class TestExitSimulation(unittest.TestCase):
     def test_gap_stop_triggers_on_large_gap_down(self):
         entry_price = 100.0

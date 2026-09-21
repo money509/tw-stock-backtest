@@ -70,10 +70,20 @@ PRICE_LEVEL_COMFORT_PCT = 8.0   # 離季線在這個百分比之內不扣分
 PRICE_LEVEL_PENALTY_SCALE = 4.0  # 超過comfort後，每超過1%扣多少分
 
 GAP_STOP_THRESHOLD = -0.015   # 開盤跳空跌幅超過 -1.5% 直接停損出場
+US_MARKET_DROP_THRESHOLD_PCT = -1.5  # 隔夜美股跌幅超過這個%，當天完全不進場（硬門檻，不是扣分）
 ATR_STOP_MULT = 0.8
 ATR_TARGET_MULT = 1.2
 
 TOP_N = 5
+
+# 8 個子訊號的名稱，順序跟 scan_candidates_for_date() 裡算出來的欄位名稱一致。
+# 給 signal_weights 這種「每個訊號各自可調權重」的用法用（例如單一訊號拆解測試），
+# 跟 tech_weight/chip_weight 那種「兩組各自取平均」的舊用法是兩條平行路徑。
+SIGNAL_NAMES = [
+    "score_close_position", "score_volume_ratio", "score_rel_strength",
+    "score_gain_pct", "score_price_level",
+    "score_day_trading", "score_foreign", "score_trust",
+]
 
 MA_SHORT = 5
 MA_MID = 20
@@ -206,11 +216,36 @@ def precompute_market_returns(market_df):
 def scan_candidates_for_date(date_str, indicators_by_code, market_returns_df,
                               foreign_ratio_df, trust_ratio_df, day_trading_ratio_df,
                               universe_codes=None, top_n=TOP_N,
-                              tech_weight=TECH_WEIGHT, chip_weight=CHIP_WEIGHT):
+                              tech_weight=TECH_WEIGHT, chip_weight=CHIP_WEIGHT,
+                              us_market_returns_df=None,
+                              us_market_drop_threshold=US_MARKET_DROP_THRESHOLD_PCT,
+                              signal_weights=None):
     """
     對指定日期，回傳依最終分數排序的候選股 DataFrame（已套用硬門檻與評分）。
     若當天沒有任何股票通過硬門檻，回傳空 DataFrame。
+
+    us_market_returns_df：可選，us_market_loader.load_us_market_returns() 的輸出
+    （欄位 date/close/return_pct）。這是隔夜跳空風險的源頭濾網——如果當天(date_str)
+    對應的美股報酬率低於 us_market_drop_threshold(預設-1.5%)，代表隔夜美股大跌，
+    直接跳過整天不進場，回傳空 DataFrame，而不是等進場後被動被跳空停損打到。
+    不傳這個參數（維持 None）就完全不啟用這個濾網，行為跟改之前一模一樣，
+    向後相容，不影響任何既有呼叫方式或測試。
+
+    signal_weights：可選，dict[str, float]，key 是 SIGNAL_NAMES 裡的欄位名稱
+    （8個子訊號各自的分數欄位名）。傳入的話會**取代**掉 tech_weight/chip_weight
+    那種「兩組各自取平均再加權」的算法，改成對全部8個子訊號直接做加權平均
+    （沒列在 dict 裡的訊號權重視為0，不會影響最終分數）。
+    用途：單一訊號拆解測試（sweep_signal_ablation.py）——只給某一個訊號
+    weight=1，其餘不列出，就能看這個訊號單獨拿來選股的效果。
+    維持 None（預設）就完全不影響既有行為，向後相容。
     """
+    if us_market_returns_df is not None and not us_market_returns_df.empty:
+        us_row = us_market_returns_df[us_market_returns_df["date"] == date_str]
+        if len(us_row):
+            us_return = us_row["return_pct"].iloc[0]
+            if pd.notna(us_return) and us_return <= us_market_drop_threshold:
+                return pd.DataFrame()  # 隔夜美股大跌，今天完全不進場
+
     market_row = market_returns_df[market_returns_df["date"] == date_str]
     market_ret = float(market_row["market_return_pct"].iloc[0]) if len(market_row) else np.nan
 
@@ -286,7 +321,15 @@ def scan_candidates_for_date(date_str, indicators_by_code, market_returns_df,
 
     cand["chip_score"] = cand[["score_day_trading", "score_foreign", "score_trust"]].mean(axis=1)
 
-    cand["final_score"] = cand["technical_score"] * tech_weight + cand["chip_score"] * chip_weight
+    if signal_weights is not None:
+        total_weight = sum(signal_weights.values())
+        if total_weight <= 0:
+            raise ValueError("signal_weights 的權重總和必須大於0")
+        cand["final_score"] = sum(
+            cand[name] * signal_weights.get(name, 0.0) for name in SIGNAL_NAMES
+        ) / total_weight
+    else:
+        cand["final_score"] = cand["technical_score"] * tech_weight + cand["chip_score"] * chip_weight
 
     cand = cand.sort_values("final_score", ascending=False).reset_index(drop=True)
     return cand.head(top_n)
@@ -342,7 +385,10 @@ def run_overnight_backtest(indicators_by_code, market_returns_df,
                             fee_per_trade=200,
                             gap_stop_threshold=GAP_STOP_THRESHOLD,
                             atr_stop_mult=ATR_STOP_MULT,
-                            atr_target_mult=ATR_TARGET_MULT):
+                            atr_target_mult=ATR_TARGET_MULT,
+                            us_market_returns_df=None,
+                            us_market_drop_threshold=US_MARKET_DROP_THRESHOLD_PCT,
+                            signal_weights=None):
     """
     對 trading_days（已排序的 YYYYMMDD 字串 list）逐日跑隔日衝策略。
     第 i 天收盤選股、進場；用第 i+1 天的 K 棒模擬出場。
@@ -351,6 +397,11 @@ def run_overnight_backtest(indicators_by_code, market_returns_df,
     gap_stop_threshold / atr_stop_mult / atr_target_mult 開放給呼叫端覆寫，
     是給參數掃描（sweep_overnight_params.py）用的——沒有指定的話就是引擎預設值，
     行為跟修改前完全一樣，不影響既有呼叫方式。
+
+    us_market_returns_df：傳入的話會啟用「隔夜美股大跌就整天不進場」的硬門檻濾網
+    （見 scan_candidates_for_date 的說明），不傳就完全不影響既有行為。
+
+    signal_weights：見 scan_candidates_for_date 的說明，往下傳給它。
     """
     trades = []
 
@@ -363,6 +414,9 @@ def run_overnight_backtest(indicators_by_code, market_returns_df,
             foreign_ratio_df, trust_ratio_df, day_trading_ratio_df,
             universe_codes=universe_codes, top_n=top_n,
             tech_weight=tech_weight, chip_weight=chip_weight,
+            us_market_returns_df=us_market_returns_df,
+            us_market_drop_threshold=us_market_drop_threshold,
+            signal_weights=signal_weights,
         )
         if candidates.empty:
             continue

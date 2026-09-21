@@ -129,9 +129,18 @@ class TestFullPipelineIntegration(unittest.TestCase):
                 data = {c: df for c, df in data.items() if c in universe_codes}
             return data
 
+        def fake_us_market_loader(start, end, refresh=False):
+            dates = pd.bdate_range(start="2026-01-01", periods=self.n_days)
+            return pd.DataFrame({
+                "date": [d.strftime("%Y%m%d") for d in dates],
+                "close": [4000.0] * self.n_days,
+                "return_pct": [0.1] * self.n_days,  # 溫和正報酬，不會觸發濾網
+            })
+
         self.fake_price_loader = fake_price_loader
         self.fake_chip_loader = fake_chip_loader
         self.fake_day_trading_loader = FakeDayTradingLoader(self.codes, self.n_days)
+        self.fake_us_market_loader = fake_us_market_loader
 
         self.whitelist = {c: c for c in self.codes}
 
@@ -142,10 +151,12 @@ class TestFullPipelineIntegration(unittest.TestCase):
             price_loader=self.fake_price_loader,
             chip_loader=self.fake_chip_loader,
             day_trading_loader_fn=self.fake_day_trading_loader,
+            us_market_loader_fn=self.fake_us_market_loader,
         )
 
         self.assertEqual(set(inputs["indicators_by_code"].keys()), set(self.codes))
         self.assertGreater(len(inputs["trading_days"]), 0)
+        self.assertIn("return_pct", inputs["us_market_returns_df"].columns)
         self.assertIn("ratio", inputs["foreign_ratio_df"].columns)
         self.assertIn("ratio", inputs["trust_ratio_df"].columns)
         self.assertIn("day_trading_ratio", inputs["day_trading_ratio_df"].columns)
@@ -168,6 +179,7 @@ class TestFullPipelineIntegration(unittest.TestCase):
             price_loader=self.fake_price_loader,
             chip_loader=self.fake_chip_loader,
             day_trading_loader_fn=self.fake_day_trading_loader,
+            us_market_loader_fn=self.fake_us_market_loader,
         )
 
         is_trades, oos_trades, is_summary, oos_summary = co.run_is_oos_backtest(inputs, top_n=2)

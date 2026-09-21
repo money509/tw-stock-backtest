@@ -20,6 +20,7 @@ import pandas as pd
 import data_loader
 import chip_data_loader
 import day_trading_loader
+import us_market_loader
 import overnight_chip_adapter as adapter
 import overnight_momentum_engine as ome
 
@@ -77,18 +78,21 @@ def build_volume_df(price_data):
 # ---------------------------------------------------------------------------
 
 def build_pipeline_inputs(whitelist, start_date, end_date, market_reference_code="2330",
-                           refresh=False, price_loader=None, chip_loader=None, day_trading_loader_fn=None):
+                           refresh=False, price_loader=None, chip_loader=None,
+                           day_trading_loader_fn=None, us_market_loader_fn=None):
     """
     組出跑 overnight_momentum_engine.run_overnight_backtest() 所需的全部輸入。
-    price_loader / chip_loader / day_trading_loader_fn 可用於測試時注入假資料源，
-    預設分別是 data_loader.load_price_data / chip_data_loader.load_chip_data /
-    day_trading_loader.load_day_trading_data。
+    price_loader / chip_loader / day_trading_loader_fn / us_market_loader_fn
+    可用於測試時注入假資料源，預設分別是 data_loader.load_price_data /
+    chip_data_loader.load_chip_data / day_trading_loader.load_day_trading_data /
+    us_market_loader.load_us_market_returns。
 
     start_date / end_date: datetime.date
     """
     price_loader = price_loader or data_loader.load_price_data
     chip_loader = chip_loader or chip_data_loader.load_chip_data
     day_trading_loader_fn = day_trading_loader_fn or day_trading_loader.load_day_trading_data
+    us_market_loader_fn = us_market_loader_fn or us_market_loader.load_us_market_returns
 
     start_dash = start_date.strftime("%Y-%m-%d")
     end_dash = end_date.strftime("%Y-%m-%d")
@@ -116,6 +120,8 @@ def build_pipeline_inputs(whitelist, start_date, end_date, market_reference_code
 
     trading_days = sorted(indicators_by_code[market_reference_code]["date"].unique().tolist())
 
+    us_market_returns_df = us_market_loader_fn(start_dash, end_dash, refresh=refresh)
+
     return {
         "indicators_by_code": indicators_by_code,
         "market_returns_df": market_returns_df,
@@ -124,6 +130,7 @@ def build_pipeline_inputs(whitelist, start_date, end_date, market_reference_code
         "day_trading_ratio_df": day_trading_ratio_df,
         "trading_days": trading_days,
         "universe_codes": universe_codes,
+        "us_market_returns_df": us_market_returns_df,
     }
 
 
@@ -145,6 +152,7 @@ def run_is_oos_backtest(pipeline_inputs, is_ratio=IS_RATIO, **backtest_kwargs):
         trust_ratio_df=pipeline_inputs["trust_ratio_df"],
         day_trading_ratio_df=pipeline_inputs["day_trading_ratio_df"],
         universe_codes=pipeline_inputs["universe_codes"],
+        us_market_returns_df=pipeline_inputs.get("us_market_returns_df"),
     )
     common_args.update(backtest_kwargs)
 
@@ -182,6 +190,10 @@ def main():
     parser.add_argument("--top-n", type=int, default=ome.TOP_N)
     parser.add_argument("--tech-weight", type=float, default=ome.TECH_WEIGHT)
     parser.add_argument("--chip-weight", type=float, default=ome.CHIP_WEIGHT)
+    parser.add_argument("--no-us-filter", action="store_true",
+                         help="停用隔夜美股大跌濾網，方便跟啟用時的結果對照比較")
+    parser.add_argument("--us-drop-threshold", type=float, default=ome.US_MARKET_DROP_THRESHOLD_PCT,
+                         help="美股隔夜跌幅超過這個%%(負數)就不進場，預設-1.5")
     args = parser.parse_args()
 
     start_date = datetime.datetime.strptime(args.start, "%Y-%m-%d").date()
@@ -191,11 +203,15 @@ def main():
     pipeline_inputs = build_pipeline_inputs(
         data_loader.STOCK_FUTURES_WHITELIST, start_date, end_date, refresh=args.refresh,
     )
+    if args.no_us_filter:
+        pipeline_inputs["us_market_returns_df"] = None
+        print("（已停用隔夜美股濾網）")
 
     print(f"共 {len(pipeline_inputs['trading_days'])} 個交易日，開始跑 IS/OOS 回測 ...")
     is_trades, oos_trades, is_summary, oos_summary = run_is_oos_backtest(
         pipeline_inputs, top_n=args.top_n,
         tech_weight=args.tech_weight, chip_weight=args.chip_weight,
+        us_market_drop_threshold=args.us_drop_threshold,
     )
 
     print_summary("樣本內 IS (前70%)", is_summary)
