@@ -56,6 +56,14 @@ on:
         description: "投信買超比重(trust_ratio，原始數值%，非分數)絕對門檻（backtest / cross_period 模式使用）：留空=不啟用。缺值或低於這個門檻的候選股直接剔除，不進入排名評分。⚠️新調的話請先在backtest模式(IS/OOS)上調好、鎖定，再拿去cross_period做最終確認，不要直接在cross_period上試調"
         required: false
         default: ""
+      atr_stop_mult:
+        description: "ATR停損倍數（僅 backtest 模式使用）：用來拿atr_sweep模式掃出來的候選組合，搭配slippage_pct等其他已鎖定參數做最終檢查，不填就用引擎預設值0.8"
+        required: false
+        default: "0.8"
+      atr_target_mult:
+        description: "ATR停利倍數（僅 backtest 模式使用），用途同atr_stop_mult，不填就用引擎預設值1.2"
+        required: false
+        default: "1.2"
       refresh:
         description: "忽略快取，強制重新下載所有資料"
         required: false
@@ -222,6 +230,8 @@ jobs:
               --chip-weight "${{ github.event.inputs.chip_weight }}" \
               --slippage-pct "${{ github.event.inputs.slippage_pct }}" \
               --universe "${{ github.event.inputs.universe }}" \
+              --atr-stop-mult "${{ github.event.inputs.atr_stop_mult }}" \
+              --atr-target-mult "${{ github.event.inputs.atr_target_mult }}" \
               $MIN_CANDIDATES_FLAG \
               $MIN_TRUST_RATIO_FLAG \
               $REFRESH_FLAG \
