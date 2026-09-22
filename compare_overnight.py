@@ -233,6 +233,17 @@ def main():
                               "⚠️ 新調的話請先在這份IS/OOS資料上調好、鎖定，"
                               "再拿去跨期驗證(cross_period_validation.py)做最終確認，"
                               "不要直接在跨期驗證資料上試調")
+    parser.add_argument("--atr-stop-mult", type=float, default=ome.ATR_STOP_MULT,
+                         help=f"ATR停損倍數(預設{ome.ATR_STOP_MULT}，引擎預設值)。"
+                              "用來把atr_sweep.py掃出來的候選組合，拿到這裡連同"
+                              "slippage_pct/min_candidates/min_trust_ratio等其他"
+                              "已鎖定的參數一起在同一份IS/OOS資料上做最終檢查——"
+                              "atr_sweep.py本身不模擬滑價，非常緊的停損倍數"
+                              "(例如0.1倍ATR)在滑價的侵蝕下可能完全不是那回事，"
+                              "鎖定前務必用這裡疊加slippage_pct確認過一次。")
+    parser.add_argument("--atr-target-mult", type=float, default=ome.ATR_TARGET_MULT,
+                         help=f"ATR停利倍數(預設{ome.ATR_TARGET_MULT}，引擎預設值)，"
+                              "用途同--atr-stop-mult")
     args = parser.parse_args()
 
     start_date = datetime.datetime.strptime(args.start, "%Y-%m-%d").date()
@@ -260,6 +271,8 @@ def main():
         slippage_pct=args.slippage_pct,
         min_candidates=args.min_candidates,
         min_trust_ratio=args.min_trust_ratio,
+        atr_stop_mult=args.atr_stop_mult,
+        atr_target_mult=args.atr_target_mult,
     )
 
     print_summary("樣本內 IS (前70%)", is_summary)

@@ -294,6 +294,36 @@ class TestFullPipelineIntegration(unittest.TestCase):
         self.assertEqual(len(captured), 2)  # IS + OOS 各跑一次
         self.assertTrue(all(v == 3.0 for v in captured))
 
+    def test_run_is_oos_backtest_passes_through_atr_mults(self):
+        """驗證atr_stop_mult/atr_target_mult真的有透過run_is_oos_backtest的
+        **backtest_kwargs傳到run_overnight_backtest，用來拿atr_sweep.py掃出來的
+        候選組合搭配slippage_pct等其他鎖定參數做最終檢查。"""
+        inputs = co.build_pipeline_inputs(
+            self.whitelist,
+            datetime.date(2026, 1, 1), datetime.date(2026, 6, 1),
+            price_loader=self.fake_price_loader,
+            chip_loader=self.fake_chip_loader,
+            day_trading_loader_fn=self.fake_day_trading_loader,
+            us_market_loader_fn=self.fake_us_market_loader,
+            dividend_loader_fn=self.fake_dividend_loader,
+        )
+
+        captured = []
+        real_run = ome.run_overnight_backtest
+
+        def spy(**kwargs):
+            captured.append((kwargs.get("atr_stop_mult"), kwargs.get("atr_target_mult")))
+            return real_run(**kwargs)
+
+        ome.run_overnight_backtest = spy
+        try:
+            co.run_is_oos_backtest(inputs, top_n=2, atr_stop_mult=0.1, atr_target_mult=3.0)
+        finally:
+            ome.run_overnight_backtest = real_run
+
+        self.assertEqual(len(captured), 2)  # IS + OOS 各跑一次
+        self.assertTrue(all(v == (0.1, 3.0) for v in captured))
+
 
 class TestUniverseChoices(unittest.TestCase):
     """--universe 選項：59檔舊清單 vs taifex_universe.py 的249檔完整清單。"""
