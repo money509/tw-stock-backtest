@@ -210,6 +210,30 @@ class TestRunSweep(unittest.TestCase):
         self.assertEqual(len(captured), 1)
         self.assertEqual(captured[0], (3, 0.02))
 
+    def test_run_sweep_passes_through_slippage_pct(self):
+        """驗證slippage_pct真的有傳到run_overnight_backtest，掃ATR倍數時
+        套用滑價才能避免掃到滑價/雜訊主導的假最佳解。"""
+        import overnight_momentum_engine as ome
+        captured = []
+        real_run = ome.run_overnight_backtest
+
+        def spy(**kwargs):
+            captured.append(kwargs.get("slippage_pct"))
+            return real_run(**kwargs)
+
+        ome.run_overnight_backtest = spy
+        try:
+            atr_sweep.run_sweep(
+                self.pipeline_inputs,
+                param_grid=[{"atr_stop_mult": 0.8, "atr_target_mult": 1.5}],
+                slippage_pct=0.1,
+            )
+        finally:
+            ome.run_overnight_backtest = real_run
+
+        self.assertEqual(len(captured), 1)
+        self.assertEqual(captured[0], 0.1)
+
     def test_run_sweep_default_none_keeps_old_behavior(self):
         small_grid = [{"atr_stop_mult": 0.8, "atr_target_mult": 1.5}]
         default_df, _, _ = atr_sweep.run_sweep(self.pipeline_inputs, param_grid=small_grid)

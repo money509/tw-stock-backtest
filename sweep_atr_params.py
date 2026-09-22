@@ -50,12 +50,16 @@ def build_atr_grid():
     (這次掃描範圍裡最遠的一個)，代表PF在停利拉遠的方向上還沒到頂，所以第二版
     把停利延伸到6.0、停損下探到0.3——結果停利在3.0左右真的出現頂點了(拉遠到
     4.0/5.0/6.0後PF微幅下降)，但換成停損又卡在邊界(0.3倍ATR，這次掃描範圍裡
-    最緊的一個，還是表現最好)。這一版繼續把停損往更緊的方向延伸到0.1，確認
-    「停損越緊越好」這個方向會不會在更極端的地方反轉——如果一直緊到0.1都還在
-    進步，那就要小心是不是已經緊到滑價和雜訊主導的範圍，不是真正可靠的訊號。
+    最緊的一個，還是表現最好)。第三版繼續把停損往更緊的方向延伸到0.1，確認
+    「停損越緊越好」這個方向會不會在更極端的地方反轉——結果0.1(這版的邊界)
+    在沒套滑價時依然是最佳，但套上0.1%滑價後PF明顯被侵蝕(仍>1，但降了快30%)，
+    證實這裡確實已經進入滑價敏感區。這一版把停損邊界再往下探到0.02，並且
+    搭配run_sweep()新增的slippage_pct參數，直接在「有滑價」的條件下掃，
+    這樣才能找到「套了滑價之後」真正的最佳組合，而不是找到一個沒滑價時
+    好看、一套滑價就打回原形的假最佳解。
     """
     combos = []
-    for atr_stop_mult in (0.1, 0.15, 0.2, 0.3, 0.5, 0.8, 1.0, 1.5):
+    for atr_stop_mult in (0.02, 0.05, 0.1, 0.15, 0.2, 0.3, 0.5, 0.8, 1.0, 1.5):
         for atr_target_mult in (1.0, 1.5, 2.0, 3.0, 4.0, 5.0, 6.0):
             if atr_target_mult < atr_stop_mult:
                 continue
@@ -70,13 +74,18 @@ def run_sweep(pipeline_inputs, is_ratio=IS_RATIO, param_grid=None,
               top_n=FIXED_TOP_N, tech_weight=FIXED_TECH_WEIGHT,
               chip_weight=FIXED_CHIP_WEIGHT,
               gap_stop_threshold=FIXED_GAP_STOP_THRESHOLD,
-              min_candidates=None, min_trust_ratio=None):
+              min_candidates=None, min_trust_ratio=None, slippage_pct=0.0):
     """只在 IS 區間跑，回傳每個 ATR 組合的結果 DataFrame（不看 OOS，理由同 sweep_overnight_params.py）。
 
     min_candidates / min_trust_ratio：可選，往下傳給每次run_overnight_backtest()呼叫，
     見overnight_momentum_engine.py的說明。不傳（維持None）就完全不啟用，向後相容。
     用途：選股邏輯換了（例如新鎖定min_trust_ratio）之後，ATR停利停損的最佳倍數
     很可能也跟著變，這裡讓呼叫端可以把新鎖定的選股參數固定住，只重新掃ATR這兩個維度。
+
+    slippage_pct：預設0.0，維持舊行為(不模擬滑價)。⚠️強烈建議掃ATR倍數時開啟這個，
+    尤其是掃描範圍包含很緊的停損倍數(例如0.1以下)時——沒套滑價掃出來的「最佳」組合，
+    可能只是滑價/雜訊主導的假訊號，套了滑價之後PF會被大幅侵蝕甚至反轉，見
+    build_atr_grid()的docstring說明。
     """
     param_grid = param_grid or build_atr_grid()
     is_days, oos_days = split_is_oos(pipeline_inputs["trading_days"], is_ratio)
@@ -97,6 +106,7 @@ def run_sweep(pipeline_inputs, is_ratio=IS_RATIO, param_grid=None,
         gap_stop_threshold=gap_stop_threshold,
         min_candidates=min_candidates,
         min_trust_ratio=min_trust_ratio,
+        slippage_pct=slippage_pct,
     )
 
     rows = []
@@ -163,6 +173,10 @@ def main():
     parser.add_argument("--min-trust-ratio", type=float, default=None,
                          help="投信買超比重絕對門檻(預設不啟用)，固定住新鎖定的選股邏輯，"
                               "只重新掃ATR倍數這兩個維度")
+    parser.add_argument("--slippage-pct", type=float, default=0.0,
+                         help="模擬滑價百分比(預設0=不模擬)，強烈建議掃描範圍包含很緊的"
+                              "停損倍數時開啟(例如0.1)，避免掃到滑價/雜訊主導的假最佳解，"
+                              "見build_atr_grid()的docstring說明")
     args = parser.parse_args()
 
     start_date = datetime.datetime.strptime(args.start, "%Y-%m-%d").date()
@@ -177,11 +191,16 @@ def main():
     print(f"\n共 {len(grid)} 組 ATR 倍數組合，其餘參數固定在 top_n={FIXED_TOP_N}, "
           f"tech/chip={FIXED_TECH_WEIGHT}/{FIXED_CHIP_WEIGHT}, "
           f"gap_stop={FIXED_GAP_STOP_THRESHOLD}, "
-          f"min_candidates={args.min_candidates}, min_trust_ratio={args.min_trust_ratio}，"
+          f"min_candidates={args.min_candidates}, min_trust_ratio={args.min_trust_ratio}, "
+          f"slippage_pct={args.slippage_pct}，"
           f"只在樣本內(IS, 前70%)跑回測 ...\n")
+    if args.slippage_pct:
+        print(f"⚠️ 有套用滑價模擬：slippage_pct={args.slippage_pct}%（買進多付、賣出少拿），"
+              f"排名結果反映的是滑價侵蝕後的真實表現，不是理論最佳值。")
     result_df, is_days, oos_days = run_sweep(
         pipeline_inputs, param_grid=grid,
         min_candidates=args.min_candidates, min_trust_ratio=args.min_trust_ratio,
+        slippage_pct=args.slippage_pct,
     )
 
     ranked = rank_results(result_df)
@@ -204,6 +223,7 @@ def main():
         oos_summary = validate_best_on_oos(
             pipeline_inputs, best, oos_days,
             min_candidates=args.min_candidates, min_trust_ratio=args.min_trust_ratio,
+            slippage_pct=args.slippage_pct,
         )
         print(f"組合: atr_stop={best['atr_stop_mult']}, atr_target={best['atr_target_mult']}")
         print(f"OOS 交易次數: {oos_summary['total_trades']}")
@@ -218,7 +238,8 @@ def validate_best_on_oos(pipeline_inputs, best_params, oos_days,
                           top_n=FIXED_TOP_N, tech_weight=FIXED_TECH_WEIGHT,
                           chip_weight=FIXED_CHIP_WEIGHT,
                           gap_stop_threshold=FIXED_GAP_STOP_THRESHOLD,
-                          min_candidates=None, min_trust_ratio=None):
+                          min_candidates=None, min_trust_ratio=None,
+                          slippage_pct=0.0):
     """把排名第一的 ATR 組合，拿到 OOS 跑一次，僅供參考、不能拿來重新挑參數。"""
     trades = ome.run_overnight_backtest(
         indicators_by_code=pipeline_inputs["indicators_by_code"],
@@ -236,6 +257,7 @@ def validate_best_on_oos(pipeline_inputs, best_params, oos_days,
         gap_stop_threshold=gap_stop_threshold,
         min_candidates=min_candidates,
         min_trust_ratio=min_trust_ratio,
+        slippage_pct=slippage_pct,
         # 跟 sweep_overnight_params.py 一樣的保險：避免 DataFrame.iloc[0].to_dict()
         # 把數值型欄位轉成非預期的 dtype。
         atr_stop_mult=float(best_params["atr_stop_mult"]),
