@@ -172,9 +172,12 @@ jobs:
             # atr_sweep 模式：只掃 ATR 停利/停損倍數，其餘參數固定，只在IS區間內跑。
             # min_candidates/min_trust_ratio可以用來固定住新鎖定的選股邏輯，
             # 重新掃出跟新選股邏輯搭配的ATR倍數(選股邏輯變了，最佳ATR倍數也可能跟著變)。
+            # slippage_pct強烈建議搭配套用，避免掃到停損設很緊、沒套滑價時好看，
+            # 一套滑價就大幅打折甚至打回虧損的假最佳解。
             python3 sweep_atr_params.py \
               --start "${{ github.event.inputs.start_date }}" \
               --end "${{ github.event.inputs.end_date }}" \
+              --slippage-pct "${{ github.event.inputs.slippage_pct }}" \
               $MIN_CANDIDATES_FLAG \
               $MIN_TRUST_RATIO_FLAG \
               $REFRESH_FLAG \
