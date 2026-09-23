@@ -4,13 +4,24 @@ cross_period_validation.py
 真正的跨期驗證：不是同一份資料切出來的IS/OOS，而是完全獨立的一段歷史區間——
 這段資料從頭到尾都沒有被用來挑過任何訊號權重或ATR參數。
 
-背景：用現有資料(2023-09-15~2026-09-14)做的IS(前70%)/OOS(後30%)驗證，
-挑出的最佳候選組合是：
-    訊號權重：只用 投信買超比重/量比/相對大盤強弱 這3個(可選投信加重2倍)
-    ATR參數：停損0.3~0.5倍 / 停利3.0倍
-IS結果 PF約1.25~1.38，OOS(同一份資料切出來的)PF約1.6。但這整個挑選過程
-（訊號拆解 -> ATR掃描 -> 合併測試）都是在同一份資料上做的多層挑選，OOS也只是
-同一份連續資料的最後一段，不是真正獨立的驗證——這支腳本就是要補上這一塊。
+背景：CANDIDATES這份候選清單，是經過一次完整的「誠實版」重新挑選才得到的
+（先前用「T日當天」偷看版本選出的候選，拿到這裡驗證時PF全部掉到1以下，詳見
+git歷史；以下是修正後的完整鏈路）：
+  1. sweep_signal_ablation.py(honest timing版)：8訊號單獨測，只有量比(PF1.12)、
+     相對大盤強弱(PF1.11)、外資買超比重(PF1.07)明顯>1，投信只是打平(PF1.01)。
+  2. sweep_atr_params.py(honest timing + slippage_pct=0.1版)：確認停損<=0.1倍
+     雖然PF還撐得住，但距離小到執行上不可信；0.1~1.5倍的合理範圍裡，固定用
+     舊8訊號等權重時全部PF<1，代表光調ATR救不回訊號本身太弱的問題。
+  3. sweep_combined_best.py(honest timing + slippage_pct=0.1版)：把①驗證過的
+     訊號分別組合、疊上②篩過的合理ATR區間交叉測試，發現「只用量比+相對大盤
+     強弱這2個、拿掉外資」表現最好且最穩——6組ATR全部PF>=1.00，其中停損0.3倍
+     /停利2.0倍最佳(IS PF=1.12)。外資單獨測雖然PF1.07不差，但混進組合裡反而
+     拖累整體，不採用。
+
+現在CANDIDATES換成這組「最強2個(量比+相對大盤強弱)」搭配幾組合理ATR，加上
+基準8訊號組跟舊版正式鎖定版本當對照。但這整個挑選過程（①②③）都是在同一份
+資料(2023-09-15~2026-09-14)上做的多層挑選，就算③的OOS(同一份資料切出來的
+後30%)也有PF=1.17，仍不是真正獨立的驗證——這支腳本就是要補上這一塊。
 
 做法：把這些候選參數鎖定下來(不再調整)，直接在一段全新的、完全沒用過的歷史
 區間上跑一次完整回測(不切IS/OOS，因為這整段資料本身就是「樣本外」)，看PF
@@ -34,26 +45,30 @@ import overnight_momentum_engine as ome
 import taifex_universe
 from compare_overnight import build_pipeline_inputs, UNIVERSE_CHOICES
 
-# 鎖定候選參數：來自訊號拆解 + ATR掃描 + 合併測試選出來的最佳組合，
-# 這裡不再調整，只是原封不動拿去一段全新的資料上驗證。
+# 鎖定候選參數：來自「誠實版」訊號拆解 + ATR掃描 + 合併測試(均為honest timing +
+# slippage_pct=0.1)選出來的最佳組合，這裡不再調整，只是原封不動拿去一段全新的
+# 資料上驗證。
 CANDIDATES = [
     {
-        "label": "最強3個等權重(投信/量比/相對大盤強弱)，停損0.5倍/停利3.0倍",
-        "signal_weights": {"score_trust": 1.0, "score_volume_ratio": 1.0, "score_rel_strength": 1.0},
+        "label": "最強2個(量比+相對大盤強弱)，停損0.3倍/停利2.0倍"
+                  "——combined測試裡的第一名(IS honest+slippage版 PF=1.12)",
+        "signal_weights": {"score_volume_ratio": 1.0, "score_rel_strength": 1.0},
+        "atr_stop_mult": 0.3,
+        "atr_target_mult": 2.0,
+    },
+    {
+        "label": "最強2個(量比+相對大盤強弱)，停損0.5倍/停利2.0倍"
+                  "——停損距離比第一名寬鬆，風控上更保守(IS PF=1.09)",
+        "signal_weights": {"score_volume_ratio": 1.0, "score_rel_strength": 1.0},
         "atr_stop_mult": 0.5,
-        "atr_target_mult": 3.0,
+        "atr_target_mult": 2.0,
     },
     {
-        "label": "最強3個等權重，停損0.3倍/停利3.0倍",
-        "signal_weights": {"score_trust": 1.0, "score_volume_ratio": 1.0, "score_rel_strength": 1.0},
-        "atr_stop_mult": 0.3,
-        "atr_target_mult": 3.0,
-    },
-    {
-        "label": "最強3個，投信加重2倍，停損0.3倍/停利3.0倍",
-        "signal_weights": {"score_trust": 2.0, "score_volume_ratio": 1.0, "score_rel_strength": 1.0},
-        "atr_stop_mult": 0.3,
-        "atr_target_mult": 3.0,
+        "label": "最強2個(量比+相對大盤強弱)，停損0.8倍/停利2.0倍"
+                  "——停損維持在舊預設倍數，只換訊號組合(IS PF=1.07)",
+        "signal_weights": {"score_volume_ratio": 1.0, "score_rel_strength": 1.0},
+        "atr_stop_mult": 0.8,
+        "atr_target_mult": 2.0,
     },
     {
         "label": "對照組：基準8訊號等權重，舊預設ATR(0.8/1.2)",
@@ -66,13 +81,9 @@ CANDIDATES = [
         "atr_target_mult": 1.2,
     },
     {
-        "label": "目前正式鎖定版本：tech/chip預設權重(0.35/0.65)"
-                  "+ min_trust_ratio絕對門檻(由CLI --min-trust-ratio傳入，"
-                  "這裡不寫死，因為門檻是在backtest模式IS/OOS上調好的，"
-                  "跨期驗證只負責原封不動拿來用) + 停損0.8倍/停利3.0倍。"
-                  "沿用tech_weight/chip_weight(不用signal_weights)，"
-                  "是atr_sweep.py套滑價掃描後，在「停損不卡邊界」的可信區間裡"
-                  "選出來的組合，取代舊的signal_weights系列候選。",
+        "label": "對照組：舊版正式鎖定版本(tech/chip預設權重0.35/0.65 + 停損0.8倍/"
+                  "停利3.0倍)——已知在honest timing下PF<1(見#42跨期驗證)，"
+                  "保留純粹當歷史對照，不是候選",
         # 不寫signal_weights鍵，代表沿用run_overnight_backtest的
         # tech_weight/chip_weight邏輯(引擎預設0.35/0.65)，不是8訊號加權平均。
         "atr_stop_mult": 0.8,
