@@ -261,21 +261,70 @@ def try_enter_mean_reversion(price_data: dict, candidates: list, entry_date,
     return None
 
 
-def check_exit(row, position):
-    """回傳 (event, exit_price)，event 為 'target' / 'stop' / None。"""
-    high, low = row["High"], row["Low"]
+def check_exit(row, position, slippage_pct: float = 0.0):
+    """
+    回傳 (event, exit_price)，event 為 'target' / 'stop' / 'stop_gap' / None。
+
+    'stop_gap'：今天開盤價本身就已經跳空越過停損價(例如隔夜利空跳空低開，
+    開盤已經比停損價還低)，這種情況下實際能成交的價位是開盤價，不是理論停損價——
+    用理論停損價當出場價是過度樂觀的假設(等於假設一定能在停損價那個點精準出場，
+    但跳空發生時那個價位根本沒有成交量)。用開盤價出場，是這裡對「跳空穿越停損」
+    最務實的處理方式；真正的保證金追繳/強制斷頭機制比這個更複雜，這裡沒有完整模擬，
+    但至少不會再假裝跳空跟沒跳空一樣可以用同一個價位出場。
+
+    target_price 為 None 時代表這筆倉位用移動停利(trailing stop)出場，不看固定停利價。
+
+    slippage_pct：只套用在停損/跳空停損這兩種「市價出場」的情境，不套用在停利(target)——
+    停利通常是限價單，可以合理假設用設定的價位成交；停損是行情已經走到不利方向才觸發，
+    實務上市場流動性通常比較差，用理論停損價/開盤價當成交價還是偏樂觀，這裡讓出場價位
+    再往不利方向滑一點(多方停損成交價更低、空方停損成交價更高)，模擬真實的滑價成本。
+    預設0.0(不模擬滑價)，跟舊版行為完全一致。
+    """
+    high, low, open_ = row["High"], row["Low"], row["Open"]
+    target_price = position.get("target_price")
     if position["side"] == "long":
+        if open_ <= position["stop_price"]:
+            return "stop_gap", open_ * (1 - slippage_pct)
         # 保守假設：同一天內若停損停利都可能觸及，優先判定停損
         if low <= position["stop_price"]:
-            return "stop", position["stop_price"]
-        if high >= position["target_price"]:
-            return "target", position["target_price"]
+            return "stop", position["stop_price"] * (1 - slippage_pct)
+        if target_price is not None and high >= target_price:
+            return "target", target_price
     else:  # short
+        if open_ >= position["stop_price"]:
+            return "stop_gap", open_ * (1 + slippage_pct)
         if high >= position["stop_price"]:
-            return "stop", position["stop_price"]
-        if low <= position["target_price"]:
-            return "target", position["target_price"]
+            return "stop", position["stop_price"] * (1 + slippage_pct)
+        if target_price is not None and low <= target_price:
+            return "target", target_price
     return None, None
+
+
+def update_trailing_stop(position, row):
+    """
+    移動停利：只在對持倉有利的方向移動停損價，絕不往回移(往不利方向移動等於
+    自己放寬風險)。用「進場後最高/最低收盤價」當錨點，距離用進場當下固定的ATR
+    (position['atr_entry'])換算，不隨每天的ATR重新變動——避免停損距離本身
+    也跟著行情忽寬忽窄，讓移動停利的邏輯保持單純好懂。
+    只有 position.get('trailing_stop') 為真的倉位才會被呼叫這個函式。
+    """
+    mult = position["trailing_atr_mult"]
+    atr = position["atr_entry"]
+    close = row["Close"]
+
+    if position["side"] == "long":
+        anchor = max(position.get("trailing_anchor", position["e_price"]), close)
+        new_stop = anchor - mult * atr
+        if new_stop > position["stop_price"]:
+            position["stop_price"] = new_stop
+        position["trailing_anchor"] = anchor
+    else:
+        anchor = min(position.get("trailing_anchor", position["e_price"]), close)
+        new_stop = anchor + mult * atr
+        if new_stop < position["stop_price"]:
+            position["stop_price"] = new_stop
+        position["trailing_anchor"] = anchor
+    return position
 
 
 def precompute_all_indicators(price_data: dict, universe: dict) -> dict:
@@ -350,11 +399,11 @@ def run_mean_reversion_backtest(price_data: dict, indicators_by_code: dict, regi
     return trades
 
 
-def _process_mr_day(position, row, date, trades, max_hold_days, cooldown_until):
-    event, exit_price = check_exit(row, position)
+def _process_mr_day(position, row, date, trades, max_hold_days, cooldown_until, slippage_pct: float = 0.0):
+    event, exit_price = check_exit(row, position, slippage_pct=slippage_pct)
 
-    if event == "stop":
-        _close_mr_trade(position, exit_price, "stop", date, trades)
+    if event in ("stop", "stop_gap"):
+        _close_mr_trade(position, exit_price, event, date, trades)
         cooldown_until[position["code"]] = date + pd.Timedelta(days=STOP_LOSS_COOLDOWN_DAYS * 2)
         # *2 是粗略把交易日轉近似日曆天數，避免跨假日冷卻期被縮短；回測用途足夠精確
         return None
@@ -366,6 +415,9 @@ def _process_mr_day(position, row, date, trades, max_hold_days, cooldown_until):
     if position["hold_days"] >= max_hold_days:
         _close_mr_trade(position, row["Close"], "forced_close", date, trades)
         return None
+
+    if position.get("trailing_stop"):
+        position = update_trailing_stop(position, row)
 
     return position
 
@@ -395,17 +447,35 @@ def _close_mr_trade(position, exit_price, reason, date, trades):
     })
 
 
+def _max_consecutive_losses(pnl_list: list) -> int:
+    """連續虧損筆數的最長紀錄(交易依trades原本的順序，也就是出場日期先後順序)。
+    這個數字比平均勝率更貼近「實際操作要撐過幾筆連虧才等得到下一筆賺錢」，
+    勝率一樣的兩個策略，連續虧損次數可以差很多，心理/資金上能不能撐住是不同的事。"""
+    longest = current = 0
+    for p in pnl_list:
+        if p < 0:
+            current += 1
+            longest = max(longest, current)
+        else:
+            current = 0
+    return longest
+
+
 def summarize_mr(trades: list, starting_capital: float) -> dict:
     if not trades:
         return {
             "trade_count": 0, "win_rate": 0.0, "avg_return_pct": 0.0,
             "total_pnl_ntd": 0.0, "max_drawdown_ntd": 0.0, "ending_equity_ntd": starting_capital,
             "long_count": 0, "short_count": 0,
+            "profit_factor": 0.0, "max_consecutive_losses": 0, "sharpe_like": 0.0,
+            "calmar_like": 0.0, "top_trade_pct_of_total_pnl": 0.0, "pnl_excluding_top3_ntd": 0.0,
         }
 
     pnl_list = [t["pnl_ntd"] for t in trades]
     returns = [t["return_pct"] for t in trades]
     wins = [p for p in pnl_list if p > 0]
+    losses = [p for p in pnl_list if p < 0]
+    total_pnl = float(sum(pnl_list))
 
     equity = [starting_capital]
     for p in pnl_list:
@@ -413,14 +483,49 @@ def summarize_mr(trades: list, starting_capital: float) -> dict:
     equity = np.array(equity)
     running_max = np.maximum.accumulate(equity)
     dd = equity - running_max
+    max_dd = float(dd.min())
+
+    # Profit Factor = 總獲利 / 總虧損(取絕對值)。>1代表賺的比賠的多，<1代表反過來，
+    # =1打平。只有賺沒有賠(losses為空)時視為無限大；一筆賺的都沒有時視為0，不用NaN，
+    # 方便直接拿去排序比較，不用另外處理NaN。
+    gross_win = float(sum(wins))
+    gross_loss = float(abs(sum(losses)))
+    if gross_loss > 0:
+        profit_factor = gross_win / gross_loss
+    else:
+        profit_factor = float("inf") if gross_win > 0 else 0.0
+
+    # 用「每筆交易報酬率」當分布算的Sharpe-like比值(平均/標準差)，不是嚴謹的年化Sharpe
+    # (交易之間間隔天數不固定，沒有真正做年化)，只拿來粗略比較「賺得穩不穩」，數字越高
+    # 代表報酬相對於波動的效率越好；標準差為0(只有一筆交易或報酬完全一樣)時給0，避免除以0。
+    returns_arr = np.array(returns)
+    ret_std = float(returns_arr.std(ddof=0))
+    sharpe_like = float(returns_arr.mean() / ret_std) if ret_std > 0 else 0.0
+
+    # calmar-like = 總損益 / 最大回撤(絕對值)，不是嚴謹的年化Calmar比率(沒有年化報酬率)，
+    # 只拿來粗略比較「賺的錢相對於曾經腰斬過的幅度划不划算」。
+    calmar_like = float(total_pnl / abs(max_dd)) if max_dd != 0 else 0.0
+
+    # 檢查獲利有沒有過度依賴少數幾筆極端交易：最大的一筆賺了多少佔總損益的比重，
+    # 以及拿掉獲利最大的3筆之後，剩下的還賺不賺錢——如果拿掉3筆就轉虧，代表這個
+    # 策略的優勢可能只是少數幾筆運氣好的交易撐出來的，不是穩定可重複的優勢。
+    top_trade_pct = float(max(pnl_list) / total_pnl * 100) if total_pnl > 0 and pnl_list else 0.0
+    sorted_pnl_desc = sorted(pnl_list, reverse=True)
+    pnl_excluding_top3 = float(sum(sorted_pnl_desc[3:]))
 
     return {
         "trade_count": len(trades),
         "win_rate": len(wins) / len(trades) * 100,
         "avg_return_pct": float(np.mean(returns)) * 100,
-        "total_pnl_ntd": float(sum(pnl_list)),
-        "max_drawdown_ntd": float(dd.min()),
+        "total_pnl_ntd": total_pnl,
+        "max_drawdown_ntd": max_dd,
         "ending_equity_ntd": float(equity[-1]),
         "long_count": sum(1 for t in trades if t["side"] == "long"),
         "short_count": sum(1 for t in trades if t["side"] == "short"),
+        "profit_factor": profit_factor,
+        "max_consecutive_losses": _max_consecutive_losses(pnl_list),
+        "sharpe_like": sharpe_like,
+        "calmar_like": calmar_like,
+        "top_trade_pct_of_total_pnl": top_trade_pct,
+        "pnl_excluding_top3_ntd": pnl_excluding_top3,
     }

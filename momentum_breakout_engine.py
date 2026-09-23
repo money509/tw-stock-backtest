@@ -35,7 +35,7 @@ _lookup_prior_row)，不會有隔日衝那邊發現的「偷看當天籌碼」�
 import pandas as pd
 import numpy as np
 
-from taifex_universe import estimate_margin
+from taifex_universe import estimate_margin, get_contract_multiplier
 from mean_reversion_engine import (
     compute_rsi, compute_atr_correct, is_near_settlement,
     precompute_regime_series, compute_regime, _lookup_prior_row,
@@ -247,7 +247,8 @@ def scan_momentum_breakout_candidates(indicators_by_code: dict, as_of_date, regi
                                        require_above_ma60: bool = False,
                                        require_ma_bullish_alignment: bool = False,
                                        require_dual_institutional_buy: bool = False,
-                                       min_volume_ratio: float = 0.0) -> list:
+                                       min_volume_ratio: float = 0.0,
+                                       ex_dividend_dates_by_code: dict = None) -> list:
     """
     掃描全市場候選標的：先套結構性突破門檻(基本門檻永遠套用，其餘4個額外門檻可選)，
     通過門檻的候選再依加權分數排名，回傳前top_n名多方候選 + 前top_n名空方候選。
@@ -257,6 +258,12 @@ def scan_momentum_breakout_candidates(indicators_by_code: dict, as_of_date, regi
 
     require_dual_institutional_buy=True 但沒有籌碼資料時，該檔股票視為沒過門檻(保守排除，
     跟均值回歸引擎「開啟籌碼確認但沒有籌碼資料就排除」的處理方式一致)。
+
+    ex_dividend_dates_by_code：可選，來自 dividend_data_loader.load_dividend_events()，
+    {code: set(日期字串YYYYMMDD)}。指標查的是「as_of_date之前最後一列」那一天的資料，
+    如果那一天剛好是除權息日，股價會因為配股配息機械性跳空，量比/相對大盤強弱/突破前高
+    這些訊號會被這個假跳空污染(不是真的動能轉強或轉弱)，所以這裡直接把那天當候選來源的
+    股票跳過，不是修正股價，因為修正股價會讓進出場價位跟真實報價脫節。
     """
     if signal_weights is None:
         signal_weights = {name: 1.0 for name in BREAKOUT_SIGNAL_NAMES}
@@ -269,6 +276,11 @@ def scan_momentum_breakout_candidates(indicators_by_code: dict, as_of_date, regi
         row, pos = _lookup_prior_row(ind_df, as_of_date)
         if row is None or pos < 60:
             continue
+
+        if ex_dividend_dates_by_code is not None and code in ex_dividend_dates_by_code:
+            row_date_str = ind_df.index[pos - 1].strftime("%Y%m%d")
+            if row_date_str in ex_dividend_dates_by_code[code]:
+                continue
 
         close = row["Close"]
         ma20 = row["MA20"]
@@ -331,11 +343,37 @@ def scan_momentum_breakout_candidates(indicators_by_code: dict, as_of_date, regi
 
 
 def try_enter_breakout(price_data: dict, candidates: list, entry_date, starting_capital: float,
-                        lots: int = 2, atr_stop_mult: float = 1.0, atr_target_mult: float = 2.0):
+                        lots: int = 2, atr_stop_mult: float = 1.0, atr_target_mult: float = 2.0,
+                        use_trailing_stop: bool = False, trailing_atr_mult: float = None,
+                        slippage_pct: float = 0.0, used_margin: float = 0.0,
+                        total_margin_cap_ratio: float = None,
+                        risk_pct_per_trade: float = None, account_equity: float = None):
     """
     依序檢查候選名單(已跳空風控+保證金上限過濾)，第一個通過的進場。
     跟均值回歸引擎的跳空風控方向一致：不管多空，方向不利的跳空超過0.5%就放棄
     (突破後反向跳空代表隔天開盤可能已經是假突破被打回，不追價)。
+
+    use_trailing_stop=True 時，這筆倉位改用移動停利出場(見 mean_reversion_engine.
+    update_trailing_stop())，不設固定停利目標價(target_price=None)——這才是右側/
+    順勢交易「讓獲利奔跑」的精神：進場當下只設一個小的初始停損，出場完全交給
+    「趨勢還在不在」決定，不是「碰到某個固定倍數就跑」。trailing_atr_mult 沒指定時，
+    預設跟 atr_stop_mult 用同一個值(進場停損距離 = 移動停利距離)。
+
+    slippage_pct：進場成交價位的滑價假設，多方成交價比開盤價再高一點(追價買貴)、
+    空方成交價比開盤價再低一點(追價賣便宜)，模擬開盤瞬間流動性最差時的真實成交狀況。
+    預設0.0，跟舊版行為完全一致。
+
+    used_margin/total_margin_cap_ratio：多部位並行時，除了原本「單筆保證金不超過
+    總資金35%」的個別上限，還要檢查「這筆 + 目前已經在用的保證金」有沒有超過帳戶
+    整體的保證金上限，避免同時開太多部位讓槓桿疊加到不合理的程度。total_margin_cap_ratio
+    為None時不做這個檢查(維持舊版單一部位的行為，因為單一部位下個別上限本身就等於整體上限)。
+
+    risk_pct_per_trade：給定時改用「風險預算反推口數」，取代固定的lots參數——
+    口數 = (account_equity x risk_pct_per_trade) / (初始停損距離 x 合約乘數)，讓每筆
+    交易承擔的風險金額大致一致，不會因為標的波動度不同、用同樣口數卻扛完全不同的風險。
+    算出來口數 < 1 時直接放棄這個候選(風險預算連1口都不夠，不該硬凹進場放大風險)。
+    帳戶權益(account_equity)沒給時退回用starting_capital，讓現有呼叫方式(固定口數)
+    完全不受影響。
     """
     for cand in candidates:
         code = cand["code"]
@@ -353,25 +391,49 @@ def try_enter_breakout(price_data: dict, candidates: list, entry_date, starting_
         if cand["side"] == "short" and gap_pct >= 0.005:
             continue
 
-        margin_needed = estimate_margin(code, open_p, lots)
-        if margin_needed > starting_capital * DEFAULT_MARGIN_CAP_RATIO:
-            continue
-
         atr = cand["atr"]
         side = cand["side"]
-        e_price = open_p
-        if side == "long":
-            stop_price = e_price - atr_stop_mult * atr
-            target_price = e_price + atr_target_mult * atr
-        else:
-            stop_price = e_price + atr_stop_mult * atr
-            target_price = e_price - atr_target_mult * atr
 
-        return {
+        lots_to_use = lots
+        if risk_pct_per_trade is not None:
+            equity = account_equity if account_equity is not None else starting_capital
+            mult = get_contract_multiplier(code, open_p)
+            stop_distance = atr_stop_mult * atr
+            if stop_distance <= 0 or mult <= 0:
+                continue
+            risk_budget = equity * risk_pct_per_trade
+            computed_lots = int(risk_budget // (stop_distance * mult))
+            if computed_lots < 1:
+                continue
+            lots_to_use = computed_lots
+
+        margin_needed = estimate_margin(code, open_p, lots_to_use)
+        if margin_needed > starting_capital * DEFAULT_MARGIN_CAP_RATIO:
+            continue
+        if total_margin_cap_ratio is not None and \
+                used_margin + margin_needed > starting_capital * total_margin_cap_ratio:
+            continue
+
+        if side == "long":
+            e_price = open_p * (1 + slippage_pct)
+            stop_price = e_price - atr_stop_mult * atr
+            target_price = None if use_trailing_stop else e_price + atr_target_mult * atr
+        else:
+            e_price = open_p * (1 - slippage_pct)
+            stop_price = e_price + atr_stop_mult * atr
+            target_price = None if use_trailing_stop else e_price - atr_target_mult * atr
+
+        position = {
             "code": code, "side": side, "entry_date": entry_date,
             "e_price": e_price, "target_price": target_price, "stop_price": stop_price,
-            "lots": lots, "hold_days": 1,
+            "lots": lots_to_use, "hold_days": 1, "margin_used": margin_needed,
         }
+        if use_trailing_stop:
+            position["trailing_stop"] = True
+            position["trailing_atr_mult"] = trailing_atr_mult if trailing_atr_mult is not None else atr_stop_mult
+            position["atr_entry"] = atr
+            position["trailing_anchor"] = e_price
+        return position
     return None
 
 
@@ -383,51 +445,104 @@ def run_momentum_breakout_backtest(price_data: dict, indicators_by_code: dict, r
                                     require_above_ma60: bool = False,
                                     require_ma_bullish_alignment: bool = False,
                                     require_dual_institutional_buy: bool = False,
-                                    min_volume_ratio: float = 0.0):
+                                    min_volume_ratio: float = 0.0,
+                                    ex_dividend_dates_by_code: dict = None,
+                                    use_trailing_stop: bool = False, trailing_atr_mult: float = None,
+                                    slippage_pct: float = 0.0, max_concurrent_positions: int = 1,
+                                    total_margin_cap_ratio: float = None,
+                                    risk_pct_per_trade: float = None):
     """
     完整 day-by-day walk-forward 模擬。出場判定/強制平倉/停損冷卻期，重用
     mean_reversion_engine._process_mr_day()，跟均值回歸引擎共用同一套出場機制，
     差別只在進場端(scan_momentum_breakout_candidates / try_enter_breakout)。
+
+    use_trailing_stop=True 時，建議 max_hold_days 給一個很大的值(例如250個交易日，
+    約一年)當工程上的安全上限，不是真正的出場依據——出場交給移動停利本身，讓真正
+    延續的趨勢可以抱得比原本的5天/15天硬上限長很多，這是右側/順勢交易「讓獲利奔跑」
+    的核心精神，也是這裡跟均值回歸引擎最大的出場邏輯差異。
+
+    max_concurrent_positions：預設1，維持跟舊版完全一樣的「一次只能持有一個部位」行為
+    (原本大盤普遍上漲時，資金大部分時間閒置)。設>1時，允許同時持有多檔不同標的的部位
+    (同一檔股票不會同時開兩個部位)，每天先處理所有既有部位的出場/移動停利，再依序
+    補進新部位填滿空出來的名額。保證金檢查也跟著擴充：除了單筆不超過總資金35%的個別
+    上限，還會檢查「所有持倉的保證金總和」有沒有超過total_margin_cap_ratio(預設None時
+    自動抓 min(35% x max_concurrent_positions, 90%)，避免多部位疊加槓桿疊到不合理)。
+
+    risk_pct_per_trade：給定時，每筆交易的口數改用風險預算反推(帳戶權益x risk_pct_per_trade
+    ÷ 停損距離)，取代固定的lots，且帳戶權益會隨已實現損益動態調整(複利效果)，而不是
+    永遠用starting_capital當基準。
     """
     trades = []
-    position = None
     cooldown_until = {}
+    open_positions = []  # 每個元素是一個 position dict(已含 margin_used 欄位)
+
+    effective_total_margin_cap_ratio = total_margin_cap_ratio
+    if max_concurrent_positions > 1 and effective_total_margin_cap_ratio is None:
+        effective_total_margin_cap_ratio = min(DEFAULT_MARGIN_CAP_RATIO * max_concurrent_positions, 0.9)
 
     for date in master_calendar:
-        excluded_codes = {c for c, until in cooldown_until.items() if date < until}
-
-        if position is None:
-            if is_near_settlement(date, days_before=2):
+        # 1) 先處理所有既有部位的出場判定/移動停利/強制平倉(可能更新cooldown_until)
+        still_open = []
+        for position in open_positions:
+            df = price_data.get(position["code"])
+            if df is None or date not in df.index:
+                still_open.append(position)
                 continue
+            if date != position["entry_date"]:
+                position["hold_days"] += 1
+            row = df.loc[date]
+            updated = _process_mr_day(position, row, date, trades, max_hold_days, cooldown_until,
+                                       slippage_pct=slippage_pct)
+            if updated is not None:
+                still_open.append(updated)
+        open_positions = still_open
 
+        # 2) 補進新部位，填滿空出來的名額(max_concurrent_positions=1時，等同舊版的
+        #    「position is None才進場」邏輯)。exclude集合要用「今天處理完出場之後」的
+        #    cooldown_until狀態，不然今天才剛停損出場的標的，理論上今天就該進冷卻期，
+        #    卻因為排除名單是用今天開始前的舊狀態算的而漏掉，變成同一天又立刻進場。
+        held_codes = {p["code"] for p in open_positions}
+        excluded_codes = {c for c, until in cooldown_until.items() if date < until} | held_codes
+
+        slots_available = max_concurrent_positions - len(open_positions)
+        if slots_available > 0 and not is_near_settlement(date, days_before=2):
             regime = compute_regime(regime_series, date)
+            used_margin = sum(p["margin_used"] for p in open_positions)
+            equity = starting_capital + sum(t["pnl_ntd"] for t in trades)
+
             candidates = scan_momentum_breakout_candidates(
                 indicators_by_code, date, regime, excluded_codes, allow_short=allow_short,
-                signal_weights=signal_weights, top_n=top_n,
+                signal_weights=signal_weights, top_n=max(top_n, slots_available),
                 require_above_ma60=require_above_ma60,
                 require_ma_bullish_alignment=require_ma_bullish_alignment,
                 require_dual_institutional_buy=require_dual_institutional_buy,
                 min_volume_ratio=min_volume_ratio,
+                ex_dividend_dates_by_code=ex_dividend_dates_by_code,
             )
-            if candidates:
-                position = try_enter_breakout(
+
+            while slots_available > 0 and candidates:
+                new_position = try_enter_breakout(
                     price_data, candidates, date, starting_capital, lots,
                     atr_stop_mult=atr_stop_mult, atr_target_mult=atr_target_mult,
+                    use_trailing_stop=use_trailing_stop, trailing_atr_mult=trailing_atr_mult,
+                    slippage_pct=slippage_pct, used_margin=used_margin,
+                    total_margin_cap_ratio=effective_total_margin_cap_ratio,
+                    risk_pct_per_trade=risk_pct_per_trade, account_equity=equity,
                 )
-                if position is not None:
-                    df = price_data[position["code"]]
-                    row = df.loc[date]
-                    position = _process_mr_day(position, row, date, trades, max_hold_days, cooldown_until)
-            continue
+                if new_position is None:
+                    break
 
-        df = price_data.get(position["code"])
-        if df is None or date not in df.index:
-            continue
+                used_margin += new_position["margin_used"]
+                slots_available -= 1
+                candidates = [c for c in candidates if c["code"] != new_position["code"]]
 
-        if date != position["entry_date"]:
-            position["hold_days"] += 1
-
-        row = df.loc[date]
-        position = _process_mr_day(position, row, date, trades, max_hold_days, cooldown_until)
+                # 進場當天立刻檢查一次出場(跟原本單一部位邏輯一致：跳空穿越停損可能當天就出場)
+                row = price_data[new_position["code"]].loc[date]
+                updated = _process_mr_day(new_position, row, date, trades, max_hold_days, cooldown_until,
+                                           slippage_pct=slippage_pct)
+                if updated is not None:
+                    open_positions.append(updated)
+                else:
+                    used_margin -= new_position["margin_used"]
 
     return trades

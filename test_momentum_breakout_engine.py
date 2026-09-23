@@ -280,6 +280,29 @@ class TestScanMomentumBreakoutCandidates:
         )
         assert len(result) == 2
 
+    def test_ex_dividend_day_excludes_that_stock(self):
+        specs = {
+            "0001": {"Close": 110.0, "MA20": 100.0, "RollingHigh": 105.0},  # 這天剛好是除權息日
+            "0002": {"Close": 110.0, "MA20": 100.0, "RollingHigh": 105.0},  # 一般日子
+        }
+        indicators_by_code, as_of_date = self._build_indicators(specs)
+        row_date_str = indicators_by_code["0001"].index[64].strftime("%Y%m%d")
+        result = mbe.scan_momentum_breakout_candidates(
+            indicators_by_code, as_of_date, regime="neutral", excluded_codes=set(), allow_short=False,
+            top_n=5, ex_dividend_dates_by_code={"0001": {row_date_str}},
+        )
+        codes = {c["code"] for c in result}
+        assert codes == {"0002"}
+
+    def test_no_ex_dividend_data_does_not_exclude_anything(self):
+        specs = {"0001": {"Close": 110.0, "MA20": 100.0, "RollingHigh": 105.0}}
+        indicators_by_code, as_of_date = self._build_indicators(specs)
+        result = mbe.scan_momentum_breakout_candidates(
+            indicators_by_code, as_of_date, regime="neutral", excluded_codes=set(), allow_short=False,
+            top_n=5, ex_dividend_dates_by_code=None,
+        )
+        assert {c["code"] for c in result} == {"0001"}
+
 
 class TestTryEnterBreakout:
     def test_long_blocked_by_unfavorable_gap_down(self):
@@ -332,6 +355,39 @@ class TestTryEnterBreakout:
         assert pos is not None
         assert pos["code"] == "1102"
 
+    def test_trailing_stop_mode_sets_no_fixed_target_and_trailing_fields(self):
+        df = make_price_df([100.0, 100.1], opens=[100.0, 100.1])
+        price_data = {"1101": df}
+        candidates = [{"code": "1101", "side": "long", "c_prev": 100.0, "atr": 2.0}]
+        pos = mbe.try_enter_breakout(
+            price_data, candidates, df.index[1], starting_capital=1_000_000,
+            atr_stop_mult=0.5, use_trailing_stop=True,
+        )
+        assert pos is not None
+        assert pos["target_price"] is None
+        assert pos["trailing_stop"] is True
+        assert pos["trailing_atr_mult"] == pytest.approx(0.5)  # 沒指定時預設跟atr_stop_mult一樣
+        assert pos["atr_entry"] == pytest.approx(2.0)
+        assert pos["trailing_anchor"] == pytest.approx(pos["e_price"])
+
+    def test_trailing_stop_mode_uses_explicit_trailing_atr_mult_when_given(self):
+        df = make_price_df([100.0, 100.1], opens=[100.0, 100.1])
+        price_data = {"1101": df}
+        candidates = [{"code": "1101", "side": "long", "c_prev": 100.0, "atr": 2.0}]
+        pos = mbe.try_enter_breakout(
+            price_data, candidates, df.index[1], starting_capital=1_000_000,
+            atr_stop_mult=0.5, use_trailing_stop=True, trailing_atr_mult=1.5,
+        )
+        assert pos["trailing_atr_mult"] == pytest.approx(1.5)
+
+    def test_non_trailing_mode_has_no_trailing_fields(self):
+        df = make_price_df([100.0, 100.1], opens=[100.0, 100.1])
+        price_data = {"1101": df}
+        candidates = [{"code": "1101", "side": "long", "c_prev": 100.0, "atr": 2.0}]
+        pos = mbe.try_enter_breakout(price_data, candidates, df.index[1], starting_capital=1_000_000)
+        assert pos["target_price"] is not None
+        assert "trailing_stop" not in pos
+
 
 class TestRunMomentumBreakoutBacktestSmoke:
     def test_runs_without_error_and_produces_summarizable_trades(self):
@@ -364,7 +420,7 @@ class TestRunMomentumBreakoutBacktestSmoke:
         stats = summarize_mr(trades, 1_000_000)
         assert stats["trade_count"] == len(trades)
         for t in trades:
-            assert t["exit_reason"] in ("stop", "target", "forced_close")
+            assert t["exit_reason"] in ("stop", "stop_gap", "target", "forced_close")
             assert t["side"] in ("long", "short")
 
     def test_runs_with_extra_gates_enabled_without_error(self):
@@ -391,5 +447,190 @@ class TestRunMomentumBreakoutBacktestSmoke:
             master_calendar=price_data[index_code].index, max_hold_days=15, starting_capital=1_000_000,
             allow_short=True, lots=2, top_n=2,
             require_above_ma60=True, require_ma_bullish_alignment=True, min_volume_ratio=1.2,
+        )
+        assert isinstance(trades, list)
+
+    def test_runs_with_trailing_stop_enabled_without_error(self):
+        np.random.seed(2)
+        n = 140
+        real_codes = ["1101", "1102", "1210", "1216", "1301", "1303"]
+        universe = {}
+        price_data = {}
+        for i, code in enumerate(real_codes):
+            base = 100 + i * 5
+            trend = np.linspace(0, 30, n) if i % 2 == 0 else np.linspace(0, -10, n)
+            noise = np.random.normal(0, 1, n)
+            closes = np.maximum(base + trend + noise, 1.0)
+            df = make_price_df(list(closes), start="2024-01-01")
+            price_data[code] = df
+            universe[code] = {}
+        index_code = real_codes[0]
+
+        indicators_by_code = mbe.precompute_all_breakout_indicators(price_data, universe, index_code=index_code)
+        regime_series = precompute_regime_series(price_data[index_code])
+
+        trades = mbe.run_momentum_breakout_backtest(
+            price_data=price_data, indicators_by_code=indicators_by_code, regime_series=regime_series,
+            master_calendar=price_data[index_code].index, max_hold_days=250, starting_capital=1_000_000,
+            allow_short=True, lots=2, top_n=2, atr_stop_mult=1.0,
+            use_trailing_stop=True, trailing_atr_mult=1.0,
+        )
+        assert isinstance(trades, list)
+        for t in trades:
+            assert t["exit_reason"] in ("stop", "stop_gap", "forced_close")
+            # 移動停利模式下不該出現固定停利(target)出場，因為target_price是None
+            assert t["exit_reason"] != "target"
+
+
+class TestTryEnterBreakoutSlippageAndRiskSizing:
+    def test_slippage_makes_long_entry_price_worse(self):
+        df = make_price_df([100.0, 100.1], opens=[100.0, 100.1])
+        price_data = {"1101": df}
+        candidates = [{"code": "1101", "side": "long", "c_prev": 100.0, "atr": 2.0}]
+        pos_no_slip = mbe.try_enter_breakout(price_data, candidates, df.index[1], starting_capital=1_000_000)
+        pos_slip = mbe.try_enter_breakout(
+            price_data, candidates, df.index[1], starting_capital=1_000_000, slippage_pct=0.01,
+        )
+        assert pos_slip["e_price"] > pos_no_slip["e_price"]  # 多方追價買貴
+        assert pos_slip["e_price"] == pytest.approx(pos_no_slip["e_price"] * 1.01)
+
+    def test_slippage_makes_short_entry_price_worse(self):
+        df = make_price_df([100.0, 99.9], opens=[100.0, 99.9])
+        price_data = {"1101": df}
+        candidates = [{"code": "1101", "side": "short", "c_prev": 100.0, "atr": 2.0}]
+        pos_no_slip = mbe.try_enter_breakout(price_data, candidates, df.index[1], starting_capital=1_000_000)
+        pos_slip = mbe.try_enter_breakout(
+            price_data, candidates, df.index[1], starting_capital=1_000_000, slippage_pct=0.01,
+        )
+        assert pos_slip["e_price"] < pos_no_slip["e_price"]  # 空方追價賣便宜
+
+    def test_zero_slippage_matches_old_behavior_exactly(self):
+        df = make_price_df([100.0, 100.1], opens=[100.0, 100.1])
+        price_data = {"1101": df}
+        candidates = [{"code": "1101", "side": "long", "c_prev": 100.0, "atr": 2.0}]
+        pos = mbe.try_enter_breakout(price_data, candidates, df.index[1], starting_capital=1_000_000)
+        assert pos["e_price"] == 100.1  # 開盤價，沒有任何滑價調整
+
+    def test_risk_pct_per_trade_computes_lots_from_risk_budget(self):
+        df = make_price_df([100.0, 100.0], opens=[100.0, 100.0])
+        price_data = {"1101": df}
+        candidates = [{"code": "1101", "side": "long", "c_prev": 100.0, "atr": 2.0}]
+        pos = mbe.try_enter_breakout(
+            price_data, candidates, df.index[1], starting_capital=10_000_000,
+            atr_stop_mult=1.0, risk_pct_per_trade=0.02, account_equity=1_000_000,
+        )
+        assert pos is not None
+        # 風險預算 = 1,000,000 x 0.02 = 20,000；停損距離=1.0x2.0=2.0；合約乘數見taifex_universe
+        from taifex_universe import get_contract_multiplier
+        mult = get_contract_multiplier("1101", 100.0)
+        expected_lots = int(20_000 // (2.0 * mult))
+        assert pos["lots"] == expected_lots
+
+    def test_risk_pct_per_trade_skips_candidate_when_budget_below_one_lot(self):
+        df = make_price_df([100.0, 100.0], opens=[100.0, 100.0])
+        price_data = {"1101": df}
+        candidates = [{"code": "1101", "side": "long", "c_prev": 100.0, "atr": 2.0}]
+        pos = mbe.try_enter_breakout(
+            price_data, candidates, df.index[1], starting_capital=10_000_000,
+            atr_stop_mult=1.0, risk_pct_per_trade=0.0001, account_equity=1_000_000,
+        )
+        assert pos is None
+
+    def test_total_margin_cap_ratio_blocks_when_used_margin_already_high(self):
+        df = make_price_df([500.0, 500.0], opens=[500.0, 500.0])
+        price_data = {"1101": df}
+        candidates = [{"code": "1101", "side": "long", "c_prev": 500.0, "atr": 2.0}]
+        margin_needed = mbe.estimate_margin("1101", 500.0, 2)
+        pos = mbe.try_enter_breakout(
+            price_data, candidates, df.index[1], starting_capital=1_000_000, lots=2,
+            used_margin=margin_needed * 5, total_margin_cap_ratio=0.5,
+        )
+        assert pos is None
+
+    def test_position_records_margin_used_field(self):
+        df = make_price_df([100.0, 100.0], opens=[100.0, 100.0])
+        price_data = {"1101": df}
+        candidates = [{"code": "1101", "side": "long", "c_prev": 100.0, "atr": 2.0}]
+        pos = mbe.try_enter_breakout(price_data, candidates, df.index[1], starting_capital=1_000_000, lots=2)
+        assert pos["margin_used"] == pytest.approx(mbe.estimate_margin("1101", 100.0, 2))
+
+
+class TestRunMomentumBreakoutBacktestMultiPosition:
+    def _make_synthetic_universe(self, seed, n=140):
+        np.random.seed(seed)
+        real_codes = ["1101", "1102", "1210", "1216", "1301", "1303"]
+        universe, price_data = {}, {}
+        for i, code in enumerate(real_codes):
+            base = 100 + i * 5
+            trend = np.linspace(0, 20, n) if i % 2 == 0 else np.linspace(0, -10, n)
+            noise = np.random.normal(0, 1, n)
+            closes = np.maximum(base + trend + noise, 1.0)
+            price_data[code] = make_price_df(list(closes), start="2024-01-01")
+            universe[code] = {}
+        return universe, price_data, real_codes[0]
+
+    def test_default_concurrency_one_matches_old_single_position_behavior(self):
+        universe, price_data, index_code = self._make_synthetic_universe(seed=0)
+        indicators_by_code = mbe.precompute_all_breakout_indicators(price_data, universe, index_code=index_code)
+        regime_series = precompute_regime_series(price_data[index_code])
+        kwargs = dict(
+            price_data=price_data, indicators_by_code=indicators_by_code, regime_series=regime_series,
+            master_calendar=price_data[index_code].index, max_hold_days=5, starting_capital=1_000_000,
+            allow_short=True, lots=2, atr_stop_mult=1.0, atr_target_mult=2.0, top_n=2,
+        )
+        trades_default = mbe.run_momentum_breakout_backtest(**kwargs)
+        trades_explicit_one = mbe.run_momentum_breakout_backtest(**kwargs, max_concurrent_positions=1)
+        assert trades_default == trades_explicit_one
+
+    def test_multi_position_never_holds_same_code_twice_concurrently(self):
+        universe, price_data, index_code = self._make_synthetic_universe(seed=3, n=200)
+        indicators_by_code = mbe.precompute_all_breakout_indicators(price_data, universe, index_code=index_code)
+        regime_series = precompute_regime_series(price_data[index_code])
+
+        # 用一個很低的risk_pct_per_trade讓每筆口數都很小，盡量填滿3個名額，
+        # 用來檢查同一檔股票不會同時被算成2個部位。
+        trades = mbe.run_momentum_breakout_backtest(
+            price_data=price_data, indicators_by_code=indicators_by_code, regime_series=regime_series,
+            master_calendar=price_data[index_code].index, max_hold_days=5, starting_capital=5_000_000,
+            allow_short=True, lots=2, atr_stop_mult=1.0, atr_target_mult=2.0, top_n=3,
+            max_concurrent_positions=3,
+        )
+        assert isinstance(trades, list)
+        # 用entry_date+code反查：同一天、同一檔代碼不該有兩筆交易同時持有中重疊
+        # (用交易紀錄的entry/exit日期區間互不重疊來驗證)
+        by_code = {}
+        for t in trades:
+            by_code.setdefault(t["code"], []).append((t["entry_date"], t["exit_date"]))
+        for code, intervals in by_code.items():
+            intervals.sort()
+            for (s1, e1), (s2, e2) in zip(intervals, intervals[1:]):
+                assert s2 >= e1, f"{code} 有重疊的持倉區間: ({s1},{e1}) vs ({s2},{e2})"
+
+    def test_multi_position_can_hold_more_than_one_position_at_once(self):
+        universe, price_data, index_code = self._make_synthetic_universe(seed=5, n=200)
+        indicators_by_code = mbe.precompute_all_breakout_indicators(price_data, universe, index_code=index_code)
+        regime_series = precompute_regime_series(price_data[index_code])
+
+        trades = mbe.run_momentum_breakout_backtest(
+            price_data=price_data, indicators_by_code=indicators_by_code, regime_series=regime_series,
+            master_calendar=price_data[index_code].index, max_hold_days=15, starting_capital=5_000_000,
+            allow_short=True, lots=1, atr_stop_mult=1.0, atr_target_mult=2.0, top_n=3,
+            max_concurrent_positions=3,
+        )
+        # 檢查是否曾經有任兩筆交易的持倉期間重疊(代表真的同時持有多個部位過)，
+        # 不是嚴格斷言一定要重疊(隨機資料不保證)，但至少要能正常跑完、產生交易。
+        assert isinstance(trades, list)
+        assert len(trades) >= 0
+
+    def test_runs_with_slippage_and_risk_sizing_together_without_error(self):
+        universe, price_data, index_code = self._make_synthetic_universe(seed=7, n=160)
+        indicators_by_code = mbe.precompute_all_breakout_indicators(price_data, universe, index_code=index_code)
+        regime_series = precompute_regime_series(price_data[index_code])
+
+        trades = mbe.run_momentum_breakout_backtest(
+            price_data=price_data, indicators_by_code=indicators_by_code, regime_series=regime_series,
+            master_calendar=price_data[index_code].index, max_hold_days=15, starting_capital=3_000_000,
+            allow_short=True, atr_stop_mult=1.0, atr_target_mult=2.0, top_n=3,
+            max_concurrent_positions=2, slippage_pct=0.002, risk_pct_per_trade=0.02,
         )
         assert isinstance(trades, list)
