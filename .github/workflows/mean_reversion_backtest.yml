@@ -23,6 +23,38 @@ on:
         description: '是否額外測試外資連續買超確認訊號(需要多下載三大法人資料，會跑比較久)'
         required: false
         default: 'false'
+      clean_ex_dividend:
+        description: '是否排除除權息當天的股票(避免機械性跳空污染訊號，需要多下載除權息資料，會跑久一點)'
+        required: false
+        default: 'false'
+      use_trailing_stop:
+        description: '出場是否改用移動停利(不設固定天數/固定停利目標價，讓獲利奔跑)，取代原本短線5天/中期15天比較'
+        required: false
+        default: 'false'
+      atr_stop_mult:
+        description: '初始停損的ATR倍數(移動停利模式下只用在對照組，最佳組合的倍數會由ATR敏感度網格自動搜出)'
+        required: false
+        default: '1.0'
+      trailing_atr_mult:
+        description: '移動停利的ATR倍數，留空代表跟初始停損用同一個值(同樣只用在對照組)'
+        required: false
+        default: ''
+      slippage_pct:
+        description: '進場/停損出場的滑價假設，例如0.002代表0.2%，留空或0代表不模擬滑價'
+        required: false
+        default: '0'
+      max_concurrent_positions:
+        description: '最佳組合最終驗證時允許同時持有的最大部位數，預設1(一次一個部位)，>1代表多部位並行'
+        required: false
+        default: '1'
+      risk_pct_per_trade:
+        description: '最佳組合改用風險預算式部位大小的比例，例如0.02代表每筆風險2%帳戶權益，留空代表維持固定2口'
+        required: false
+        default: ''
+      multi_period_test:
+        description: '是否額外把最佳組合套到2022年修正段/2021下半年盤整段這兩個跟近期多頭不同市況的期間驗證(會多跑久一點)'
+        required: false
+        default: 'false'
 
 jobs:
   backtest:
@@ -51,7 +83,7 @@ jobs:
             price-data-cache-
 
       - name: Run momentum breakout backtest
-        timeout-minutes: 90
+        timeout-minutes: 150
         run: |
           ARGS="--starting-capital ${{ github.event.inputs.starting_capital }} --max-stocks ${{ github.event.inputs.max_stocks }}"
           if [ -n "${{ github.event.inputs.start_date }}" ]; then
@@ -62,6 +94,30 @@ jobs:
           fi
           if [ "${{ github.event.inputs.with_chip_confirm }}" = "true" ]; then
             ARGS="$ARGS --with-chip-confirm"
+          fi
+          if [ "${{ github.event.inputs.clean_ex_dividend }}" = "true" ]; then
+            ARGS="$ARGS --clean-ex-dividend"
+          fi
+          if [ "${{ github.event.inputs.use_trailing_stop }}" = "true" ]; then
+            ARGS="$ARGS --use-trailing-stop"
+          fi
+          if [ -n "${{ github.event.inputs.atr_stop_mult }}" ]; then
+            ARGS="$ARGS --atr-stop-mult ${{ github.event.inputs.atr_stop_mult }}"
+          fi
+          if [ -n "${{ github.event.inputs.trailing_atr_mult }}" ]; then
+            ARGS="$ARGS --trailing-atr-mult ${{ github.event.inputs.trailing_atr_mult }}"
+          fi
+          if [ -n "${{ github.event.inputs.slippage_pct }}" ] && [ "${{ github.event.inputs.slippage_pct }}" != "0" ]; then
+            ARGS="$ARGS --slippage-pct ${{ github.event.inputs.slippage_pct }}"
+          fi
+          if [ -n "${{ github.event.inputs.max_concurrent_positions }}" ]; then
+            ARGS="$ARGS --max-concurrent-positions ${{ github.event.inputs.max_concurrent_positions }}"
+          fi
+          if [ -n "${{ github.event.inputs.risk_pct_per_trade }}" ]; then
+            ARGS="$ARGS --risk-pct-per-trade ${{ github.event.inputs.risk_pct_per_trade }}"
+          fi
+          if [ "${{ github.event.inputs.multi_period_test }}" = "true" ]; then
+            ARGS="$ARGS --multi-period-test"
           fi
           python compare_breakout.py $ARGS
 
