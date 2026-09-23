@@ -323,16 +323,57 @@ class TestRunCrossPeriodValidation(unittest.TestCase):
         self.assertAlmostEqual(
             default_df.iloc[0]["total_pnl"], explicit_none_df.iloc[0]["total_pnl"])
 
+    def test_candidate_without_signal_weights_uses_tech_chip_weight(self):
+        """候選字典裡沒有signal_weights鍵時，應該退回tech_weight/chip_weight邏輯，
+        並把候選字典裡的tech_weight/chip_weight(若有指定)往下傳到engine，
+        而不是強制用signal_weights=某個空/預設值。"""
+        captured = []
+        import overnight_momentum_engine as ome
+        real_run = ome.run_overnight_backtest
+
+        def spy(**kwargs):
+            captured.append({
+                "signal_weights": kwargs.get("signal_weights"),
+                "tech_weight": kwargs.get("tech_weight"),
+                "chip_weight": kwargs.get("chip_weight"),
+            })
+            return real_run(**kwargs)
+
+        ome.run_overnight_backtest = spy
+        try:
+            small_candidates = [
+                {"label": "無signal_weights，走tech/chip", "tech_weight": 0.4, "chip_weight": 0.6,
+                 "atr_stop_mult": 0.8, "atr_target_mult": 3.0},
+            ]
+            cpv.run_cross_period_validation(
+                self.pipeline_inputs, candidates=small_candidates, top_n=2,
+                compare_chip_timing=False)
+        finally:
+            ome.run_overnight_backtest = real_run
+
+        self.assertEqual(len(captured), 1)
+        self.assertIsNone(captured[0]["signal_weights"])
+        self.assertEqual(captured[0]["tech_weight"], 0.4)
+        self.assertEqual(captured[0]["chip_weight"], 0.6)
+
 
 class TestCandidatesConstant(unittest.TestCase):
     def test_candidates_have_required_fields(self):
+        """signal_weights是可選的：沒有這個鍵代表沿用tech_weight/chip_weight
+        邏輯(見cross_period_validation.py裡「目前正式鎖定版本」那個候選)，
+        不是每個候選都強制要有。"""
         self.assertGreater(len(cpv.CANDIDATES), 0)
         for cand in cpv.CANDIDATES:
             self.assertIn("label", cand)
-            self.assertIn("signal_weights", cand)
             self.assertIn("atr_stop_mult", cand)
             self.assertIn("atr_target_mult", cand)
-            self.assertGreater(len(cand["signal_weights"]), 0)
+            if "signal_weights" in cand:
+                self.assertGreater(len(cand["signal_weights"]), 0)
+
+    def test_at_least_one_candidate_uses_tech_chip_weight_fallback(self):
+        """確認目前正式鎖定版本(tech/chip權重+min_trust_ratio)真的在候選清單裡，
+        不是只有舊的signal_weights系列候選。"""
+        self.assertTrue(any("signal_weights" not in cand for cand in cpv.CANDIDATES))
 
 
 if __name__ == "__main__":

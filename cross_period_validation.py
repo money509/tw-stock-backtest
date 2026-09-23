@@ -65,6 +65,19 @@ CANDIDATES = [
         "atr_stop_mult": 0.8,
         "atr_target_mult": 1.2,
     },
+    {
+        "label": "目前正式鎖定版本：tech/chip預設權重(0.35/0.65)"
+                  "+ min_trust_ratio絕對門檻(由CLI --min-trust-ratio傳入，"
+                  "這裡不寫死，因為門檻是在backtest模式IS/OOS上調好的，"
+                  "跨期驗證只負責原封不動拿來用) + 停損0.8倍/停利3.0倍。"
+                  "沿用tech_weight/chip_weight(不用signal_weights)，"
+                  "是atr_sweep.py套滑價掃描後，在「停損不卡邊界」的可信區間裡"
+                  "選出來的組合，取代舊的signal_weights系列候選。",
+        # 不寫signal_weights鍵，代表沿用run_overnight_backtest的
+        # tech_weight/chip_weight邏輯(引擎預設0.35/0.65)，不是8訊號加權平均。
+        "atr_stop_mult": 0.8,
+        "atr_target_mult": 3.0,
+    },
 ]
 
 
@@ -138,7 +151,9 @@ def run_cross_period_validation(pipeline_inputs, candidates=None, top_n=5,
             done += 1
             trades = ome.run_overnight_backtest(
                 **common_args,
-                signal_weights=cand["signal_weights"],
+                signal_weights=cand.get("signal_weights"),
+                tech_weight=cand.get("tech_weight", ome.TECH_WEIGHT),
+                chip_weight=cand.get("chip_weight", ome.CHIP_WEIGHT),
                 atr_stop_mult=cand["atr_stop_mult"],
                 atr_target_mult=cand["atr_target_mult"],
                 use_prior_day_chip_data=use_chip_lag,
