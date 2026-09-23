@@ -13,6 +13,10 @@ data_cache/chip_cache/day_trading_cache，不需要重新下載），之後每�
 用法：
     python3 sweep_overnight_params.py --start 2023-09-15 --end 2026-09-14
 
+⚠️ 時間差修正：預設用「三大法人+美股濾網都錯開(真正能實測)」的版本，只用T-1日
+已知的資料，跟cross_period_validation.py裡唯一能拿去實盤判讀的版本一致。加
+--legacy-timing 可以切回舊版T日當天資料，僅供除錯/對照用。
+
 掃描的參數（第一版先掃這幾個，範圍不用太大——你自己說了「慢慢測，慢慢優化」，
 先看這幾個維度有沒有明顯的方向，比一次掃幾百種組合更容易看懂結果）：
     top_n              : 每日選幾檔
@@ -52,10 +56,15 @@ def build_param_grid():
     return combos
 
 
-def run_sweep(pipeline_inputs, is_ratio=IS_RATIO, param_grid=None):
+def run_sweep(pipeline_inputs, is_ratio=IS_RATIO, param_grid=None,
+              use_prior_day_chip_data=True, use_prior_day_us_market_data=True):
     """
     對每個參數組合，只在 IS 區間跑回測，回傳依 profit_factor 排序的結果 DataFrame。
     （刻意不去看 OOS，避免「挑到讓 OOS 也好看的參數」這種變相偷看答案的行為）
+
+    use_prior_day_chip_data / use_prior_day_us_market_data：預設都是True，只用
+    T-1日已知的三大法人/美股資料(真正能實測的版本)。設False會改用T日當天資料
+    (舊版，不可能實測)，僅供除錯/對照用。
     """
     param_grid = param_grid or build_param_grid()
     is_days, oos_days = split_is_oos(pipeline_inputs["trading_days"], is_ratio)
@@ -70,6 +79,8 @@ def run_sweep(pipeline_inputs, is_ratio=IS_RATIO, param_grid=None):
         us_market_returns_df=pipeline_inputs.get("us_market_returns_df"),
         ex_dividend_dates_by_code=pipeline_inputs.get("ex_dividend_dates_by_code"),
         trading_days=is_days,
+        use_prior_day_chip_data=use_prior_day_chip_data,
+        use_prior_day_us_market_data=use_prior_day_us_market_data,
     )
 
     rows = []
@@ -102,7 +113,8 @@ def rank_results(result_df, min_trades=MIN_TRADES_FOR_RANKING):
     return reliable.sort_values("profit_factor", ascending=False).reset_index(drop=True)
 
 
-def validate_best_on_oos(pipeline_inputs, best_params, oos_days):
+def validate_best_on_oos(pipeline_inputs, best_params, oos_days,
+                          use_prior_day_chip_data=True, use_prior_day_us_market_data=True):
     """把排名第一的組合，拿到 OOS 跑一次，僅供參考、不能拿來重新挑參數。"""
     trades = ome.run_overnight_backtest(
         indicators_by_code=pipeline_inputs["indicators_by_code"],
@@ -120,6 +132,8 @@ def validate_best_on_oos(pipeline_inputs, best_params, oos_days):
         tech_weight=best_params["tech_weight"],
         chip_weight=best_params["chip_weight"],
         gap_stop_threshold=best_params["gap_stop_threshold"],
+        use_prior_day_chip_data=use_prior_day_chip_data,
+        use_prior_day_us_market_data=use_prior_day_us_market_data,
     )
     return ome.summarize_overnight(trades)
 
@@ -130,19 +144,34 @@ def main():
     parser.add_argument("--end", required=True, help="YYYY-MM-DD")
     parser.add_argument("--top", type=int, default=10, help="列出前幾名組合")
     parser.add_argument("--refresh", action="store_true", help="忽略快取，強制重新下載所有資料")
+    parser.add_argument("--legacy-timing", action="store_true",
+                         help="改用T日當天資料(舊版，不可能實測)，僅供除錯/對照用，"
+                              "不建議拿這個版本的結果去挑參數")
     args = parser.parse_args()
 
     start_date = datetime.datetime.strptime(args.start, "%Y-%m-%d").date()
     end_date = datetime.datetime.strptime(args.end, "%Y-%m-%d").date()
+
+    use_realistic_timing = not args.legacy_timing
 
     print(f"載入資料 ({args.start} ~ {args.end})，若快取已存在會直接使用，不重新下載 ...")
     pipeline_inputs = build_pipeline_inputs(
         data_loader.STOCK_FUTURES_WHITELIST, start_date, end_date, refresh=args.refresh,
     )
 
+    if use_realistic_timing:
+        print("時間差修正：三大法人+美股濾網都錯開(真正能實測) —— 只用T-1日已知的資料。")
+    else:
+        print("⚠️ 時間差修正：已停用(--legacy-timing)，用的是T日當天資料(舊版，不可能實測)，"
+              "結果僅供對照，不代表能實盤。")
+
     grid = build_param_grid()
     print(f"\n共 {len(grid)} 組參數，只在樣本內(IS, 前70%)跑回測 ...\n")
-    result_df, is_days, oos_days = run_sweep(pipeline_inputs, param_grid=grid)
+    result_df, is_days, oos_days = run_sweep(
+        pipeline_inputs, param_grid=grid,
+        use_prior_day_chip_data=use_realistic_timing,
+        use_prior_day_us_market_data=use_realistic_timing,
+    )
 
     ranked = rank_results(result_df)
     print(f"\n=== IS 排名前 {args.top} 組合（依 profit_factor） ===")
@@ -158,7 +187,11 @@ def main():
         print(f"\n=== 用排名第一的組合在 OOS 驗證（僅供參考，不能用來重新選參數） ===")
         print(f"組合: top_n={best['top_n']}, tech/chip={best['tech_weight']}/{best['chip_weight']}, "
               f"gap_stop={best['gap_stop_threshold']}")
-        oos_summary = validate_best_on_oos(pipeline_inputs, best, oos_days)
+        oos_summary = validate_best_on_oos(
+            pipeline_inputs, best, oos_days,
+            use_prior_day_chip_data=use_realistic_timing,
+            use_prior_day_us_market_data=use_realistic_timing,
+        )
         print(f"OOS 交易次數: {oos_summary['total_trades']}")
         print(f"OOS 勝率: {oos_summary['win_rate']:.1f}%")
         print(f"OOS 盈虧比: {oos_summary['profit_factor']:.2f}")

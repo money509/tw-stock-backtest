@@ -17,6 +17,10 @@ sweep_atr_params.py
 用法：
     python3 sweep_atr_params.py --start 2023-09-15 --end 2026-09-14
 
+⚠️ 時間差修正：預設用「三大法人+美股濾網都錯開(真正能實測)」的版本，只用T-1日
+已知的資料，跟cross_period_validation.py裡唯一能拿去實盤判讀的版本一致。加
+--legacy-timing 可以切回舊版T日當天資料，僅供除錯/對照用。
+
 資料一樣只載入一次（吃現有快取），之後每個 ATR 組合都是對同一份資料重跑
 run_overnight_backtest()，只在記憶體內計算，不會再打網路請求。
 """
@@ -74,8 +78,13 @@ def run_sweep(pipeline_inputs, is_ratio=IS_RATIO, param_grid=None,
               top_n=FIXED_TOP_N, tech_weight=FIXED_TECH_WEIGHT,
               chip_weight=FIXED_CHIP_WEIGHT,
               gap_stop_threshold=FIXED_GAP_STOP_THRESHOLD,
-              min_candidates=None, min_trust_ratio=None, slippage_pct=0.0):
+              min_candidates=None, min_trust_ratio=None, slippage_pct=0.0,
+              use_prior_day_chip_data=True, use_prior_day_us_market_data=True):
     """只在 IS 區間跑，回傳每個 ATR 組合的結果 DataFrame（不看 OOS，理由同 sweep_overnight_params.py）。
+
+    use_prior_day_chip_data / use_prior_day_us_market_data：預設都是True，只用
+    T-1日已知的三大法人/美股資料(真正能實測的版本)。設False會改用T日當天資料
+    (舊版，不可能實測)，僅供除錯/對照用。
 
     min_candidates / min_trust_ratio：可選，往下傳給每次run_overnight_backtest()呼叫，
     見overnight_momentum_engine.py的說明。不傳（維持None）就完全不啟用，向後相容。
@@ -107,6 +116,8 @@ def run_sweep(pipeline_inputs, is_ratio=IS_RATIO, param_grid=None,
         min_candidates=min_candidates,
         min_trust_ratio=min_trust_ratio,
         slippage_pct=slippage_pct,
+        use_prior_day_chip_data=use_prior_day_chip_data,
+        use_prior_day_us_market_data=use_prior_day_us_market_data,
     )
 
     rows = []
@@ -177,15 +188,26 @@ def main():
                          help="模擬滑價百分比(預設0=不模擬)，強烈建議掃描範圍包含很緊的"
                               "停損倍數時開啟(例如0.1)，避免掃到滑價/雜訊主導的假最佳解，"
                               "見build_atr_grid()的docstring說明")
+    parser.add_argument("--legacy-timing", action="store_true",
+                         help="改用T日當天資料(舊版，不可能實測)，僅供除錯/對照用，"
+                              "不建議拿這個版本的結果去挑參數")
     args = parser.parse_args()
 
     start_date = datetime.datetime.strptime(args.start, "%Y-%m-%d").date()
     end_date = datetime.datetime.strptime(args.end, "%Y-%m-%d").date()
 
+    use_realistic_timing = not args.legacy_timing
+
     print(f"載入資料 ({args.start} ~ {args.end})，若快取已存在會直接使用，不重新下載 ...")
     pipeline_inputs = build_pipeline_inputs(
         data_loader.STOCK_FUTURES_WHITELIST, start_date, end_date, refresh=args.refresh,
     )
+
+    if use_realistic_timing:
+        print("時間差修正：三大法人+美股濾網都錯開(真正能實測) —— 只用T-1日已知的資料。")
+    else:
+        print("⚠️ 時間差修正：已停用(--legacy-timing)，用的是T日當天資料(舊版，不可能實測)，"
+              "結果僅供對照，不代表能實盤。")
 
     grid = build_atr_grid()
     print(f"\n共 {len(grid)} 組 ATR 倍數組合，其餘參數固定在 top_n={FIXED_TOP_N}, "
@@ -201,6 +223,8 @@ def main():
         pipeline_inputs, param_grid=grid,
         min_candidates=args.min_candidates, min_trust_ratio=args.min_trust_ratio,
         slippage_pct=args.slippage_pct,
+        use_prior_day_chip_data=use_realistic_timing,
+        use_prior_day_us_market_data=use_realistic_timing,
     )
 
     ranked = rank_results(result_df)
@@ -224,6 +248,8 @@ def main():
             pipeline_inputs, best, oos_days,
             min_candidates=args.min_candidates, min_trust_ratio=args.min_trust_ratio,
             slippage_pct=args.slippage_pct,
+            use_prior_day_chip_data=use_realistic_timing,
+            use_prior_day_us_market_data=use_realistic_timing,
         )
         print(f"組合: atr_stop={best['atr_stop_mult']}, atr_target={best['atr_target_mult']}")
         print(f"OOS 交易次數: {oos_summary['total_trades']}")
@@ -239,7 +265,8 @@ def validate_best_on_oos(pipeline_inputs, best_params, oos_days,
                           chip_weight=FIXED_CHIP_WEIGHT,
                           gap_stop_threshold=FIXED_GAP_STOP_THRESHOLD,
                           min_candidates=None, min_trust_ratio=None,
-                          slippage_pct=0.0):
+                          slippage_pct=0.0,
+                          use_prior_day_chip_data=True, use_prior_day_us_market_data=True):
     """把排名第一的 ATR 組合，拿到 OOS 跑一次，僅供參考、不能拿來重新挑參數。"""
     trades = ome.run_overnight_backtest(
         indicators_by_code=pipeline_inputs["indicators_by_code"],
@@ -262,6 +289,8 @@ def validate_best_on_oos(pipeline_inputs, best_params, oos_days,
         # 把數值型欄位轉成非預期的 dtype。
         atr_stop_mult=float(best_params["atr_stop_mult"]),
         atr_target_mult=float(best_params["atr_target_mult"]),
+        use_prior_day_chip_data=use_prior_day_chip_data,
+        use_prior_day_us_market_data=use_prior_day_us_market_data,
     )
     return ome.summarize_overnight(trades)
 

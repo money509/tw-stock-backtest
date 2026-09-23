@@ -10,6 +10,16 @@ day_trading_loader.py（當沖比例）、overnight_chip_adapter.py（籌碼格�
 
 IS/OOS 切分沿用本專案既有標準：70% 時間在前當 IS（樣本內），30% 在後當 OOS（樣本外），
 避免像之前技術面組合那樣，樣本內看起來賺錢、實際上只是騎到多頭順風車。
+
+⚠️ 時間差修正：預設用「三大法人+美股濾網都錯開(真正能實測)」的版本
+（use_prior_day_chip_data=True, use_prior_day_us_market_data=True），只用T-1日
+已知的資料，跟cross_period_validation.py裡唯一能拿去實盤判讀的版本一致。這裡是
+拿來鎖定tech_weight/chip_weight/ATR倍數/min_trust_ratio等正式參數的主程式，
+如果這裡用的是偷看版本，鎖出來的參數在跨期驗證(甚至實盤)上會現形失效——這正是
+#42那次跨期驗證抓到的問題，所以這支腳本的時間差修正尤其重要，不能只修
+sweep_signal_ablation.py。
+如果想比較兩種時間假設差多少（僅供除錯/對照，不建議拿legacy版本的結果去鎖參數），
+可以加 --legacy-timing 改回舊版T日當天資料。
 """
 
 import argparse
@@ -244,10 +254,15 @@ def main():
     parser.add_argument("--atr-target-mult", type=float, default=ome.ATR_TARGET_MULT,
                          help=f"ATR停利倍數(預設{ome.ATR_TARGET_MULT}，引擎預設值)，"
                               "用途同--atr-stop-mult")
+    parser.add_argument("--legacy-timing", action="store_true",
+                         help="改用T日當天資料(舊版，不可能實測)，僅供除錯/對照用，"
+                              "不建議拿這個版本的結果去鎖定正式參數")
     args = parser.parse_args()
 
     start_date = datetime.datetime.strptime(args.start, "%Y-%m-%d").date()
     end_date = datetime.datetime.strptime(args.end, "%Y-%m-%d").date()
+
+    use_realistic_timing = not args.legacy_timing
 
     whitelist = UNIVERSE_CHOICES[args.universe]
     if args.universe == "full":
@@ -263,6 +278,12 @@ def main():
         pipeline_inputs["us_market_returns_df"] = None
         print("（已停用隔夜美股濾網）")
 
+    if use_realistic_timing:
+        print("時間差修正：三大法人+美股濾網都錯開(真正能實測) —— 只用T-1日已知的資料。")
+    else:
+        print("⚠️ 時間差修正：已停用(--legacy-timing)，用的是T日當天資料(舊版，不可能實測)，"
+              "結果僅供對照，不代表能實盤，不要拿這次結果去鎖定正式參數。")
+
     print(f"共 {len(pipeline_inputs['trading_days'])} 個交易日，開始跑 IS/OOS 回測 ...")
     is_trades, oos_trades, is_summary, oos_summary = run_is_oos_backtest(
         pipeline_inputs, top_n=args.top_n,
@@ -273,6 +294,8 @@ def main():
         min_trust_ratio=args.min_trust_ratio,
         atr_stop_mult=args.atr_stop_mult,
         atr_target_mult=args.atr_target_mult,
+        use_prior_day_chip_data=use_realistic_timing,
+        use_prior_day_us_market_data=use_realistic_timing,
     )
 
     print_summary("樣本內 IS (前70%)", is_summary)

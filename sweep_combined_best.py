@@ -15,6 +15,15 @@ sweep_combined_best.py
 
 用法：
     python3 sweep_combined_best.py --start 2023-09-15 --end 2026-09-14
+
+⚠️ 時間差修正：預設用「三大法人+美股濾網都錯開(真正能實測)」的版本，只用T-1日
+已知的資料，跟cross_period_validation.py裡唯一能拿去實盤判讀的版本一致。加
+--legacy-timing 可以切回舊版T日當天資料，僅供除錯/對照用。
+
+⚠️ SIGNAL_WEIGHT_VARIANTS 目前仍是依照舊版(偷看T日當天資料)的訊號拆解結果挑的
+候選（投信+量比+相對大盤強弱），還沒有依照修正後的誠實版拆解結果（量比+相對大盤
+強弱+外資買超比重PF較高，投信只是打平）更新——重新掃這個之前，建議先確認要不要
+把候選組合也換成新的訊號組合，不要只改時間差就直接沿用舊候選。
 """
 
 import argparse
@@ -57,8 +66,14 @@ ATR_VARIANTS = {
 
 
 def run_combined_sweep(pipeline_inputs, is_ratio=IS_RATIO, top_n=5,
-                        signal_variants=None, atr_variants=None):
-    """訊號權重 x ATR參數 交叉測試，只在IS區間跑。"""
+                        signal_variants=None, atr_variants=None,
+                        use_prior_day_chip_data=True, use_prior_day_us_market_data=True):
+    """訊號權重 x ATR參數 交叉測試，只在IS區間跑。
+
+    use_prior_day_chip_data / use_prior_day_us_market_data：預設都是True，只用
+    T-1日已知的三大法人/美股資料(真正能實測的版本)。設False會改用T日當天資料
+    (舊版，不可能實測)，僅供除錯/對照用。
+    """
     signal_variants = signal_variants or SIGNAL_WEIGHT_VARIANTS
     atr_variants = atr_variants or ATR_VARIANTS
     is_days, oos_days = split_is_oos(pipeline_inputs["trading_days"], is_ratio)
@@ -74,6 +89,8 @@ def run_combined_sweep(pipeline_inputs, is_ratio=IS_RATIO, top_n=5,
         ex_dividend_dates_by_code=pipeline_inputs.get("ex_dividend_dates_by_code"),
         trading_days=is_days,
         top_n=top_n,
+        use_prior_day_chip_data=use_prior_day_chip_data,
+        use_prior_day_us_market_data=use_prior_day_us_market_data,
     )
 
     rows = []
@@ -113,7 +130,8 @@ def rank_results(result_df, min_trades=MIN_TRADES_FOR_RANKING):
 
 
 def validate_best_on_oos(pipeline_inputs, best_row, oos_days, top_n=5,
-                          signal_weight_variants=None):
+                          signal_weight_variants=None,
+                          use_prior_day_chip_data=True, use_prior_day_us_market_data=True):
     """把排名第一的組合，拿到 OOS 跑一次，僅供參考、不能拿來重新挑參數。"""
     signal_weight_variants = signal_weight_variants or SIGNAL_WEIGHT_VARIANTS
     signal_label = best_row["signal_variant"]
@@ -134,6 +152,8 @@ def validate_best_on_oos(pipeline_inputs, best_row, oos_days, top_n=5,
         # （sweep_overnight_params.py 曾經因為這個炸過一次）。
         atr_stop_mult=float(best_row["atr_stop_mult"]),
         atr_target_mult=float(best_row["atr_target_mult"]),
+        use_prior_day_chip_data=use_prior_day_chip_data,
+        use_prior_day_us_market_data=use_prior_day_us_market_data,
     )
     return ome.summarize_overnight(trades)
 
@@ -144,19 +164,34 @@ def main():
     parser.add_argument("--end", required=True, help="YYYY-MM-DD")
     parser.add_argument("--top-n", type=int, default=5)
     parser.add_argument("--refresh", action="store_true", help="忽略快取，強制重新下載所有資料")
+    parser.add_argument("--legacy-timing", action="store_true",
+                         help="改用T日當天資料(舊版，不可能實測)，僅供除錯/對照用，"
+                              "不建議拿這個版本的結果去挑參數")
     args = parser.parse_args()
 
     start_date = datetime.datetime.strptime(args.start, "%Y-%m-%d").date()
     end_date = datetime.datetime.strptime(args.end, "%Y-%m-%d").date()
+
+    use_realistic_timing = not args.legacy_timing
 
     print(f"載入資料 ({args.start} ~ {args.end})，若快取已存在會直接使用，不重新下載 ...")
     pipeline_inputs = build_pipeline_inputs(
         data_loader.STOCK_FUTURES_WHITELIST, start_date, end_date, refresh=args.refresh,
     )
 
+    if use_realistic_timing:
+        print("時間差修正：三大法人+美股濾網都錯開(真正能實測) —— 只用T-1日已知的資料。")
+    else:
+        print("⚠️ 時間差修正：已停用(--legacy-timing)，用的是T日當天資料(舊版，不可能實測)，"
+              "結果僅供對照，不代表能實盤。")
+
     print(f"\n共 {len(SIGNAL_WEIGHT_VARIANTS)} 組訊號權重 x {len(ATR_VARIANTS)} 組ATR參數，"
           f"只在樣本內(IS, 前70%)跑回測 ...\n")
-    result_df, is_days, oos_days = run_combined_sweep(pipeline_inputs, top_n=args.top_n)
+    result_df, is_days, oos_days = run_combined_sweep(
+        pipeline_inputs, top_n=args.top_n,
+        use_prior_day_chip_data=use_realistic_timing,
+        use_prior_day_us_market_data=use_realistic_timing,
+    )
 
     ranked = rank_results(result_df)
     print(f"\n=== 依 profit_factor 排名 ===")
@@ -167,7 +202,11 @@ def main():
         best = ranked.iloc[0].to_dict()
         print(f"\n=== 排名第一的組合在 OOS 驗證（僅供參考，不能用來重新選參數） ===")
         print(f"組合: {best['signal_variant']} x {best['atr_variant']}")
-        oos_summary = validate_best_on_oos(pipeline_inputs, best, oos_days, top_n=args.top_n)
+        oos_summary = validate_best_on_oos(
+            pipeline_inputs, best, oos_days, top_n=args.top_n,
+            use_prior_day_chip_data=use_realistic_timing,
+            use_prior_day_us_market_data=use_realistic_timing,
+        )
         print(f"OOS 交易次數: {oos_summary['total_trades']}")
         print(f"OOS 勝率: {oos_summary['win_rate']:.1f}%")
         print(f"OOS 盈虧比: {oos_summary['profit_factor']:.2f}")
