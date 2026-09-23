@@ -16,13 +16,18 @@ sweep_combined_best.py
   可能低於實際下單的最小跳動/價差，執行上不可信；停損0.1~1.5倍的「正常」
   範圍，全部PF<1(0.71~0.95)，找不到任何站得住腳的ATR組合能單靠出場距離
   把PF拉過1——問題核心在訊號本身太弱，不是出場設定。
+- 第一次合併測試發現「最強2個(量比+相對大盤強弱，拿掉外資)」是唯一一組在
+  多種ATR設定下都PF>=1.00的組合(IS最佳PF=1.12)，且因為這2個都是股票自己
+  當天的價量訊號(不像籌碼資料要等收盤後才公布)，完全不受時間差修正影響。
+  但拿去cross_period_validation.py在完全獨立的2020-2023區間驗證，PF掉到
+  0.88~0.90，沒有通過——不過同一批候選裡，它仍然是所有候選中PF最高、
+  跌幅最小的一組(基準8訊號組在同一段資料上只有0.66)。
 
-這次調整：SIGNAL_WEIGHT_VARIANTS換成上面誠實版拆解結果驗證過的訊號組合，
-拿掉投信(只是打平)、拿掉收盤位置/股價位階/當沖比例/漲幅%(打平或負貢獻)；
-ATR_VARIANTS換成避開執行失真邊界(<=0.1倍)的合理區間，範圍設在0.3~0.8停損、
-2.0~3.0停利，讓這次合併測試回答的問題是「乾淨的訊號組合 x 合理的出場距離」
-搭配起來，能不能把PF真正拉過1，而不是繼續在偷看版本挑出的候選、或執行上不可信
-的ATR邊界附近打轉。
+這次調整：既然量比/相對大盤強弱這兩個純技術訊號本身不受時間差問題影響、
+表現也相對最穩，SIGNAL_WEIGHT_VARIANTS這次改成專注在「技術面內部」找更好的
+搭配——測試全部5個技術訊號等權重、只調量比/相對大盤強弱的權重比例、
+加入漲幅%(打平訊號)當多樣化對照，看純技術面裡有沒有比目前的「最強2個」更好
+的組合。ATR_VARIANTS維持前一版避開執行失真邊界(<=0.1倍)的合理區間。
 
 用法：
     python3 sweep_combined_best.py --start 2023-09-15 --end 2026-09-14 --slippage-pct 0.1
@@ -48,29 +53,31 @@ from compare_overnight import build_pipeline_inputs, split_is_oos, IS_RATIO
 
 MIN_TRADES_FOR_RANKING = 30
 
-# 候選訊號權重組合：baseline是現在的8訊號等權重(對照組，預期會是最差的之一)，
-# 其餘依「誠實版」單一訊號拆解結果(sweep_signal_ablation.py, honest timing)
-# 挑出——只保留PF明顯>1的量比/相對大盤強弱/外資買超比重，投信(PF1.01，只是打平)
-# 跟收盤位置/股價位階/當沖比例/漲幅%(打平或負貢獻)都拿掉，不再沿用舊版(偷看
-# T日當天資料)挑出的「投信+量比+相對大盤強弱」這組候選。
+# 候選訊號權重組合：baseline是現在的8訊號等權重(對照組)，其餘全部是純技術面
+# 組合(不含任何籌碼訊號)——「最強2個」是上一版combined測試驗證過的最佳解，
+# 保留當這一輪的對照基準；其餘4組是圍繞它做的技術面內部調整，看能不能找到
+# 更好的搭配。
 SIGNAL_WEIGHT_VARIANTS = {
     "baseline_8訊號等權重": {
         "score_close_position": 1.0, "score_volume_ratio": 1.0, "score_rel_strength": 1.0,
         "score_gain_pct": 1.0, "score_price_level": 1.0, "score_day_trading": 1.0,
         "score_foreign": 1.0, "score_trust": 1.0,
     },
-    "最強3個(量比+相對大盤強弱+外資)": {
-        "score_volume_ratio": 1.0, "score_rel_strength": 1.0, "score_foreign": 1.0,
+    "技術5訊號等權重(不含籌碼)": {
+        "score_close_position": 1.0, "score_volume_ratio": 1.0, "score_rel_strength": 1.0,
+        "score_gain_pct": 1.0, "score_price_level": 1.0,
     },
     "最強2個(量比+相對大盤強弱)": {
         "score_volume_ratio": 1.0, "score_rel_strength": 1.0,
     },
-    "最強3個，外資加重2倍": {
-        "score_volume_ratio": 1.0, "score_rel_strength": 1.0, "score_foreign": 2.0,
+    "最強2個，量比加重2倍": {
+        "score_volume_ratio": 2.0, "score_rel_strength": 1.0,
     },
-    "最強3個+投信(打平訊號，當多樣化對照)": {
-        "score_volume_ratio": 1.0, "score_rel_strength": 1.0, "score_foreign": 1.0,
-        "score_trust": 1.0,
+    "最強2個，相對大盤強弱加重2倍": {
+        "score_volume_ratio": 1.0, "score_rel_strength": 2.0,
+    },
+    "最強2個+漲幅%(打平訊號，當多樣化對照)": {
+        "score_volume_ratio": 1.0, "score_rel_strength": 1.0, "score_gain_pct": 1.0,
     },
 }
 
