@@ -5,25 +5,36 @@ sweep_combined_best.py
 確認合起來是不是真的比任何一個單獨的改善更好，而不是想當然爾地假設兩個好東西
 加在一起一定更好（實務上常常因為互相干擾反而更差，一定要實際測過）。
 
-背景：
-- 單一訊號拆解（sweep_signal_ablation.py）顯示，真正有預測力的訊號集中在
-  投信買超比重/量比/相對大盤強弱這3個，現在的8訊號等權重反而被外資買超比重、
-  當沖比例這兩個反效果訊號拖累，比只用好訊號還差。
-- ATR掃描（sweep_atr_params.py）顯示，停損拉緊到0.3~0.5倍、停利拉遠到3.0倍附近，
-  比原本的0.8/1.2好很多；但停損緊到0.1倍已經是回測失真的範圍（現實下單會有
-  滑價，這麼緊的停損不可能穩定成交在理論價位），不採用。
+背景（以下均為「三大法人+美股濾網都錯開(真正能實測)」+ slippage_pct=0.1 的誠實版結果）：
+- 單一訊號拆解（sweep_signal_ablation.py，honest timing版）顯示，真正有預測力
+  （PF明顯>1）的訊號是量比(PF1.12)、相對大盤強弱(PF1.11)、外資買超比重(PF1.07)
+  這3個；投信買超比重(PF1.01)、漲幅%(PF1.00)只是打平；收盤位置、股價位階、
+  當沖比例是負貢獻，8訊號等權重的基準組(PF0.93)反而比多數單一訊號還差，
+  代表現在的作法是把好訊號跟壞訊號混在一起、互相稀釋。
+- ATR掃描（sweep_atr_params.py，honest timing + slippage_pct=0.1版）顯示，
+  一旦套上合理滑價，停損0.1倍以下的組合雖然PF還撐得住(>1)，但停損距離小到
+  可能低於實際下單的最小跳動/價差，執行上不可信；停損0.1~1.5倍的「正常」
+  範圍，全部PF<1(0.71~0.95)，找不到任何站得住腳的ATR組合能單靠出場距離
+  把PF拉過1——問題核心在訊號本身太弱，不是出場設定。
+
+這次調整：SIGNAL_WEIGHT_VARIANTS換成上面誠實版拆解結果驗證過的訊號組合，
+拿掉投信(只是打平)、拿掉收盤位置/股價位階/當沖比例/漲幅%(打平或負貢獻)；
+ATR_VARIANTS換成避開執行失真邊界(<=0.1倍)的合理區間，範圍設在0.3~0.8停損、
+2.0~3.0停利，讓這次合併測試回答的問題是「乾淨的訊號組合 x 合理的出場距離」
+搭配起來，能不能把PF真正拉過1，而不是繼續在偷看版本挑出的候選、或執行上不可信
+的ATR邊界附近打轉。
 
 用法：
-    python3 sweep_combined_best.py --start 2023-09-15 --end 2026-09-14
+    python3 sweep_combined_best.py --start 2023-09-15 --end 2026-09-14 --slippage-pct 0.1
 
 ⚠️ 時間差修正：預設用「三大法人+美股濾網都錯開(真正能實測)」的版本，只用T-1日
 已知的資料，跟cross_period_validation.py裡唯一能拿去實盤判讀的版本一致。加
 --legacy-timing 可以切回舊版T日當天資料，僅供除錯/對照用。
 
-⚠️ SIGNAL_WEIGHT_VARIANTS 目前仍是依照舊版(偷看T日當天資料)的訊號拆解結果挑的
-候選（投信+量比+相對大盤強弱），還沒有依照修正後的誠實版拆解結果（量比+相對大盤
-強弱+外資買超比重PF較高，投信只是打平）更新——重新掃這個之前，建議先確認要不要
-把候選組合也換成新的訊號組合，不要只改時間差就直接沿用舊候選。
+⚠️ 滑價：預設0.0(不模擬)，維持舊行為向後相容。但atr_sweep已經證實滑價對排名
+影響很大(套了0.1%滑價後，原本PF>1的組合大量翻成PF<1)，這次合併測試強烈建議
+加 --slippage-pct 0.1，不然排名結果可能只是沒套滑價時的假象，跟前面兩支腳本
+的判讀基準不一致。
 """
 
 import argparse
@@ -37,42 +48,59 @@ from compare_overnight import build_pipeline_inputs, split_is_oos, IS_RATIO
 
 MIN_TRADES_FOR_RANKING = 30
 
-# 候選訊號權重組合：baseline是現在的8訊號等權重，其餘是依訊號拆解結果挑出的候選
+# 候選訊號權重組合：baseline是現在的8訊號等權重(對照組，預期會是最差的之一)，
+# 其餘依「誠實版」單一訊號拆解結果(sweep_signal_ablation.py, honest timing)
+# 挑出——只保留PF明顯>1的量比/相對大盤強弱/外資買超比重，投信(PF1.01，只是打平)
+# 跟收盤位置/股價位階/當沖比例/漲幅%(打平或負貢獻)都拿掉，不再沿用舊版(偷看
+# T日當天資料)挑出的「投信+量比+相對大盤強弱」這組候選。
 SIGNAL_WEIGHT_VARIANTS = {
     "baseline_8訊號等權重": {
         "score_close_position": 1.0, "score_volume_ratio": 1.0, "score_rel_strength": 1.0,
         "score_gain_pct": 1.0, "score_price_level": 1.0, "score_day_trading": 1.0,
         "score_foreign": 1.0, "score_trust": 1.0,
     },
-    "只用最強3個(投信+量比+相對大盤強弱)": {
-        "score_trust": 1.0, "score_volume_ratio": 1.0, "score_rel_strength": 1.0,
+    "最強3個(量比+相對大盤強弱+外資)": {
+        "score_volume_ratio": 1.0, "score_rel_strength": 1.0, "score_foreign": 1.0,
     },
-    "最強3個+漲幅%": {
-        "score_trust": 1.0, "score_volume_ratio": 1.0, "score_rel_strength": 1.0,
-        "score_gain_pct": 1.0,
+    "最強2個(量比+相對大盤強弱)": {
+        "score_volume_ratio": 1.0, "score_rel_strength": 1.0,
     },
-    "最強3個，投信加重2倍": {
-        "score_trust": 2.0, "score_volume_ratio": 1.0, "score_rel_strength": 1.0,
+    "最強3個，外資加重2倍": {
+        "score_volume_ratio": 1.0, "score_rel_strength": 1.0, "score_foreign": 2.0,
+    },
+    "最強3個+投信(打平訊號，當多樣化對照)": {
+        "score_volume_ratio": 1.0, "score_rel_strength": 1.0, "score_foreign": 1.0,
+        "score_trust": 1.0,
     },
 }
 
-# 候選ATR組合：保留舊預設值當對照，另外兩組是掃描裡表現好、且風控上還算合理
-# （不是掃到失真邊界0.1倍那種）的組合
+# 候選ATR組合：保留舊預設值當對照，其餘避開執行上不可信的失真邊界
+# （atr_sweep套滑價後顯示，停損<=0.1倍雖然PF還撐得住，但停損距離可能小於
+# 實際下單的最小跳動/價差，執行上不可信；0.1~1.5倍這個「正常」範圍套滑價後
+# 全部PF<1，這裡選相對表現較好、風控上也合理的0.3~0.8倍停損區間）。
 ATR_VARIANTS = {
     "舊預設(0.8/1.2)": {"atr_stop_mult": 0.8, "atr_target_mult": 1.2},
-    "停損0.5倍/停利3.0倍": {"atr_stop_mult": 0.5, "atr_target_mult": 3.0},
+    "停損0.3倍/停利2.0倍": {"atr_stop_mult": 0.3, "atr_target_mult": 2.0},
     "停損0.3倍/停利3.0倍": {"atr_stop_mult": 0.3, "atr_target_mult": 3.0},
+    "停損0.5倍/停利2.0倍": {"atr_stop_mult": 0.5, "atr_target_mult": 2.0},
+    "停損0.5倍/停利3.0倍": {"atr_stop_mult": 0.5, "atr_target_mult": 3.0},
+    "停損0.8倍/停利2.0倍": {"atr_stop_mult": 0.8, "atr_target_mult": 2.0},
 }
 
 
 def run_combined_sweep(pipeline_inputs, is_ratio=IS_RATIO, top_n=5,
                         signal_variants=None, atr_variants=None,
-                        use_prior_day_chip_data=True, use_prior_day_us_market_data=True):
+                        use_prior_day_chip_data=True, use_prior_day_us_market_data=True,
+                        slippage_pct=0.0):
     """訊號權重 x ATR參數 交叉測試，只在IS區間跑。
 
     use_prior_day_chip_data / use_prior_day_us_market_data：預設都是True，只用
     T-1日已知的三大法人/美股資料(真正能實測的版本)。設False會改用T日當天資料
     (舊版，不可能實測)，僅供除錯/對照用。
+
+    slippage_pct：預設0.0(不模擬)，維持舊行為向後相容。⚠️atr_sweep已經證實
+    滑價對排名影響很大，強烈建議呼叫端傳入0.1，跟前面兩支腳本的判讀基準一致，
+    避免排名結果只是沒套滑價時的假象。
     """
     signal_variants = signal_variants or SIGNAL_WEIGHT_VARIANTS
     atr_variants = atr_variants or ATR_VARIANTS
@@ -89,6 +117,7 @@ def run_combined_sweep(pipeline_inputs, is_ratio=IS_RATIO, top_n=5,
         ex_dividend_dates_by_code=pipeline_inputs.get("ex_dividend_dates_by_code"),
         trading_days=is_days,
         top_n=top_n,
+        slippage_pct=slippage_pct,
         use_prior_day_chip_data=use_prior_day_chip_data,
         use_prior_day_us_market_data=use_prior_day_us_market_data,
     )
@@ -131,7 +160,8 @@ def rank_results(result_df, min_trades=MIN_TRADES_FOR_RANKING):
 
 def validate_best_on_oos(pipeline_inputs, best_row, oos_days, top_n=5,
                           signal_weight_variants=None,
-                          use_prior_day_chip_data=True, use_prior_day_us_market_data=True):
+                          use_prior_day_chip_data=True, use_prior_day_us_market_data=True,
+                          slippage_pct=0.0):
     """把排名第一的組合，拿到 OOS 跑一次，僅供參考、不能拿來重新挑參數。"""
     signal_weight_variants = signal_weight_variants or SIGNAL_WEIGHT_VARIANTS
     signal_label = best_row["signal_variant"]
@@ -154,6 +184,7 @@ def validate_best_on_oos(pipeline_inputs, best_row, oos_days, top_n=5,
         atr_target_mult=float(best_row["atr_target_mult"]),
         use_prior_day_chip_data=use_prior_day_chip_data,
         use_prior_day_us_market_data=use_prior_day_us_market_data,
+        slippage_pct=slippage_pct,
     )
     return ome.summarize_overnight(trades)
 
@@ -167,6 +198,10 @@ def main():
     parser.add_argument("--legacy-timing", action="store_true",
                          help="改用T日當天資料(舊版，不可能實測)，僅供除錯/對照用，"
                               "不建議拿這個版本的結果去挑參數")
+    parser.add_argument("--slippage-pct", type=float, default=0.0,
+                         help="模擬滑價百分比(預設0=不模擬)，強烈建議填0.1，"
+                              "跟sweep_atr_params.py的判讀基準一致，避免排名結果"
+                              "只是沒套滑價時的假象")
     args = parser.parse_args()
 
     start_date = datetime.datetime.strptime(args.start, "%Y-%m-%d").date()
@@ -185,12 +220,20 @@ def main():
         print("⚠️ 時間差修正：已停用(--legacy-timing)，用的是T日當天資料(舊版，不可能實測)，"
               "結果僅供對照，不代表能實盤。")
 
+    if args.slippage_pct:
+        print(f"⚠️ 有套用滑價模擬：slippage_pct={args.slippage_pct}%（買進多付、賣出少拿），"
+              f"排名結果反映的是滑價侵蝕後的真實表現，不是理論最佳值。")
+    else:
+        print("⚠️ 未套用滑價模擬(slippage_pct=0)，排名結果可能偏樂觀，"
+              "建議加 --slippage-pct 0.1 才跟其他腳本的判讀基準一致。")
+
     print(f"\n共 {len(SIGNAL_WEIGHT_VARIANTS)} 組訊號權重 x {len(ATR_VARIANTS)} 組ATR參數，"
           f"只在樣本內(IS, 前70%)跑回測 ...\n")
     result_df, is_days, oos_days = run_combined_sweep(
         pipeline_inputs, top_n=args.top_n,
         use_prior_day_chip_data=use_realistic_timing,
         use_prior_day_us_market_data=use_realistic_timing,
+        slippage_pct=args.slippage_pct,
     )
 
     ranked = rank_results(result_df)
@@ -206,6 +249,7 @@ def main():
             pipeline_inputs, best, oos_days, top_n=args.top_n,
             use_prior_day_chip_data=use_realistic_timing,
             use_prior_day_us_market_data=use_realistic_timing,
+            slippage_pct=args.slippage_pct,
         )
         print(f"OOS 交易次數: {oos_summary['total_trades']}")
         print(f"OOS 勝率: {oos_summary['win_rate']:.1f}%")

@@ -16,6 +16,7 @@ import numpy as np
 
 import sweep_combined_best as combined
 import compare_overnight as co
+import overnight_momentum_engine as ome
 
 
 def make_ohlcv_df(n_days, base_price=100.0, start="2026-01-01", trend=0.3, seed=0):
@@ -146,6 +147,39 @@ class TestRunCombinedSweep(unittest.TestCase):
             row_a["total_pnl"] == row_b["total_pnl"] and
             row_a["total_trades"] == row_b["total_trades"]
         )
+
+
+class TestSlippagePlumbing(unittest.TestCase):
+    """確認 slippage_pct 真的有傳到 run_overnight_backtest()，
+    跟 sweep_atr_params.py 的對應測試同樣的驗證方式。"""
+
+    def setUp(self):
+        self.pipeline_inputs = make_pipeline_inputs()
+
+    def test_run_combined_sweep_passes_through_slippage_pct(self):
+        captured = []
+        real_run = ome.run_overnight_backtest
+
+        def spy_run_overnight_backtest(**kwargs):
+            captured.append(kwargs["slippage_pct"])
+            return real_run(**kwargs)
+
+        small_signals = {"只用量比": {"score_volume_ratio": 1.0}}
+        small_atr = {"固定組合": {"atr_stop_mult": 0.8, "atr_target_mult": 1.2}}
+
+        ome.run_overnight_backtest = spy_run_overnight_backtest
+        try:
+            combined.run_combined_sweep(
+                self.pipeline_inputs, top_n=2,
+                signal_variants=small_signals, atr_variants=small_atr,
+                slippage_pct=0.1,
+            )
+        finally:
+            ome.run_overnight_backtest = real_run
+
+        self.assertTrue(captured)
+        for slippage in captured:
+            self.assertEqual(slippage, 0.1)
 
 
 class TestRankResults(unittest.TestCase):
