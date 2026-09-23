@@ -13,6 +13,15 @@ sweep_signal_ablation.py
 
 會用跟 sweep_overnight_params.py 一樣的方式：資料只在一開始載入一次，之後每個
 訊號的測試都是對同一份資料重跑 run_overnight_backtest()，不重新下載。
+
+⚠️ 時間差修正：預設每個訊號都用「三大法人+美股濾網都錯開(真正能實測)」的版本
+（use_prior_day_chip_data=True, use_prior_day_us_market_data=True），也就是
+只用T-1日已知的資料，跟cross_period_validation.py裡唯一能拿去實盤判讀的版本
+一致。這是為了避免重蹈覆轍：如果拆解單一訊號時還是用「完全T日當天(舊版，不可能
+實測)」在挑訊號，挑出來的「有效訊號」本身就可能只是偷看了收盤後才公布的三大法人
+資料或晚上才開盤的美股資料，跨期驗證時一樣會現形、白做工。
+如果想比較兩種時間假設差多少（僅供除錯/對照，不建議拿legacy版本的結果去挑訊號），
+可以加 --legacy-timing 改回舊版T日當天資料。
 """
 
 import argparse
@@ -38,8 +47,15 @@ SIGNAL_LABELS = {
 }
 
 
-def run_ablation(pipeline_inputs, is_ratio=IS_RATIO, top_n=5):
-    """對 SIGNAL_LABELS 裡每一個訊號，單獨開啟後在IS跑一次回測，回傳結果 DataFrame。"""
+def run_ablation(pipeline_inputs, is_ratio=IS_RATIO, top_n=5,
+                  use_prior_day_chip_data=True, use_prior_day_us_market_data=True):
+    """對 SIGNAL_LABELS 裡每一個訊號，單獨開啟後在IS跑一次回測，回傳結果 DataFrame。
+
+    use_prior_day_chip_data / use_prior_day_us_market_data：預設都是True，也就是
+    只用T-1日已知的三大法人/美股資料（跟cross_period_validation.py裡唯一能實測的
+    版本一致）。設False的話會改用T日當天資料(舊版，不可能實測)，僅供除錯/對照用，
+    不建議拿這個版本的結果去挑訊號——挑出來的「有效訊號」可能只是偷看了未來資料。
+    """
     is_days, oos_days = split_is_oos(pipeline_inputs["trading_days"], is_ratio)
 
     common_args = dict(
@@ -53,6 +69,8 @@ def run_ablation(pipeline_inputs, is_ratio=IS_RATIO, top_n=5):
         ex_dividend_dates_by_code=pipeline_inputs.get("ex_dividend_dates_by_code"),
         trading_days=is_days,
         top_n=top_n,
+        use_prior_day_chip_data=use_prior_day_chip_data,
+        use_prior_day_us_market_data=use_prior_day_us_market_data,
     )
 
     rows = []
@@ -111,18 +129,33 @@ def main():
     parser.add_argument("--end", required=True, help="YYYY-MM-DD")
     parser.add_argument("--top-n", type=int, default=5)
     parser.add_argument("--refresh", action="store_true", help="忽略快取，強制重新下載所有資料")
+    parser.add_argument("--legacy-timing", action="store_true",
+                         help="改用T日當天資料(舊版，不可能實測)，僅供除錯/對照用，"
+                              "不建議拿這個版本的結果去挑訊號")
     args = parser.parse_args()
 
     start_date = datetime.datetime.strptime(args.start, "%Y-%m-%d").date()
     end_date = datetime.datetime.strptime(args.end, "%Y-%m-%d").date()
+
+    use_realistic_timing = not args.legacy_timing
 
     print(f"載入資料 ({args.start} ~ {args.end})，若快取已存在會直接使用，不重新下載 ...")
     pipeline_inputs = build_pipeline_inputs(
         data_loader.STOCK_FUTURES_WHITELIST, start_date, end_date, refresh=args.refresh,
     )
 
+    if use_realistic_timing:
+        print("\n時間差修正：三大法人+美股濾網都錯開(真正能實測) —— 只用T-1日已知的資料。")
+    else:
+        print("\n⚠️ 時間差修正：已停用(--legacy-timing)，用的是T日當天資料(舊版，不可能實測)，"
+              "結果僅供對照，不代表能實盤。")
+
     print(f"\n開始單一訊號拆解測試（只在IS, 前70%）...\n")
-    result_df = run_ablation(pipeline_inputs, top_n=args.top_n)
+    result_df = run_ablation(
+        pipeline_inputs, top_n=args.top_n,
+        use_prior_day_chip_data=use_realistic_timing,
+        use_prior_day_us_market_data=use_realistic_timing,
+    )
 
     ranked = rank_results(result_df)
     print(f"\n=== 依 profit_factor 排名 ===")

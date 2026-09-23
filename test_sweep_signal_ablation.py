@@ -144,6 +144,57 @@ class TestRunAblation(unittest.TestCase):
             self.assertTrue(set(days_used).isdisjoint(set(expected_oos)))
 
 
+class TestRunAblationTiming(unittest.TestCase):
+    """確認 run_ablation() 預設用「真正能實測」的時間差修正，不是舊版T日當天資料，
+    且能正確切回舊版供對照用。"""
+
+    def setUp(self):
+        self.pipeline_inputs = make_pipeline_inputs()
+
+    def test_defaults_to_realistic_timing(self):
+        captured = []
+        real_run = ome.run_overnight_backtest
+
+        def spy_run_overnight_backtest(**kwargs):
+            captured.append((kwargs["use_prior_day_chip_data"],
+                              kwargs["use_prior_day_us_market_data"]))
+            return real_run(**kwargs)
+
+        ome.run_overnight_backtest = spy_run_overnight_backtest
+        try:
+            ablation.run_ablation(self.pipeline_inputs, top_n=2)
+        finally:
+            ome.run_overnight_backtest = real_run
+
+        # 8個訊號 + 1個基準列，全部都應該是 (True, True)
+        self.assertEqual(len(captured), len(ablation.SIGNAL_LABELS) + 1)
+        for use_chip_lag, use_us_lag in captured:
+            self.assertTrue(use_chip_lag)
+            self.assertTrue(use_us_lag)
+
+    def test_legacy_timing_flag_disables_offset(self):
+        captured = []
+        real_run = ome.run_overnight_backtest
+
+        def spy_run_overnight_backtest(**kwargs):
+            captured.append((kwargs["use_prior_day_chip_data"],
+                              kwargs["use_prior_day_us_market_data"]))
+            return real_run(**kwargs)
+
+        ome.run_overnight_backtest = spy_run_overnight_backtest
+        try:
+            ablation.run_ablation(
+                self.pipeline_inputs, top_n=2,
+                use_prior_day_chip_data=False, use_prior_day_us_market_data=False,
+            )
+        finally:
+            ome.run_overnight_backtest = real_run
+
+        for use_chip_lag, use_us_lag in captured:
+            self.assertFalse(use_chip_lag)
+            self.assertFalse(use_us_lag)
+
+
 class TestRankResults(unittest.TestCase):
     def test_filters_low_trade_count_and_sorts_by_pf(self):
         df = pd.DataFrame([
