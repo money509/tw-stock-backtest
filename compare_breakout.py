@@ -31,6 +31,25 @@ compare_breakout.py
    跟部位大小怎麼配是兩件事，混在一起篩選反而讓比較不是蘋果比蘋果)。
 6. **多部位並行(--max-concurrent-positions)**：允許同時持有多檔不同標的的部位，
    不再是「一次只能一個部位、資金大部分時間閒置」。同樣只套用在最終驗證階段。
+7. **進場時機本身的診斷/優化(這一輪新增，回應「出場已經測過、規模穩健性也測過，
+   問題可能出在進場」的判斷)**：
+   a. **突破窗口比較(新增的「階段0」)**：原本固定用「20日創新高」當結構門檻，
+      這次額外比較5日(提早進場)、60日(季線級別)、250日(年線級別，約52週新高)
+      三種替代窗口，一樣只在IS內、用等權重訊號+基本門檻比較，自動選總損益最高
+      的窗口，後面所有階段(訊號拆解、門檻比較、ATR網格、最終IS/OOS驗證、跨週期
+      驗證)都改用選出的窗口，不再寫死20日。
+   b. **趨勢強度門檻(ADX)**：新增「趨勢強度(ADX>=25)」門檻變體，只在ADX(採
+      Wilder平滑的近似算法，非精確遞迴公式)達到閾值、代表確實在趨勢中時才放行，
+      過濾掉盤整雜訊造成的假突破。
+   c. **波動收縮後突破門檻**：新增「波動收縮後突破」門檻變體，只在近期波動度
+      (10日平均ATR%)相對前期(20日平均ATR%)明顯收縮(比值<=0.85)時才放行，
+      嘗試抓「盤整蓄積後才噴出」比隨機一天創新高更可信的型態。這兩個門檻會
+      自動併入既有的門檻比較(階段2)一起排名，不需要額外的CLI參數。
+   本輪明確**沒有**動的(留給下一輪，因為需要把預先計算好的指標值一路傳進
+   共用的逐日出場處理函式，目前那些函式只看得到原始OHLCV)：均線動態停利、
+   Chandelier停利錨點(用高/低點而非收盤價)、拉回測試型進場(狀態機式，跟現在
+   單日掃描+進場的架構不同)、類股輪動/市場廣度濾網(需要新的資料來源)、
+   分批加碼/減碼。
 
 用法：
     python3 compare_breakout.py --start 2023-09-15 --end 2026-09-14 --max-stocks 50
@@ -88,8 +107,20 @@ GATE_VARIANTS = [
     ("+均線多頭排列", {"require_ma_bullish_alignment": True}),
     ("+爆量(量比>=1.5)", {"min_volume_ratio": 1.5}),
     ("+雙法人同步買超", {"require_dual_institutional_buy": True}),
+    ("+趨勢強度(ADX>=25)", {"min_adx": 25.0}),
+    ("+波動收縮後突破", {"require_vol_contraction": True}),
 ]
 GATE_KWARGS_BY_LABEL = dict(GATE_VARIANTS)
+
+# 突破窗口比較：算「有沒有突破」用哪個窗口的前高/前低。20日是原本的設定，
+# 其他窗口用來回答「20日創新高這個進場時點是不是太晚/太早」這個問題——
+# 5日窗口進場更早、60日/250日(約季線/年線)窗口進場更晚但濾掉更多雜訊。
+BREAKOUT_WINDOW_VARIANTS = [
+    ("5日創新高(提早進場)", 5),
+    ("20日創新高(原本設定)", 20),
+    ("60日創新高(季線級別)", 60),
+    ("52週創新高(年線級別)", 250),
+]
 
 # 移動停利模式下的ATR倍數敏感度網格：(初始停損倍數, 移動停利倍數)。
 # 刻意只有6組、只在IS內搜尋，避免搜索空間太大又製造新的多重比較問題。
@@ -151,6 +182,47 @@ def select_winning_gate(gate_df, min_trades=MIN_TRADES_FOR_GATE_RANKING):
     best_row = reliable.sort_values("total_pnl_ntd", ascending=False).iloc[0]
     label = best_row["gate"]
     return label, GATE_KWARGS_BY_LABEL[label]
+
+
+def select_winning_breakout_window(window_df, min_trades=MIN_TRADES_FOR_GATE_RANKING):
+    """從突破窗口比較結果裡，挑總損益最高、且交易筆數不會太少的那個窗口。"""
+    pool = _prefer_nonzero_trades(window_df)
+    reliable = pool[pool["trade_count"] >= min_trades]
+    if reliable.empty:
+        reliable = pool
+    if reliable.empty:
+        return BREAKOUT_WINDOW_VARIANTS[1]  # 找不到任何可用結果時，退回原本的20日設定
+    best_row = reliable.sort_values("total_pnl_ntd", ascending=False).iloc[0]
+    return best_row["window_label"], int(best_row["breakout_window"])
+
+
+def run_breakout_window_comparison(price_data, indicators_by_code, regime_series, is_calendar,
+                                    starting_capital, hold_days, all_signal_names, extra_kwargs=None):
+    """用全部訊號等權重+基本門檻當基準，只換突破窗口(5/20/60/250日)，測哪個進場時點
+    比較好。刻意用最單純的訊號/門檻設定，先回答「進場時點本身」這一個變數的問題，
+    不跟訊號/門檻篩選的結果交互影響——選出來的窗口會固定下來，之後的訊號拆解、
+    門檻比較、ATR網格、最終驗證都套用這個窗口，不會針對每個窗口重跑一次完整流程
+    (那樣運算量會爆炸，也會製造更嚴重的多重比較問題)。這是一個簡化假設：不同窗口
+    下最有效的訊號/門檻組合理論上可能不同，這裡沒有各自重新篩選，見README的誠實揭露。"""
+    extra_kwargs = extra_kwargs or {}
+    rows = []
+    equal_weights = {name: 1.0 for name in all_signal_names}
+    for label, window in BREAKOUT_WINDOW_VARIANTS:
+        trades = run_momentum_breakout_backtest(
+            price_data=price_data, indicators_by_code=indicators_by_code, regime_series=regime_series,
+            master_calendar=is_calendar, max_hold_days=hold_days, starting_capital=starting_capital,
+            allow_short=True, lots=2, atr_stop_mult=1.0, atr_target_mult=2.0,
+            signal_weights=equal_weights, breakout_window=window, **extra_kwargs,
+        )
+        stats = summarize_mr(trades, starting_capital)
+        rows.append({
+            "window_label": label, "breakout_window": window,
+            "trade_count": stats["trade_count"], "profit_factor": stats["profit_factor"],
+            "total_pnl_ntd": stats["total_pnl_ntd"], "win_rate": stats["win_rate"],
+        })
+        print(f"  {label} -> {stats['trade_count']}筆, PF={_fmt_pf(stats['profit_factor'])}, "
+              f"勝率={stats['win_rate']:.1f}%, 損益={stats['total_pnl_ntd']:,.0f}", flush=True)
+    return pd.DataFrame(rows)
 
 
 def run_signal_ablation(price_data, indicators_by_code, regime_series, is_calendar,
@@ -464,13 +536,29 @@ def main():
     all_multi_period = {}
     signal_reliable_flags = {}
 
+    all_breakout_window = {}
+    signal_names_for_window = [s for s in BREAKOUT_SIGNAL_NAMES
+                                if args.with_chip_confirm or s not in CHIP_DEPENDENT_SIGNALS]
+
     for hold_label, hold_days in hold_days_options:
         print(f"=== {hold_label} ===")
+
+        print("[階段0] 突破窗口比較 (5/20/60/250日創新高，只在IS內，等權重訊號+基本門檻) ...")
+        window_df = run_breakout_window_comparison(
+            price_data, indicators_by_code, regime_series, is_calendar,
+            args.starting_capital, hold_days, signal_names_for_window, extra_kwargs=extra_kwargs,
+        )
+        all_breakout_window[hold_label] = window_df
+        window_df.to_csv(os.path.join(RESULTS_DIR, f"breakout_window_{hold_label}.csv"),
+                          index=False, encoding="utf-8-sig")
+        window_label, winning_window = select_winning_breakout_window(window_df)
+        print(f"  → 選出突破窗口：{window_label}\n")
+        window_extra_kwargs = dict(extra_kwargs, breakout_window=winning_window)
 
         print("[階段1] 單一訊號拆解 (只在IS內，基本門檻) ...")
         ablation_df, signal_names_used = run_signal_ablation(
             price_data, indicators_by_code, regime_series, is_calendar,
-            args.starting_capital, hold_days, has_chip=args.with_chip_confirm, extra_kwargs=extra_kwargs,
+            args.starting_capital, hold_days, has_chip=args.with_chip_confirm, extra_kwargs=window_extra_kwargs,
         )
         all_ablation[hold_label] = ablation_df
         ablation_df.to_csv(os.path.join(RESULTS_DIR, f"ablation_{hold_label}.csv"),
@@ -480,7 +568,7 @@ def main():
         gate_df = run_gate_comparison(
             price_data, indicators_by_code, regime_series, is_calendar,
             args.starting_capital, hold_days, signal_names_used, has_chip=args.with_chip_confirm,
-            extra_kwargs=extra_kwargs,
+            extra_kwargs=window_extra_kwargs,
         )
         all_gate_comparison[hold_label] = gate_df
         gate_df.to_csv(os.path.join(RESULTS_DIR, f"gate_comparison_{hold_label}.csv"),
@@ -499,7 +587,7 @@ def main():
             print(f"\n[階段2.5] ATR倍數敏感度網格(只在IS內，用上面選出的最佳訊號/門檻組合) ...")
             atr_grid_df, (atr_stop_mult, trailing_atr_mult) = run_atr_sensitivity_grid(
                 price_data, indicators_by_code, regime_series, is_calendar,
-                args.starting_capital, winning_signal_weights, winning_gate_kwargs, extra_kwargs,
+                args.starting_capital, winning_signal_weights, winning_gate_kwargs, window_extra_kwargs,
             )
             all_atr_grid[hold_label] = atr_grid_df
             print(f"  → 選出：初始停損x{atr_stop_mult}, 移動停利x{trailing_atr_mult}")
@@ -509,14 +597,14 @@ def main():
         naive_result = evaluate_combo(
             "對照組(全部訊號等權重+基本門檻)", price_data, indicators_by_code, regime_series,
             is_calendar, oos_calendar, args.starting_capital, hold_days, naive_weights, {},
-            args.atr_stop_mult, args.trailing_atr_mult, args.use_trailing_stop, extra_kwargs,
+            args.atr_stop_mult, args.trailing_atr_mult, args.use_trailing_stop, window_extra_kwargs,
             {"lots": 2, "max_concurrent_positions": 1},
         )
         winning_result = evaluate_combo(
-            f"最佳組合(訊號={winning_gate_label})", price_data, indicators_by_code, regime_series,
-            is_calendar, oos_calendar, args.starting_capital, hold_days, winning_signal_weights,
+            f"最佳組合(訊號={winning_gate_label}, 突破窗口={window_label})", price_data, indicators_by_code,
+            regime_series, is_calendar, oos_calendar, args.starting_capital, hold_days, winning_signal_weights,
             winning_gate_kwargs, atr_stop_mult, trailing_atr_mult, args.use_trailing_stop,
-            extra_kwargs, execution_kwargs,
+            window_extra_kwargs, execution_kwargs,
         )
         all_combo_results[hold_label] = {"對照組": naive_result, "最佳組合": winning_result}
 
@@ -540,7 +628,7 @@ def main():
             all_multi_period[hold_label] = run_multi_period_validation(
                 universe, INDEX_PROXY_CODE, winning_signal_weights, winning_gate_kwargs,
                 atr_stop_mult, trailing_atr_mult, args.use_trailing_stop, hold_days,
-                args.starting_capital, extra_kwargs, execution_kwargs, chip_data, args.refresh,
+                args.starting_capital, window_extra_kwargs, execution_kwargs, chip_data, args.refresh,
             )
 
     summary_lines = [
@@ -555,6 +643,17 @@ def main():
         "=" * 100,
     ]
     for hold_label, _ in hold_days_options:
+        summary_lines.append(f"\n--- {hold_label} / 突破窗口比較(IS，等權重訊號+基本門檻) ---")
+        window_df = all_breakout_window[hold_label].sort_values("total_pnl_ntd", ascending=False)
+        header0 = f"{'突破窗口':<24}{'交易數':>8}{'PF':>8}{'勝率%':>8}{'總損益NT$':>14}"
+        summary_lines.append(header0)
+        summary_lines.append("-" * len(header0))
+        for _, r in window_df.iterrows():
+            summary_lines.append(
+                f"{r['window_label']:<24}{r['trade_count']:>8}{_fmt_pf(r['profit_factor']):>8}"
+                f"{r['win_rate']:>8.1f}{r['total_pnl_ntd']:>14,.0f}"
+            )
+
         summary_lines.append(f"\n--- {hold_label} / 單一訊號拆解(IS，基本門檻) ---")
         ablation_df = all_ablation[hold_label]
         reliable = ablation_df[ablation_df["trade_count"] >= MIN_TRADES_FOR_RANKING]
@@ -633,6 +732,11 @@ def main():
         "p值(越接近0代表優勢在不同交易順序下都站得住，超過0.2以上不該當作已驗證的優勢)。"
         "如果有跑跨市場週期驗證，最後看PF/bootstrap正報酬比例是不是一到2022年修正段/盤整段就"
         "明顯轉差——如果是，代表這組優勢比較接近「牛市beta」，不是在任何市況都成立的右側交易優勢。"
+        "\n\n新增的「突破窗口比較」是在測試進場時機本身：原本固定用20日創新高當進場門檻，"
+        "可能買在短線衝高、快要拉回的位置，而不是真正的趨勢起漲點；改比較5/20/60/250日窗口，"
+        "看換一個進場時機是不是能改善績效。門檻變體裡新增的「趨勢強度(ADX)」「波動收縮後突破」"
+        "則是分別測試「只在真的有趨勢時才進場」跟「只在盤整蓄積後才進場」這兩種篩選能不能提高"
+        "進場品質，篩掉單純雜訊造成的假突破。"
     )
 
     summary_text = "\n".join(summary_lines)

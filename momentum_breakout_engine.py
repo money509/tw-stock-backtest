@@ -77,14 +77,56 @@ def compute_institutional_ratio(chip_df: pd.DataFrame, price_df: pd.DataFrame, n
     return amount / turnover_value
 
 
+def compute_adx(df: pd.DataFrame, period: int = 14) -> pd.Series:
+    """
+    ADX(平均趨向指標)，用來過濾「真正有趨勢」跟「盤整區間反覆假突破」的環境——
+    只有ADX夠高，代表現在是有方向性的行情，這時候的突破訊號才比較可信；ADX低的時候，
+    「創新高」很可能只是盤整區間裡的雜訊。
+
+    這裡用ewm(alpha=1/period)做Wilder平滑的近似實作，不是Wilder原始公式逐日遞迴的
+    寫法，但ewm(alpha=1/period, adjust=False)在數學上等價於Wilder平滑的極限行為，
+    業界常見的近似做法，跟嚴格照抄教科書遞迴公式的差異在最初幾筆會有些微落差，
+    對回測用途影響可以忽略。
+    """
+    high, low, close = df["High"], df["Low"], df["Close"]
+    prev_close = close.shift(1)
+    tr = pd.concat([high - low, (high - prev_close).abs(), (low - prev_close).abs()], axis=1).max(axis=1)
+
+    up_move = high.diff()
+    down_move = -low.diff()
+    plus_dm = up_move.where((up_move > down_move) & (up_move > 0), 0.0)
+    minus_dm = down_move.where((down_move > up_move) & (down_move > 0), 0.0)
+
+    atr_wilder = tr.ewm(alpha=1 / period, adjust=False).mean()
+    plus_di = 100 * plus_dm.ewm(alpha=1 / period, adjust=False).mean() / atr_wilder.replace(0, np.nan)
+    minus_di = 100 * minus_dm.ewm(alpha=1 / period, adjust=False).mean() / atr_wilder.replace(0, np.nan)
+    dx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan)
+    adx = dx.ewm(alpha=1 / period, adjust=False).mean()
+    return adx
+
+
 def precompute_breakout_indicators(df: pd.DataFrame, index_close: pd.Series, chip_df: pd.DataFrame = None,
                                     breakout_lookback: int = 20, rel_strength_window: int = 5,
                                     golden_cross_lookback: int = 3, gap_lookback: int = 5,
-                                    gap_threshold: float = 0.02, candle_lookback: int = 3) -> pd.DataFrame:
+                                    gap_threshold: float = 0.02, candle_lookback: int = 3,
+                                    extra_breakout_windows: tuple = (5, 60, 250),
+                                    vol_contraction_short: int = 10, vol_contraction_prior: int = 20) -> pd.DataFrame:
     """
     針對一檔股票的完整價格序列，一次算好突破策略需要的全部指標(技術面10個訊號用得到的欄位 +
     結構性門檻用得到的欄位)。所有rolling/shift計算在完整序列上一次算好，跟均值回歸引擎的
     precompute_indicators()同樣精神：day-by-day迴圈之後只是查表，不重複計算。
+
+    extra_breakout_windows：除了原本的breakout_lookback(預設20日，存在"RollingHigh"/
+    "RollingLow"欄位)，額外多算幾組不同窗口的前高/前低("RollingHigh_5"、"RollingHigh_60"、
+    "RollingHigh_250"...)，讓scan_momentum_breakout_candidates()可以選擇用哪個窗口當
+    「算不算突破」的基本門檻——這是為了回答「20日創新高這個進場時點是不是太晚」的問題：
+    5日窗口進場更早、250日(約年線)窗口進場更晚但濾掉更多雜訊，都是同一組股價資料上
+    可以直接算出來的候選比較對象，不需要另外抓資料。
+
+    vol_contraction_short/vol_contraction_prior：波動收縮比率用的兩個窗口——
+    「近vol_contraction_short天的平均波動度」跟「再往前vol_contraction_prior天的平均波動度」
+    的比值，比值明顯小於1代表波動剛收縮完，通常對應盤整、籌碼沉澱的階段，此時如果接著突破，
+    比「隨便哪天」的突破更可信(不是每天都在噴出雜訊的股票，剛好那天噴了一根)。
     """
     close = df["Close"]
     open_ = df["Open"]
@@ -106,6 +148,20 @@ def precompute_breakout_indicators(df: pd.DataFrame, index_close: pd.Series, chi
     rolling_high = close.rolling(breakout_lookback).max().shift(1)
     rolling_low = close.rolling(breakout_lookback).min().shift(1)
     rolling_vol_high = volume.rolling(breakout_lookback).max().shift(1)
+
+    extra_rolling_cols = {}
+    for w in extra_breakout_windows:
+        extra_rolling_cols[f"RollingHigh_{w}"] = close.rolling(w).max().shift(1)
+        extra_rolling_cols[f"RollingLow_{w}"] = close.rolling(w).min().shift(1)
+
+    adx = compute_adx(df)
+
+    # 波動收縮比率：近vol_contraction_short天的平均ATR% ÷ 再往前vol_contraction_prior天
+    # 的平均ATR%，明顯小於1代表波動剛收縮完，這時候的突破比隨便哪天都噴量的雜訊更可信。
+    atr_pct = compute_atr_correct(df) / close.replace(0, np.nan)
+    atr_pct_recent = atr_pct.rolling(vol_contraction_short).mean()
+    atr_pct_prior = atr_pct.shift(vol_contraction_short).rolling(vol_contraction_prior).mean()
+    vol_contraction_ratio = atr_pct_recent / atr_pct_prior.replace(0, np.nan)
 
     _, _, macd_hist = compute_macd(close)
 
@@ -155,6 +211,8 @@ def precompute_breakout_indicators(df: pd.DataFrame, index_close: pd.Series, chi
         "PriceVolNewHighLong": price_vol_new_high_long, "PriceVolNewHighShort": price_vol_new_high_short,
         "GapUpFlag": gap_up_flag, "GapDownFlag": gap_down_flag,
         "BullishCandleScore": bullish_candle_score, "BearishCandleScore": bearish_candle_score,
+        "ADX": adx, "VolContractionRatio": vol_contraction_ratio,
+        **extra_rolling_cols,
     }, index=df.index)
 
     if chip_df is not None:
@@ -248,9 +306,11 @@ def scan_momentum_breakout_candidates(indicators_by_code: dict, as_of_date, regi
                                        require_ma_bullish_alignment: bool = False,
                                        require_dual_institutional_buy: bool = False,
                                        min_volume_ratio: float = 0.0,
-                                       ex_dividend_dates_by_code: dict = None) -> list:
+                                       ex_dividend_dates_by_code: dict = None,
+                                       breakout_window: int = 20, min_adx: float = 0.0,
+                                       require_vol_contraction: bool = False) -> list:
     """
-    掃描全市場候選標的：先套結構性突破門檻(基本門檻永遠套用，其餘4個額外門檻可選)，
+    掃描全市場候選標的：先套結構性突破門檻(基本門檻永遠套用，其餘6個額外門檻可選)，
     通過門檻的候選再依加權分數排名，回傳前top_n名多方候選 + 前top_n名空方候選。
     regime == 'bull' 時停用空方訊號；regime == 'bear' 時停用多方訊號；'neutral' 兩者都放行。
     allow_short=False 時，不管regime是什麼，永遠不產生空方候選。
@@ -264,9 +324,24 @@ def scan_momentum_breakout_candidates(indicators_by_code: dict, as_of_date, regi
     如果那一天剛好是除權息日，股價會因為配股配息機械性跳空，量比/相對大盤強弱/突破前高
     這些訊號會被這個假跳空污染(不是真的動能轉強或轉弱)，所以這裡直接把那天當候選來源的
     股票跳過，不是修正股價，因為修正股價會讓進出場價位跟真實報價脫節。
+
+    breakout_window：算「有沒有突破」用哪個窗口的前高/前低，預設20日(對應"RollingHigh"/
+    "RollingLow"欄位)。給5/60/250之類的值時，改讀"RollingHigh_{breakout_window}"/
+    "RollingLow_{breakout_window}"(需要precompute_breakout_indicators()的
+    extra_breakout_windows有算過這個窗口，預設已包含5/60/250)——用來測試「20日創新高
+    這個進場時點是不是太晚/太早」。
+
+    min_adx：ADX(平均趨向指標)門檻，要求進場當下的趨勢強度夠高，過濾掉盤整區間反覆假突破
+    的雜訊。0代表不套用這個門檻。
+
+    require_vol_contraction：要求近期波動度明顯低於前一段時期(波動收縮比率<=0.85)才算
+    候選，抓「盤整、籌碼沉澱後才發動」的突破，過濾「隨便哪天都在噴量」的雜訊股。
     """
     if signal_weights is None:
         signal_weights = {name: 1.0 for name in BREAKOUT_SIGNAL_NAMES}
+
+    high_col = "RollingHigh" if breakout_window == 20 else f"RollingHigh_{breakout_window}"
+    low_col = "RollingLow" if breakout_window == 20 else f"RollingLow_{breakout_window}"
 
     long_rows, short_rows = [], []
 
@@ -285,8 +360,8 @@ def scan_momentum_breakout_candidates(indicators_by_code: dict, as_of_date, regi
         close = row["Close"]
         ma20 = row["MA20"]
         atr = row["ATR"]
-        rolling_high = row["RollingHigh"]
-        rolling_low = row["RollingLow"]
+        rolling_high = row[high_col]
+        rolling_low = row[low_col]
 
         if pd.isna(ma20) or pd.isna(atr) or atr <= 0 or pd.isna(rolling_high) or pd.isna(rolling_low):
             continue
@@ -294,6 +369,16 @@ def scan_momentum_breakout_candidates(indicators_by_code: dict, as_of_date, regi
         if min_volume_ratio > 0:
             vr = row["VolumeRatio"]
             if pd.isna(vr) or vr < min_volume_ratio:
+                continue
+
+        if min_adx > 0:
+            adx_val = row["ADX"]
+            if pd.isna(adx_val) or adx_val < min_adx:
+                continue
+
+        if require_vol_contraction:
+            vcr = row["VolContractionRatio"]
+            if pd.isna(vcr) or vcr > 0.85:
                 continue
 
         base = {
@@ -450,7 +535,9 @@ def run_momentum_breakout_backtest(price_data: dict, indicators_by_code: dict, r
                                     use_trailing_stop: bool = False, trailing_atr_mult: float = None,
                                     slippage_pct: float = 0.0, max_concurrent_positions: int = 1,
                                     total_margin_cap_ratio: float = None,
-                                    risk_pct_per_trade: float = None):
+                                    risk_pct_per_trade: float = None,
+                                    breakout_window: int = 20, min_adx: float = 0.0,
+                                    require_vol_contraction: bool = False):
     """
     完整 day-by-day walk-forward 模擬。出場判定/強制平倉/停損冷卻期，重用
     mean_reversion_engine._process_mr_day()，跟均值回歸引擎共用同一套出場機制，
@@ -518,6 +605,8 @@ def run_momentum_breakout_backtest(price_data: dict, indicators_by_code: dict, r
                 require_dual_institutional_buy=require_dual_institutional_buy,
                 min_volume_ratio=min_volume_ratio,
                 ex_dividend_dates_by_code=ex_dividend_dates_by_code,
+                breakout_window=breakout_window, min_adx=min_adx,
+                require_vol_contraction=require_vol_contraction,
             )
 
             while slots_available > 0 and candidates:
