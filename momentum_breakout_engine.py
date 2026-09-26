@@ -432,7 +432,9 @@ def try_enter_breakout(price_data: dict, candidates: list, entry_date, starting_
                         use_trailing_stop: bool = False, trailing_atr_mult: float = None,
                         slippage_pct: float = 0.0, used_margin: float = 0.0,
                         total_margin_cap_ratio: float = None,
-                        risk_pct_per_trade: float = None, account_equity: float = None):
+                        risk_pct_per_trade: float = None, account_equity: float = None,
+                        max_gap_pct: float = None,
+                        trailing_activation_days: int = 0, trailing_activation_profit_atr: float = 0.0):
     """
     依序檢查候選名單(已跳空風控+保證金上限過濾)，第一個通過的進場。
     跟均值回歸引擎的跳空風控方向一致：不管多空，方向不利的跳空超過0.5%就放棄
@@ -459,6 +461,17 @@ def try_enter_breakout(price_data: dict, candidates: list, entry_date, starting_
     算出來口數 < 1 時直接放棄這個候選(風險預算連1口都不夠，不該硬凹進場放大風險)。
     帳戶權益(account_equity)沒給時退回用starting_capital，讓現有呼叫方式(固定口數)
     完全不受影響。
+
+    max_gap_pct：開盤跳空幅度的「上限」濾網(跟前面的-0.5%下限方向相反)，多單如果
+    開盤跳空超過這個正值就放棄進場，用意是避免追在隔日沖主力已經拉高、獲利空間被
+    追價盤吃乾抹淨的位置。None(預設)代表不檢查上限，維持舊版行為完全不變。
+
+    trailing_activation_days/trailing_activation_profit_atr：移動停利延遲啟動，
+    在進場後的前幾天(或還沒累積到一定倍數的ATR獲利之前)只用進場當下設定的固定
+    初始停損防守，不提前啟動移動停利，避免「進場後正常的健康拉回」被貼太緊的
+    移動停利提前洗出場、魚身都還沒吃到就出局。兩者都預設0，代表進場當天(第1天)
+    就立即啟動移動停利，維持舊版行為完全不變(見mean_reversion_engine._process_mr_day
+    的啟動判斷)。
     """
     for cand in candidates:
         code = cand["code"]
@@ -475,6 +488,11 @@ def try_enter_breakout(price_data: dict, candidates: list, entry_date, starting_
             continue
         if cand["side"] == "short" and gap_pct >= 0.005:
             continue
+        if max_gap_pct is not None:
+            if cand["side"] == "long" and gap_pct > max_gap_pct:
+                continue
+            if cand["side"] == "short" and gap_pct < -max_gap_pct:
+                continue
 
         atr = cand["atr"]
         side = cand["side"]
@@ -518,6 +536,8 @@ def try_enter_breakout(price_data: dict, candidates: list, entry_date, starting_
             position["trailing_atr_mult"] = trailing_atr_mult if trailing_atr_mult is not None else atr_stop_mult
             position["atr_entry"] = atr
             position["trailing_anchor"] = e_price
+            position["trailing_activation_days"] = trailing_activation_days
+            position["trailing_activation_profit_atr"] = trailing_activation_profit_atr
         return position
     return None
 
@@ -537,7 +557,10 @@ def run_momentum_breakout_backtest(price_data: dict, indicators_by_code: dict, r
                                     total_margin_cap_ratio: float = None,
                                     risk_pct_per_trade: float = None,
                                     breakout_window: int = 20, min_adx: float = 0.0,
-                                    require_vol_contraction: bool = False):
+                                    require_vol_contraction: bool = False,
+                                    max_gap_pct: float = None,
+                                    trailing_activation_days: int = 0,
+                                    trailing_activation_profit_atr: float = 0.0):
     """
     完整 day-by-day walk-forward 模擬。出場判定/強制平倉/停損冷卻期，重用
     mean_reversion_engine._process_mr_day()，跟均值回歸引擎共用同一套出場機制，
@@ -617,6 +640,9 @@ def run_momentum_breakout_backtest(price_data: dict, indicators_by_code: dict, r
                     slippage_pct=slippage_pct, used_margin=used_margin,
                     total_margin_cap_ratio=effective_total_margin_cap_ratio,
                     risk_pct_per_trade=risk_pct_per_trade, account_equity=equity,
+                    max_gap_pct=max_gap_pct,
+                    trailing_activation_days=trailing_activation_days,
+                    trailing_activation_profit_atr=trailing_activation_profit_atr,
                 )
                 if new_position is None:
                     break

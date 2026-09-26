@@ -50,6 +50,17 @@ compare_breakout.py
    Chandelier停利錨點(用高/低點而非收盤價)、拉回測試型進場(狀態機式，跟現在
    單日掃描+進場的架構不同)、類股輪動/市場廣度濾網(需要新的資料來源)、
    分批加碼/減碼。
+8. **「只吃魚身」出場配置比較(僅移動停利模式，新增的「階段2.6」)**：回應
+   「不追求抱到魚頭魚尾，只要主升段那幾天、不要拖太久」的交易哲學，在ATR倍數
+   固定之後，額外測試(a)持有天數上限(`max_hold_days_override`)、(b)移動停利
+   延遲啟動(`trailing_activation_days`/`trailing_activation_profit_atr`，進場後
+   前幾天或還沒累積一定倍數ATR獲利之前，只用進場當下的固定初始停損，不提前啟動
+   移動停利，避免健康拉回被貼太緊的移動停利提早洗出場)、(c)開盤跳空上限
+   (`max_gap_pct`，避免追在隔日沖已經拉高、獲利空間被追價盤吃乾抹淨的位置，跟
+   原本就有的跳空下限方向相反)這幾種配置的排列組合，自動選總損益最高的一組，
+   套用在最終驗證的「最佳組合」(對照組不受影響，維持原本的固定天數+立即啟動)。
+   `summarize_mr()`同時新增`avg_hold_days`(平均持有天數)這個統計量，用來檢查
+   選出的配置有沒有真的抓到預期的短波段長度，不是憑感覺猜參數。
 
 用法：
     python3 compare_breakout.py --start 2023-09-15 --end 2026-09-14 --max-stocks 50
@@ -125,6 +136,30 @@ BREAKOUT_WINDOW_VARIANTS = [
 # 移動停利模式下的ATR倍數敏感度網格：(初始停損倍數, 移動停利倍數)。
 # 刻意只有6組、只在IS內搜尋，避免搜索空間太大又製造新的多重比較問題。
 ATR_SENSITIVITY_GRID = [(0.8, 1.0), (1.0, 1.0), (1.0, 1.5), (1.5, 1.5), (1.5, 2.0), (0.8, 1.5)]
+
+MIN_TRADES_FOR_EXIT_STYLE_RANKING = 10
+
+# 「只吃魚身」出場配置比較(僅移動停利模式使用)：在ATR倍數固定之後，額外測試
+# 持有天數上限、移動停利延遲啟動、開盤跳空上限這幾個「進出場配置」的組合，
+# 目的是縮短平均持有天數、避免抱到魚尾、也避免進場後健康拉回被貼太緊的移動停利
+# 提早洗出場。每個變體的kwargs鍵：
+#   max_hold_days_override：不給代表沿用TRAILING_STOP_MAX_HOLD_DAYS(不限天數)
+#   trailing_activation_days/trailing_activation_profit_atr：移動停利延遲啟動的
+#     天數/獲利ATR倍數門檻，兩者任一達成就啟動(見mean_reversion_engine的判斷)
+#   max_gap_pct：開盤跳空幅度上限，超過就放棄進場(避免追在隔日沖已經拉高的位置)
+EXIT_STYLE_VARIANTS = [
+    ("現行(不限天數/移動停利立即啟動)", {}),
+    ("10天強制出場", {"max_hold_days_override": 10}),
+    ("移動停利延遲啟動(2天或獲利1.5ATR)", {"trailing_activation_days": 2, "trailing_activation_profit_atr": 1.5}),
+    ("10天出場+延遲啟動", {
+        "max_hold_days_override": 10, "trailing_activation_days": 2, "trailing_activation_profit_atr": 1.5,
+    }),
+    ("加開盤跳空上限+2.5%", {"max_gap_pct": 0.025}),
+    ("魚身整合版(10天+延遲啟動+跳空上限)", {
+        "max_hold_days_override": 10, "trailing_activation_days": 2,
+        "trailing_activation_profit_atr": 1.5, "max_gap_pct": 0.025,
+    }),
+]
 
 # 跨市場週期驗證用的額外歷史窗口：刻意挑跟近期多頭段落明顯不同的市況，
 # 檢查最終驗證出的組合是不是只吃到牛市紅利。實際PF/bootstrap結果要看下載回來的
@@ -332,6 +367,66 @@ def run_atr_sensitivity_grid(price_data, indicators_by_code, regime_series, is_c
     return df, (float(best["atr_stop_mult"]), float(best["trailing_atr_mult"]))
 
 
+def run_exit_style_comparison(price_data, indicators_by_code, regime_series, is_calendar,
+                               starting_capital, signal_weights, gate_kwargs, atr_stop_mult, trailing_atr_mult,
+                               extra_kwargs):
+    """「只吃魚身」出場配置比較(僅移動停利模式使用)：ATR倍數固定之後，另外測試持有天數
+    上限/移動停利延遲啟動/開盤跳空上限這幾個進出場配置組合，只在IS內搜尋。額外印出
+    平均持有天數，用來檢查有沒有真的抓到預期的短波段長度，不是憑感覺猜參數。"""
+    rows = []
+    for label, style_kwargs in EXIT_STYLE_VARIANTS:
+        style_kwargs = dict(style_kwargs)
+        max_hold_days = style_kwargs.pop("max_hold_days_override", TRAILING_STOP_MAX_HOLD_DAYS)
+        trades = run_momentum_breakout_backtest(
+            price_data=price_data, indicators_by_code=indicators_by_code, regime_series=regime_series,
+            master_calendar=is_calendar, max_hold_days=max_hold_days,
+            starting_capital=starting_capital, allow_short=True, lots=2,
+            signal_weights=signal_weights, atr_stop_mult=atr_stop_mult,
+            use_trailing_stop=True, trailing_atr_mult=trailing_atr_mult,
+            **gate_kwargs, **extra_kwargs, **style_kwargs,
+        )
+        stats = summarize_mr(trades, starting_capital)
+        rows.append({
+            "exit_style": label, "max_hold_days": max_hold_days,
+            "trailing_activation_days": style_kwargs.get("trailing_activation_days", 0),
+            "trailing_activation_profit_atr": style_kwargs.get("trailing_activation_profit_atr", 0.0),
+            "max_gap_pct": style_kwargs.get("max_gap_pct"),
+            "trade_count": stats["trade_count"], "profit_factor": stats["profit_factor"],
+            "win_rate": stats["win_rate"], "total_pnl_ntd": stats["total_pnl_ntd"],
+            "avg_hold_days": stats["avg_hold_days"],
+        })
+        print(f"  {label} -> {stats['trade_count']}筆, PF={_fmt_pf(stats['profit_factor'])}, "
+              f"勝率={stats['win_rate']:.1f}%, 平均持有{stats['avg_hold_days']:.1f}天, "
+              f"損益={stats['total_pnl_ntd']:,.0f}", flush=True)
+    return pd.DataFrame(rows)
+
+
+def select_winning_exit_style(exit_style_df, min_trades=MIN_TRADES_FOR_EXIT_STYLE_RANKING):
+    """從出場配置比較結果裡，挑總損益最高、且交易筆數不會太少的那組配置，回傳
+    (label, max_hold_days, extra_kwargs)，extra_kwargs只包含trailing_activation_days/
+    trailing_activation_profit_atr/max_gap_pct這三個要餵進run_momentum_breakout_backtest
+    的鍵(None的max_gap_pct會被拿掉，避免傳一個沒意義的None覆蓋掉預設值以外的行為——
+    其實傳None結果一樣，這裡拿掉純粹讓kwargs乾淨)。"""
+    pool = _prefer_nonzero_trades(exit_style_df)
+    reliable = pool[pool["trade_count"] >= min_trades]
+    if reliable.empty:
+        reliable = pool
+    if reliable.empty:
+        best_row = None
+    else:
+        best_row = reliable.sort_values("total_pnl_ntd", ascending=False).iloc[0]
+    if best_row is None:
+        label, max_hold_days = EXIT_STYLE_VARIANTS[0][0], TRAILING_STOP_MAX_HOLD_DAYS
+        return label, max_hold_days, {}
+    extra = {
+        "trailing_activation_days": int(best_row["trailing_activation_days"]),
+        "trailing_activation_profit_atr": float(best_row["trailing_activation_profit_atr"]),
+    }
+    if pd.notna(best_row["max_gap_pct"]):
+        extra["max_gap_pct"] = float(best_row["max_gap_pct"])
+    return best_row["exit_style"], int(best_row["max_hold_days"]), extra
+
+
 def evaluate_combo(label, price_data, indicators_by_code, regime_series, is_calendar, oos_calendar,
                     starting_capital, hold_days, signal_weights, gate_kwargs, atr_stop_mult,
                     trailing_atr_mult, use_trailing_stop, extra_kwargs, execution_kwargs):
@@ -532,6 +627,7 @@ def main():
     all_ablation = {}
     all_gate_comparison = {}
     all_atr_grid = {}
+    all_exit_style = {}
     all_combo_results = {}  # {hold_label: {"對照組": {...}, "最佳組合": {...}}}
     all_multi_period = {}
     signal_reliable_flags = {}
@@ -583,6 +679,8 @@ def main():
               f"門檻={winning_gate_label}")
 
         atr_stop_mult, trailing_atr_mult = args.atr_stop_mult, args.trailing_atr_mult
+        winning_hold_days = hold_days
+        winning_exit_extra = {}
         if args.use_trailing_stop:
             print(f"\n[階段2.5] ATR倍數敏感度網格(只在IS內，用上面選出的最佳訊號/門檻組合) ...")
             atr_grid_df, (atr_stop_mult, trailing_atr_mult) = run_atr_sensitivity_grid(
@@ -591,6 +689,18 @@ def main():
             )
             all_atr_grid[hold_label] = atr_grid_df
             print(f"  → 選出：初始停損x{atr_stop_mult}, 移動停利x{trailing_atr_mult}")
+
+            print(f"\n[階段2.6] 出場配置比較(只吃魚身：持有天數上限/延遲啟動/跳空上限，只在IS內) ...")
+            exit_style_df = run_exit_style_comparison(
+                price_data, indicators_by_code, regime_series, is_calendar,
+                args.starting_capital, winning_signal_weights, winning_gate_kwargs,
+                atr_stop_mult, trailing_atr_mult, window_extra_kwargs,
+            )
+            all_exit_style[hold_label] = exit_style_df
+            exit_style_df.to_csv(os.path.join(RESULTS_DIR, f"exit_style_{hold_label}.csv"),
+                                  index=False, encoding="utf-8-sig")
+            exit_style_label, winning_hold_days, winning_exit_extra = select_winning_exit_style(exit_style_df)
+            print(f"  → 選出：{exit_style_label}(持有天數上限={winning_hold_days})")
 
         print(f"\n[階段3] 對照組 vs 最佳組合，IS vs OOS + bootstrap穩健性檢查 ...")
         naive_weights = {name: 1.0 for name in signal_names_used}
@@ -601,19 +711,19 @@ def main():
             {"lots": 2, "max_concurrent_positions": 1},
         )
         winning_result = evaluate_combo(
-            f"最佳組合(訊號={winning_gate_label}, 突破窗口={window_label})", price_data, indicators_by_code,
-            regime_series, is_calendar, oos_calendar, args.starting_capital, hold_days, winning_signal_weights,
-            winning_gate_kwargs, atr_stop_mult, trailing_atr_mult, args.use_trailing_stop,
-            window_extra_kwargs, execution_kwargs,
+            f"最佳組合(訊號={winning_gate_label}, 突破窗口={window_label}, 出場={exit_style_label if args.use_trailing_stop else '固定天數'})",
+            price_data, indicators_by_code, regime_series, is_calendar, oos_calendar, args.starting_capital,
+            winning_hold_days, winning_signal_weights, winning_gate_kwargs, atr_stop_mult, trailing_atr_mult,
+            args.use_trailing_stop, dict(window_extra_kwargs, **winning_exit_extra), execution_kwargs,
         )
         all_combo_results[hold_label] = {"對照組": naive_result, "最佳組合": winning_result}
 
         for result in (naive_result, winning_result):
             print(f"  [{result['label']}]")
             print(f"    IS  -> {result['IS']['trade_count']}筆, PF={_fmt_pf(result['IS']['profit_factor'])}, "
-                  f"損益={result['IS']['total_pnl_ntd']:,.0f}")
+                  f"平均持有{result['IS']['avg_hold_days']:.1f}天, 損益={result['IS']['total_pnl_ntd']:,.0f}")
             print(f"    OOS -> {result['OOS']['trade_count']}筆, PF={_fmt_pf(result['OOS']['profit_factor'])}, "
-                  f"損益={result['OOS']['total_pnl_ntd']:,.0f}")
+                  f"平均持有{result['OOS']['avg_hold_days']:.1f}天, 損益={result['OOS']['total_pnl_ntd']:,.0f}")
             b = result["bootstrap"]
             print(f"    bootstrap：正報酬比例={b['pct_positive']:.1f}%, p值={b['p_value']:.3f}, "
                   f"拿掉最大3筆後損益={b['pnl_excluding_top3_ntd']:,.0f}")
@@ -627,8 +737,9 @@ def main():
             print(f"[跨市場週期驗證] 把最佳組合套到跟近期多頭明顯不同市況的歷史期間 ...")
             all_multi_period[hold_label] = run_multi_period_validation(
                 universe, INDEX_PROXY_CODE, winning_signal_weights, winning_gate_kwargs,
-                atr_stop_mult, trailing_atr_mult, args.use_trailing_stop, hold_days,
-                args.starting_capital, window_extra_kwargs, execution_kwargs, chip_data, args.refresh,
+                atr_stop_mult, trailing_atr_mult, args.use_trailing_stop, winning_hold_days,
+                args.starting_capital, dict(window_extra_kwargs, **winning_exit_extra),
+                execution_kwargs, chip_data, args.refresh,
             )
 
     summary_lines = [
@@ -695,6 +806,18 @@ def main():
                     f"{_fmt_pf(r['profit_factor']):>8}{r['total_pnl_ntd']:>14,.0f}"
                 )
 
+        if hold_label in all_exit_style:
+            summary_lines.append(f"\n--- {hold_label} / 出場配置比較(IS，只吃魚身：天數上限/延遲啟動/跳空上限) ---")
+            exit_df = all_exit_style[hold_label].sort_values("total_pnl_ntd", ascending=False)
+            header4 = f"{'出場配置':<32}{'交易數':>8}{'PF':>8}{'勝率%':>8}{'平均持有天':>10}{'總損益NT$':>14}"
+            summary_lines.append(header4)
+            summary_lines.append("-" * len(header4))
+            for _, r in exit_df.iterrows():
+                summary_lines.append(
+                    f"{r['exit_style']:<32}{r['trade_count']:>8}{_fmt_pf(r['profit_factor']):>8}"
+                    f"{r['win_rate']:>8.1f}{r['avg_hold_days']:>10.1f}{r['total_pnl_ntd']:>14,.0f}"
+                )
+
         summary_lines.append(f"\n--- {hold_label} / 對照組 vs 最佳組合：IS vs OOS + bootstrap ---")
         for combo_key, result in all_combo_results[hold_label].items():
             summary_lines.append(f"\n[{result['label']}]")
@@ -703,7 +826,8 @@ def main():
                 split_full = "樣本內(IS)" if split_name == "IS" else "樣本外(OOS) ← 較誠實的參考依據"
                 summary_lines.append(
                     f"  {split_full}: {stats['trade_count']}筆, PF={_fmt_pf(stats['profit_factor'])}, "
-                    f"勝率={stats['win_rate']:.1f}%, 總損益NT${stats['total_pnl_ntd']:,.0f}, "
+                    f"勝率={stats['win_rate']:.1f}%, 平均持有{stats['avg_hold_days']:.1f}天, "
+                    f"總損益NT${stats['total_pnl_ntd']:,.0f}, "
                     f"最大回撤NT${stats['max_drawdown_ntd']:,.0f}, 最大連續虧損{stats['max_consecutive_losses']}筆"
                 )
             b = result["bootstrap"]
@@ -737,6 +861,12 @@ def main():
         "看換一個進場時機是不是能改善績效。門檻變體裡新增的「趨勢強度(ADX)」「波動收縮後突破」"
         "則是分別測試「只在真的有趨勢時才進場」跟「只在盤整蓄積後才進場」這兩種篩選能不能提高"
         "進場品質，篩掉單純雜訊造成的假突破。"
+        "\n\n新增的「出場配置比較」是針對「只吃魚身、不拖時間」這個需求：不追求抱到趨勢走完"
+        "(那樣容易連末升段的洗盤都吃到)，而是設持有天數上限、以及移動停利延遲啟動(給進場後的"
+        "健康拉回一點呼吸空間，不要一進場就被貼太緊的移動停利提早洗出場)、開盤跳空上限(避免"
+        "追在隔日沖已經拉高的位置)。這段結果裡的「平均持有天數」是用來檢查有沒有真的抓到預期"
+        "的短波段長度——如果選出來的配置平均持有天數還是偏長，代表天數上限或延遲啟動的參數"
+        "要再調緊；如果偏短(例如不到2天就出場)，代表移動停利貼得太緊，健康拉回也被洗出場。"
     )
 
     summary_text = "\n".join(summary_lines)

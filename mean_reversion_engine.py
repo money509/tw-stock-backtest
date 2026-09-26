@@ -417,7 +417,24 @@ def _process_mr_day(position, row, date, trades, max_hold_days, cooldown_until, 
         return None
 
     if position.get("trailing_stop"):
-        position = update_trailing_stop(position, row)
+        # 移動停利延遲啟動：預設兩個門檻都是0，也就是「hold_days>=0」恆真、
+        # 立即啟動，維持舊版行為完全不變。只有明確設定trailing_activation_days>0
+        # 或trailing_activation_profit_atr>0時，才會延後啟動，讓進場後的健康拉回
+        # 不會被移動停利提早洗出場。
+        activation_days = position.get("trailing_activation_days", 0)
+        activation_profit_atr = position.get("trailing_activation_profit_atr", 0.0)
+        should_activate = position["hold_days"] >= activation_days
+        if not should_activate and activation_profit_atr > 0:
+            atr_entry = position.get("atr_entry", 0.0)
+            if atr_entry > 0:
+                close = row["Close"]
+                if position["side"] == "long":
+                    profit_atr = (close - position["e_price"]) / atr_entry
+                else:
+                    profit_atr = (position["e_price"] - close) / atr_entry
+                should_activate = profit_atr >= activation_profit_atr
+        if should_activate:
+            position = update_trailing_stop(position, row)
 
     return position
 
@@ -469,6 +486,7 @@ def summarize_mr(trades: list, starting_capital: float) -> dict:
             "long_count": 0, "short_count": 0,
             "profit_factor": 0.0, "max_consecutive_losses": 0, "sharpe_like": 0.0,
             "calmar_like": 0.0, "top_trade_pct_of_total_pnl": 0.0, "pnl_excluding_top3_ntd": 0.0,
+            "avg_hold_days": 0.0,
         }
 
     pnl_list = [t["pnl_ntd"] for t in trades]
@@ -513,10 +531,15 @@ def summarize_mr(trades: list, starting_capital: float) -> dict:
     sorted_pnl_desc = sorted(pnl_list, reverse=True)
     pnl_excluding_top3 = float(sum(sorted_pnl_desc[3:]))
 
+    # 平均持有天數：用來檢查「吃魚身」策略是不是真的抓到預期的短波段長度，
+    # 不是憑感覺猜參數(見trades裡每一筆已經記錄的hold_days欄位)。
+    avg_hold_days = float(np.mean([t["hold_days"] for t in trades]))
+
     return {
         "trade_count": len(trades),
         "win_rate": len(wins) / len(trades) * 100,
         "avg_return_pct": float(np.mean(returns)) * 100,
+        "avg_hold_days": avg_hold_days,
         "total_pnl_ntd": total_pnl,
         "max_drawdown_ntd": max_dd,
         "ending_equity_ntd": float(equity[-1]),
