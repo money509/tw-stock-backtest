@@ -89,6 +89,26 @@ compare_breakout.py
        --max-concurrent-positions，導致「篩選階段選出的最佳組合」跟「最終驗證實際
        套用的部位大小」不是同一套規則，篩選結果可能失真。這一輪把這兩個函式改成
        接收真正的execution_kwargs，確保篩選跟最終驗證用同一套部位大小規則。
+11. **使用者盤感提出的新假設(這輪新增)**：
+    a. **訊號組合比較(新增的「階段1.5」)**：使用者提出「MACD柱狀圖轉正+RSI穿越50+
+       量比放大」代表「主力進場、散戶跟進、短進短出、最後誰接盤」的組合效應假設，
+       這跟既有的「單一訊號拆解」自動篩選機制邏輯不同(自動篩選只驗證單一訊號的個別
+       預測力，量比/RSI單獨測都不到1，永遠不會被自動選中)，所以新增這個階段，把
+       自動篩選出的組合跟這組手動指定的固定組合放在一起比較，選總損益較高的那組，
+       固定套用到後面所有階段(門檻比較改用選定的組合當基準，不再是全部訊號等權重)。
+    b. **MA5基礎+均線型態門檻(新增的GATE_VARIANTS一項)**：短波段基本方向確認改用
+       MA5(5日均線)取代MA20，額外要求「均線糾結(MA5/MA20/MA60三線貼在一起，
+       (三線最大值-最小值)/ATR<=0.5)」或「多頭並列且三線同步向上(不只排列順序對，
+       三條線各自都要比5天前的自己高)」兩者擇一，見momentum_breakout_engine.py新增的
+       MASpreadOverATR/MA5Slope5/MA20Slope5/MA60Slope5指標欄位跟use_ma5_base/
+       require_ma_pattern參數。
+    c. **保本停損(新增的EXIT_STYLE_VARIANTS一項)**：回應「只要有漲，停利一定是成本價，
+       不要漲了後面下跌還賠錢」這個原則，新增breakeven_after_profit機制——浮動獲利
+       轉正後把停損移到成本價，不管有沒有開移動停利都會生效，是獨立於移動停利之外的
+       一道「保本地板」，實作在mean_reversion_engine._process_mr_day()。搭配新的
+       「3天出場+保本停損」出場配置(強制出場天數從10天縮短到3天)。
+    這幾個都是使用者盤感提出、還沒被驗證過的新假設，程式會照實測出來的PF/總損益排名，
+    不會因為背後的邏輯聽起來合理就預設會贏。
 
 用法：
     python3 compare_breakout.py --start 2023-09-15 --end 2026-09-14 --max-stocks 50
@@ -156,6 +176,11 @@ GATE_VARIANTS = [
     # 答案的關係。
     ("+趨勢強度+均線排列雙重確認", {"min_adx": 25.0, "require_ma_bullish_alignment": True}),
     ("+趨勢強度+站上季線雙重確認", {"min_adx": 25.0, "require_above_ma60": True}),
+    # 使用者盤感提出的假設：短波段基本方向改看MA5(比MA20更即時)，額外要求「均線糾結
+    # (像要爆發)」或「多頭並列且三線同步向上」兩者擇一——不是隨便均線排列對就算，
+    # 而是三線真的都在漲，或是三線貼在一起代表盤整蓄積、隨時要噴出。這是還沒被驗證過
+    # 的新假設，不是先驗認定一定比MA20+創新高好。
+    ("MA5基礎+均線糾結或多頭同步向上", {"use_ma5_base": True, "require_ma_pattern": True}),
 ]
 GATE_KWARGS_BY_LABEL = dict(GATE_VARIANTS)
 
@@ -193,6 +218,9 @@ MIN_TRADES_FOR_EXIT_STYLE_RANKING = 10
 #   trailing_activation_days/trailing_activation_profit_atr：移動停利延遲啟動的
 #     天數/獲利ATR倍數門檻，兩者任一達成就啟動(見mean_reversion_engine的判斷)
 #   max_gap_pct：開盤跳空幅度上限，超過就放棄進場(避免追在隔日沖已經拉高的位置)
+#   breakeven_after_profit：保本停損，浮動獲利轉正後把停損移到成本價，不管有沒有
+#     開移動停利都會生效(使用者盤感提出：「只要有漲，停利一定是成本價，不要漲了
+#     後面下跌還賠錢」)
 EXIT_STYLE_VARIANTS = [
     ("現行(不限天數/移動停利立即啟動)", {}),
     ("10天強制出場", {"max_hold_days_override": 10}),
@@ -205,6 +233,7 @@ EXIT_STYLE_VARIANTS = [
         "max_hold_days_override": 10, "trailing_activation_days": 2,
         "trailing_activation_profit_atr": 1.5, "max_gap_pct": 0.025,
     }),
+    ("3天出場+保本停損", {"max_hold_days_override": 3, "breakeven_after_profit": True}),
 ]
 
 # 跨市場週期驗證用的額外歷史窗口：刻意挑跟近期多頭段落明顯不同的市況，
@@ -392,9 +421,61 @@ def run_signal_ablation(price_data, indicators_by_code, regime_series, is_calend
     return pd.DataFrame(rows), signal_names
 
 
+# 使用者盤感提出的固定訊號組合：MACD柱狀圖轉正 + RSI穿越50 + 量比放大，代表「主力進場、
+# 散戶也跟著進來追、短進短出、最後誰接盤」的組合效應假設——這跟上面的自動篩選機制邏輯
+# 不同：自動篩選只驗證「單一訊號」的個別預測力(PF>1才選)，量比/RSI單獨測都不到1，永遠
+# 不會被自動選中，但這個假設認為「這三個訊號組合在一起才有效」，是單一訊號拆解測不出來
+# 的組合效應，所以另外測試這組固定組合，跟自動篩選的結果放在一起比較，不預設誰比較好。
+MANUAL_SIGNAL_COMBO_LABEL = "手動指定(MACD轉正+RSI>50+量比放大)"
+MANUAL_SIGNAL_COMBO = {"score_macd": 1.0, "score_rsi_cross": 1.0, "score_volume_ratio": 1.0}
+
+
+def run_signal_combo_comparison(price_data, indicators_by_code, regime_series, is_calendar,
+                                 starting_capital, hold_days, auto_label, auto_weights, extra_kwargs=None):
+    """比較「自動篩選出的訊號組合」vs 使用者手動指定的固定組合(MANUAL_SIGNAL_COMBO)。
+    只用基本門檻(門檻比較階段還沒開始)，只在IS內比較，選出來的訊號組合會固定下來，
+    後面的門檻比較/ATR網格/出場配置/最終驗證都套用。"""
+    extra_kwargs = extra_kwargs or {}
+    rows = []
+    for label, weights in [(auto_label, auto_weights), (MANUAL_SIGNAL_COMBO_LABEL, MANUAL_SIGNAL_COMBO)]:
+        trades = run_momentum_breakout_backtest(
+            price_data=price_data, indicators_by_code=indicators_by_code, regime_series=regime_series,
+            master_calendar=is_calendar, max_hold_days=hold_days, starting_capital=starting_capital,
+            allow_short=True, lots=2, atr_stop_mult=1.0, atr_target_mult=2.0,
+            signal_weights=weights, **extra_kwargs,
+        )
+        stats = summarize_mr(trades, starting_capital)
+        rows.append({
+            "combo_label": label, "trade_count": stats["trade_count"], "profit_factor": stats["profit_factor"],
+            "win_rate": stats["win_rate"], "total_pnl_ntd": stats["total_pnl_ntd"],
+        })
+        print(f"  {label} -> {stats['trade_count']}筆, PF={_fmt_pf(stats['profit_factor'])}, "
+              f"勝率={stats['win_rate']:.1f}%, 損益={stats['total_pnl_ntd']:,.0f}", flush=True)
+    return pd.DataFrame(rows)
+
+
+def select_winning_signal_combo(combo_df, auto_label, auto_weights, min_trades=MIN_TRADES_FOR_GATE_RANKING):
+    """從訊號組合比較(自動篩選 vs 手動指定)裡，挑總損益較高、且交易筆數不會太少的那組，
+    回傳(label, weights)。"""
+    pool = _prefer_nonzero_trades(combo_df)
+    reliable = pool[pool["trade_count"] >= min_trades]
+    if reliable.empty:
+        reliable = pool
+    if reliable.empty:
+        return auto_label, auto_weights
+    best_row = reliable.sort_values("total_pnl_ntd", ascending=False).iloc[0]
+    label = best_row["combo_label"]
+    if label == MANUAL_SIGNAL_COMBO_LABEL:
+        return label, dict(MANUAL_SIGNAL_COMBO)
+    return auto_label, auto_weights
+
+
 def run_gate_comparison(price_data, indicators_by_code, regime_series, is_calendar,
                          starting_capital, hold_days, signal_names, has_chip=False, extra_kwargs=None):
-    """用等權重訊號當基準，把結構門檻換成不同變體，比較哪種過濾條件篩出的候選比較好。"""
+    """用階段1.5選出的訊號組合(等權重)當基準，把結構門檻換成不同變體，比較哪種過濾條件
+    篩出的候選比較好——這輪改成「用已經選定的訊號組合」而不是「全部訊號等權重」當基準，
+    因為階段1.5可能選出手動指定的小組合(例如MACD+RSI+量比)，門檻比較應該回答「在這個
+    已經選定的訊號組合下，哪個門檻最好」，不是拿一個跟訊號選擇無關的基準去測門檻。"""
     extra_kwargs = extra_kwargs or {}
     rows = []
     equal_weights = {name: 1.0 for name in signal_names}
@@ -488,6 +569,7 @@ def run_exit_style_comparison(price_data, indicators_by_code, regime_series, is_
             "trailing_activation_days": style_kwargs.get("trailing_activation_days", 0),
             "trailing_activation_profit_atr": style_kwargs.get("trailing_activation_profit_atr", 0.0),
             "max_gap_pct": style_kwargs.get("max_gap_pct"),
+            "breakeven_after_profit": style_kwargs.get("breakeven_after_profit", False),
             "trade_count": stats["trade_count"], "profit_factor": stats["profit_factor"],
             "win_rate": stats["win_rate"], "total_pnl_ntd": stats["total_pnl_ntd"],
             "avg_hold_days": stats["avg_hold_days"],
@@ -500,10 +582,11 @@ def run_exit_style_comparison(price_data, indicators_by_code, regime_series, is_
 
 def select_winning_exit_style(exit_style_df, min_trades=MIN_TRADES_FOR_EXIT_STYLE_RANKING):
     """從出場配置比較結果裡，挑總損益最高、且交易筆數不會太少的那組配置，回傳
-    (label, max_hold_days, extra_kwargs)，extra_kwargs只包含trailing_activation_days/
-    trailing_activation_profit_atr/max_gap_pct這三個要餵進run_momentum_breakout_backtest
-    的鍵(None的max_gap_pct會被拿掉，避免傳一個沒意義的None覆蓋掉預設值以外的行為——
-    其實傳None結果一樣，這裡拿掉純粹讓kwargs乾淨)。"""
+    (label, max_hold_days, extra_kwargs)，extra_kwargs包含trailing_activation_days/
+    trailing_activation_profit_atr/max_gap_pct/breakeven_after_profit這幾個要餵進
+    run_momentum_breakout_backtest的鍵(None的max_gap_pct、False的breakeven_after_profit
+    會被拿掉，避免傳一個沒意義的值覆蓋掉預設值以外的行為——其實傳了結果一樣，這裡拿掉
+    純粹讓kwargs乾淨)。"""
     pool = _prefer_nonzero_trades(exit_style_df)
     reliable = pool[pool["trade_count"] >= min_trades]
     if reliable.empty:
@@ -521,6 +604,8 @@ def select_winning_exit_style(exit_style_df, min_trades=MIN_TRADES_FOR_EXIT_STYL
     }
     if pd.notna(best_row["max_gap_pct"]):
         extra["max_gap_pct"] = float(best_row["max_gap_pct"])
+    if bool(best_row.get("breakeven_after_profit", False)):
+        extra["breakeven_after_profit"] = True
     return best_row["exit_style"], int(best_row["max_hold_days"]), extra
 
 
@@ -722,6 +807,7 @@ def main():
         print(f"⚠️ 滑價模擬：進場/停損出場套用 {args.slippage_pct:.2%} 滑價\n")
 
     all_ablation = {}
+    all_signal_combo = {}
     all_gate_comparison = {}
     all_atr_grid = {}
     all_exit_style = {}
@@ -770,23 +856,39 @@ def main():
         ablation_df.to_csv(os.path.join(RESULTS_DIR, f"ablation_{hold_label}.csv"),
                             index=False, encoding="utf-8-sig")
 
-        print(f"\n[階段2] 結構門檻變體比較 (只在IS內，等權重訊號) ...")
+        winning_signals, is_reliable = select_winning_signals(ablation_df)
+        signal_reliable_flags[hold_label] = is_reliable
+        auto_signal_weights = {name: 1.0 for name in winning_signals}
+        auto_signal_label = f"自動篩選({','.join(SIGNAL_LABELS[s] for s in winning_signals)})" \
+            f"{'' if is_reliable else '⚠️探索性選擇'}"
+
+        print(f"\n[階段1.5] 訊號組合比較(自動篩選 vs 手動指定：MACD轉正+RSI>50+量比放大，只在IS內) ...")
+        combo_df = run_signal_combo_comparison(
+            price_data, indicators_by_code, regime_series, is_calendar,
+            args.starting_capital, hold_days, auto_signal_label, auto_signal_weights,
+            extra_kwargs=window_extra_kwargs,
+        )
+        all_signal_combo[hold_label] = combo_df
+        combo_df.to_csv(os.path.join(RESULTS_DIR, f"signal_combo_{hold_label}.csv"),
+                         index=False, encoding="utf-8-sig")
+        combo_label, winning_signal_weights = select_winning_signal_combo(
+            combo_df, auto_signal_label, auto_signal_weights,
+        )
+        print(f"  → 選出訊號組合：{combo_label}\n")
+
+        print(f"[階段2] 結構門檻變體比較 (只在IS內，用上面選出的訊號組合) ...")
         gate_df = run_gate_comparison(
             price_data, indicators_by_code, regime_series, is_calendar,
-            args.starting_capital, hold_days, signal_names_used, has_chip=args.with_chip_confirm,
+            args.starting_capital, hold_days, list(winning_signal_weights.keys()), has_chip=args.with_chip_confirm,
             extra_kwargs=window_extra_kwargs,
         )
         all_gate_comparison[hold_label] = gate_df
         gate_df.to_csv(os.path.join(RESULTS_DIR, f"gate_comparison_{hold_label}.csv"),
                         index=False, encoding="utf-8-sig")
 
-        winning_signals, is_reliable = select_winning_signals(ablation_df)
         winning_gate_label, winning_gate_kwargs = select_winning_gate(gate_df)
-        signal_reliable_flags[hold_label] = is_reliable
-        winning_signal_weights = {name: 1.0 for name in winning_signals}
-        print(f"\n  → 依IS結果選出的最佳組合：訊號={[SIGNAL_LABELS[s] for s in winning_signals]}"
-              f"{'' if is_reliable else '(⚠️沒有訊號單獨PF>1，退回選總損益前3名，屬探索性選擇)'}，"
-              f"門檻={winning_gate_label}")
+        print(f"\n  → 依IS結果選出的最佳組合：訊號組合={combo_label}"
+              f"，門檻={winning_gate_label}")
 
         atr_stop_mult, trailing_atr_mult = args.atr_stop_mult, args.trailing_atr_mult
         winning_hold_days = hold_days
@@ -823,8 +925,8 @@ def main():
             {"lots": 2, "max_concurrent_positions": 1},
         )
         winning_result = evaluate_combo(
-            f"最佳組合(訊號={winning_gate_label}, 突破窗口={window_label}, 突破風格={style_label}, "
-            f"出場={exit_style_label if args.use_trailing_stop else '固定天數'})",
+            f"最佳組合(訊號組合={combo_label}, 門檻={winning_gate_label}, 突破窗口={window_label}, "
+            f"突破風格={style_label}, 出場={exit_style_label if args.use_trailing_stop else '固定天數'})",
             price_data, indicators_by_code, regime_series, is_calendar, oos_calendar, args.starting_capital,
             winning_hold_days, winning_signal_weights, winning_gate_kwargs, atr_stop_mult, trailing_atr_mult,
             args.use_trailing_stop, dict(window_extra_kwargs, **winning_exit_extra), execution_kwargs,
@@ -907,7 +1009,18 @@ def main():
         if not signal_reliable_flags[hold_label]:
             summary_lines.append("⚠️ 沒有任何訊號單獨PF>1，下面的「最佳組合」是探索性選擇(總損益前3名)，不是已驗證過的訊號")
 
-        summary_lines.append(f"\n--- {hold_label} / 結構門檻變體比較(IS，等權重訊號) ---")
+        summary_lines.append(f"\n--- {hold_label} / 訊號組合比較(IS，自動篩選 vs 手動指定MACD+RSI+量比) ---")
+        combo_df = all_signal_combo[hold_label].sort_values("total_pnl_ntd", ascending=False)
+        header1b = f"{'訊號組合':<50}{'交易數':>8}{'PF':>8}{'勝率%':>8}{'總損益NT$':>14}"
+        summary_lines.append(header1b)
+        summary_lines.append("-" * len(header1b))
+        for _, r in combo_df.iterrows():
+            summary_lines.append(
+                f"{r['combo_label']:<50}{r['trade_count']:>8}{_fmt_pf(r['profit_factor']):>8}"
+                f"{r['win_rate']:>8.1f}{r['total_pnl_ntd']:>14,.0f}"
+            )
+
+        summary_lines.append(f"\n--- {hold_label} / 結構門檻變體比較(IS，用選定的訊號組合) ---")
         gate_df = all_gate_comparison[hold_label].sort_values("total_pnl_ntd", ascending=False)
         header2 = f"{'門檻':<24}{'交易數':>8}{'PF':>8}{'勝率%':>8}{'總損益NT$':>14}"
         summary_lines.append(header2)
@@ -997,6 +1110,18 @@ def main():
         "候選順序，是不是比絕對值判定更穩定——因為相對排名不管標的池大小或期間怎麼變，"
         "永遠是拿候選互相比較，不是拿候選跟一個固定的magic number比較。這裡選出的風格"
         "會固定套用到後面所有階段。"
+        "\n\n新增的「訊號組合比較」是回應使用者盤感提出的假設：MACD柱狀圖轉正+RSI穿越50+"
+        "量比放大，代表「主力進場、散戶也跟著追、短進短出、最後誰接盤」的組合效應，這跟"
+        "「單一訊號拆解」的自動篩選機制邏輯不同——自動篩選只驗證單一訊號的個別預測力"
+        "(PF>1才選)，量比/RSI單獨測都不到1，永遠不會被自動選中，但組合在一起可能有單一"
+        "訊號測不出來的效應，所以另外測試這組固定組合，跟自動篩選的結果放在一起比較，"
+        "不預設誰比較好。門檻變體裡新增的「MA5基礎+均線糾結或多頭同步向上」則是把基本方向"
+        "確認從MA20改成MA5(短波段反應更即時)，額外要求「均線糾結(像要爆發)」或「多頭並列"
+        "且三線同步向上」兩者擇一——不是排列剛好對就算，而是三線真的都在漲，或三線貼在一起"
+        "代表盤整蓄積。出場配置新增的「3天出場+保本停損」則是回應「只要有漲，停利一定是"
+        "成本價，不要漲了後面下跌還賠錢」這個原則：一旦浮動獲利轉正，停損就移到成本價，"
+        "不管有沒有開移動停利都會生效。這幾個都是使用者盤感提出、還沒被驗證過的新假設，"
+        "程式會照實測出來的PF/總損益排名，不會因為背後的邏輯聽起來合理就預設會贏。"
     )
 
     summary_text = "\n".join(summary_lines)

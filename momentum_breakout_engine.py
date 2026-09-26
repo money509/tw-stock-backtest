@@ -42,6 +42,15 @@ score_breakout_strength——概念是「不追求猜中絕對的突破時機，
 
 籌碼相關的欄位(ForeignRatio/TrustRatio)查的都是「嚴格早於進場日」的資料(用
 _lookup_prior_row)，不會有隔日衝那邊發現的「偷看當天籌碼」的時間差問題。
+
+這一輪新增(使用者盤感提出的假設，見compare_breakout.py的GATE_VARIANTS/EXIT_STYLE_VARIANTS新增項目)：
+- use_ma5_base：基本方向確認改用MA5(5日均線)取代MA20，短波段反應更即時
+- require_ma_pattern：額外要求「均線糾結」或「多頭/空頭並列且三線同步走勢」兩者擇一
+  (見scan_momentum_breakout_candidates()說明、新增指標欄位MASpreadOverATR/MA5Slope5/
+  MA20Slope5/MA60Slope5)
+- breakeven_after_profit：出場端新增「保本停損」——浮動獲利轉正後把停損移到成本價，
+  不管有沒有開移動停利都會生效(見try_enter_breakout()說明，實作在mean_reversion_engine.
+  _process_mr_day())
 """
 import pandas as pd
 import numpy as np
@@ -61,6 +70,13 @@ BREAKOUT_SIGNAL_NAMES = [
     "score_candle_body", "score_foreign_ratio", "score_trust_ratio",
     "score_breakout_strength",
 ]
+
+# 均線型態門檻(require_ma_pattern=True時使用，見scan_momentum_breakout_candidates說明)：
+# MA_CONVERGENCE_THRESHOLD 是「(MA5/MA20/MA60三線最大值-最小值) ÷ ATR」的門檻，數字越小
+# 代表要求三線貼得越緊(糾結)；MA_SLOPE_LOOKBACK 是判斷「均線是不是同步向上/向下」時，
+# 要跟幾天前的自己比較斜率。兩個數字都是使用者盤感先抓的預設值，之後可以再依實測調整。
+MA_CONVERGENCE_THRESHOLD = 0.5
+MA_SLOPE_LOOKBACK = 5
 
 # 這幾個訊號需要額外的籌碼資料才能算，沒有籌碼資料時會被自動跳過(不計分，不影響其他訊號)
 CHIP_DEPENDENT_SIGNALS = {"score_foreign_ratio", "score_trust_ratio"}
@@ -215,6 +231,17 @@ def precompute_breakout_indicators(df: pd.DataFrame, index_close: pd.Series, chi
     bullish_candle_score = bullish_body.rolling(candle_lookback).mean()
     bearish_candle_score = bearish_body.rolling(candle_lookback).mean()
 
+    # 均線糾結/多頭並列同步向上型態(require_ma_pattern用)：
+    # MASpreadOverATR = (三線最大值-最小值)/ATR，比值小代表三線貼得很近(糾結、盤整蓄積)；
+    # MA5Slope5/MA20Slope5/MA60Slope5 = 今天的均線值 - MA_SLOPE_LOOKBACK天前的均線值，
+    # 正值代表這條均線本身在向上走(不是只看排列順序，是真的在漲)，負值代表在向下走。
+    ma_max = np.maximum(np.maximum(ma5, ma20), ma60)
+    ma_min = np.minimum(np.minimum(ma5, ma20), ma60)
+    ma_spread_over_atr = (ma_max - ma_min) / atr.replace(0, np.nan)
+    ma5_slope = ma5 - ma5.shift(MA_SLOPE_LOOKBACK)
+    ma20_slope = ma20 - ma20.shift(MA_SLOPE_LOOKBACK)
+    ma60_slope = ma60 - ma60.shift(MA_SLOPE_LOOKBACK)
+
     result = pd.DataFrame({
         "Close": close, "MA5": ma5, "MA20": ma20, "MA60": ma60, "ATR": atr,
         "VolumeRatio": volume_ratio, "RollingHigh": rolling_high, "RollingLow": rolling_low,
@@ -224,6 +251,8 @@ def precompute_breakout_indicators(df: pd.DataFrame, index_close: pd.Series, chi
         "GapUpFlag": gap_up_flag, "GapDownFlag": gap_down_flag,
         "BullishCandleScore": bullish_candle_score, "BearishCandleScore": bearish_candle_score,
         "ADX": adx, "VolContractionRatio": vol_contraction_ratio,
+        "MASpreadOverATR": ma_spread_over_atr,
+        "MA5Slope5": ma5_slope, "MA20Slope5": ma20_slope, "MA60Slope5": ma60_slope,
         **extra_rolling_cols,
     }, index=df.index)
 
@@ -324,7 +353,9 @@ def scan_momentum_breakout_candidates(indicators_by_code: dict, as_of_date, regi
                                        ex_dividend_dates_by_code: dict = None,
                                        breakout_window: int = 20, min_adx: float = 0.0,
                                        require_vol_contraction: bool = False,
-                                       require_hard_breakout: bool = True) -> list:
+                                       require_hard_breakout: bool = True,
+                                       use_ma5_base: bool = False,
+                                       require_ma_pattern: bool = False) -> list:
     """
     掃描全市場候選標的：先套結構性突破門檻(基本門檻永遠套用，其餘6個額外門檻可選)，
     通過門檻的候選再依加權分數排名，回傳前top_n名多方候選 + 前top_n名空方候選。
@@ -359,6 +390,18 @@ def scan_momentum_breakout_candidates(indicators_by_code: dict, as_of_date, regi
     ATR倍數距離，連續分數)在訊號評分階段自然排出「誰比較接近/超過突破」的相對順序——
     這是回應多輪測試裡「絕對值硬門檻對標的池大小/期間變動極度敏感」的問題，用相對排名
     取代絕對值判定，理論上應該更穩定，但這是待驗證的假設。
+
+    use_ma5_base：預設False，用MA20當基本方向的均線；設True時改用MA5(5日均線)，
+    對短波段交易更即時反應。
+
+    require_ma_pattern：預設False。設True時，除了上面的均線基本方向確認之外，
+    多方候選還要額外符合「均線糾結」或「多頭並列且三線同步向上」其中一個型態
+    (空方對稱，符合「均線糾結」或「空頭並列且三線同步向下」其中一個)：
+      - 均線糾結：MA5/MA20/MA60三線彼此貼得很近((三線最大值-最小值)/ATR <=
+        MA_CONVERGENCE_THRESHOLD)，代表盤整蓄積、隨時可能噴出
+      - 多頭並列且同步向上：不只MA5>MA20>MA60(排列順序)，三條線各自都要比
+        MA_SLOPE_LOOKBACK天前的自己高(真的在漲，不是排列剛好對但走平/往下)
+    這兩個型態擇一符合即可，不用同時滿足；這是使用者盤感提出的假設，還沒被驗證過。
     """
     if signal_weights is None:
         signal_weights = {name: 1.0 for name in BREAKOUT_SIGNAL_NAMES}
@@ -382,11 +425,14 @@ def scan_momentum_breakout_candidates(indicators_by_code: dict, as_of_date, regi
 
         close = row["Close"]
         ma20 = row["MA20"]
+        ma5 = row["MA5"]
+        ma60 = row["MA60"]
         atr = row["ATR"]
         rolling_high = row[high_col]
         rolling_low = row[low_col]
 
-        if pd.isna(ma20) or pd.isna(atr) or atr <= 0 or pd.isna(rolling_high) or pd.isna(rolling_low):
+        trend_ma = ma5 if use_ma5_base else ma20
+        if pd.isna(trend_ma) or pd.isna(atr) or atr <= 0 or pd.isna(rolling_high) or pd.isna(rolling_low):
             continue
 
         if min_volume_ratio > 0:
@@ -418,11 +464,22 @@ def scan_momentum_breakout_candidates(indicators_by_code: dict, as_of_date, regi
             "breakout_strength_short": (rolling_low - close) / atr,
         }
 
-        ma5 = row["MA5"]
-        ma60 = row["MA60"]
+        ma_pattern_bullish = ma_pattern_bearish = True
+        if require_ma_pattern:
+            spread_ratio = row["MASpreadOverATR"]
+            ma_convergence = not pd.isna(spread_ratio) and spread_ratio <= MA_CONVERGENCE_THRESHOLD
+            ma5_slope, ma20_slope, ma60_slope = row["MA5Slope5"], row["MA20Slope5"], row["MA60Slope5"]
+            slopes_valid = not (pd.isna(ma5_slope) or pd.isna(ma20_slope) or pd.isna(ma60_slope))
+            ma_bullish_slope = slopes_valid and not pd.isna(ma5) and not pd.isna(ma60) and \
+                ma5 > ma20 > ma60 and ma5_slope > 0 and ma20_slope > 0 and ma60_slope > 0
+            ma_bearish_slope = slopes_valid and not pd.isna(ma5) and not pd.isna(ma60) and \
+                ma5 < ma20 < ma60 and ma5_slope < 0 and ma20_slope < 0 and ma60_slope < 0
+            ma_pattern_bullish = ma_convergence or ma_bullish_slope
+            ma_pattern_bearish = ma_convergence or ma_bearish_slope
 
         # 多方
-        if regime != "bear" and close > ma20 and (not require_hard_breakout or close > rolling_high):
+        if regime != "bear" and close > trend_ma and (not require_hard_breakout or close > rolling_high) \
+                and ma_pattern_bullish:
             ok = True
             if require_above_ma60:
                 ok = ok and not pd.isna(ma60) and close > ma60
@@ -435,7 +492,8 @@ def scan_momentum_breakout_candidates(indicators_by_code: dict, as_of_date, regi
                 long_rows.append(dict(base))
 
         # 空方(對稱)
-        if allow_short and regime != "bull" and close < ma20 and (not require_hard_breakout or close < rolling_low):
+        if allow_short and regime != "bull" and close < trend_ma and (not require_hard_breakout or close < rolling_low) \
+                and ma_pattern_bearish:
             ok = True
             if require_above_ma60:
                 ok = ok and not pd.isna(ma60) and close < ma60
@@ -459,7 +517,8 @@ def try_enter_breakout(price_data: dict, candidates: list, entry_date, starting_
                         total_margin_cap_ratio: float = None,
                         risk_pct_per_trade: float = None, account_equity: float = None,
                         max_gap_pct: float = None,
-                        trailing_activation_days: int = 0, trailing_activation_profit_atr: float = 0.0):
+                        trailing_activation_days: int = 0, trailing_activation_profit_atr: float = 0.0,
+                        breakeven_after_profit: bool = False):
     """
     依序檢查候選名單(已跳空風控+保證金上限過濾)，第一個通過的進場。
     跟均值回歸引擎的跳空風控方向一致：不管多空，方向不利的跳空超過0.5%就放棄
@@ -497,6 +556,11 @@ def try_enter_breakout(price_data: dict, candidates: list, entry_date, starting_
     移動停利提前洗出場、魚身都還沒吃到就出局。兩者都預設0，代表進場當天(第1天)
     就立即啟動移動停利，維持舊版行為完全不變(見mean_reversion_engine._process_mr_day
     的啟動判斷)。
+
+    breakeven_after_profit：預設False。設True時，只要浮動獲利轉正(多方收盤價>進場價、
+    空方收盤價<進場價)，就把停損價移到成本價(不會再往回移)，避免「已經賺錢後又跌回去
+    倒賠」的情況——這是獨立於移動停利之外的一道「保本地板」，不管有沒有開啟移動停利
+    都會生效(見mean_reversion_engine._process_mr_day的實作)。
     """
     for cand in candidates:
         code = cand["code"]
@@ -555,6 +619,7 @@ def try_enter_breakout(price_data: dict, candidates: list, entry_date, starting_
             "code": code, "side": side, "entry_date": entry_date,
             "e_price": e_price, "target_price": target_price, "stop_price": stop_price,
             "lots": lots_to_use, "hold_days": 1, "margin_used": margin_needed,
+            "breakeven_after_profit": breakeven_after_profit,
         }
         if use_trailing_stop:
             position["trailing_stop"] = True
@@ -586,7 +651,10 @@ def run_momentum_breakout_backtest(price_data: dict, indicators_by_code: dict, r
                                     max_gap_pct: float = None,
                                     trailing_activation_days: int = 0,
                                     trailing_activation_profit_atr: float = 0.0,
-                                    require_hard_breakout: bool = True):
+                                    require_hard_breakout: bool = True,
+                                    use_ma5_base: bool = False,
+                                    require_ma_pattern: bool = False,
+                                    breakeven_after_profit: bool = False):
     """
     完整 day-by-day walk-forward 模擬。出場判定/強制平倉/停損冷卻期，重用
     mean_reversion_engine._process_mr_day()，跟均值回歸引擎共用同一套出場機制，
@@ -611,6 +679,12 @@ def run_momentum_breakout_backtest(price_data: dict, indicators_by_code: dict, r
     require_hard_breakout：見scan_momentum_breakout_candidates()說明，預設True維持舊版
     行為；False時改用軟性排名模式(只留MA20結構性資格，突破強度交給score_breakout_strength
     做相對排名)。
+
+    use_ma5_base/require_ma_pattern：見scan_momentum_breakout_candidates()說明，
+    分別是「基本方向改用MA5」跟「額外要求均線糾結或多頭/空頭並列同步走勢」。
+
+    breakeven_after_profit：見try_enter_breakout()說明，「保本停損」——浮動獲利轉正後
+    把停損移到成本價。
     """
     trades = []
     cooldown_until = {}
@@ -661,6 +735,7 @@ def run_momentum_breakout_backtest(price_data: dict, indicators_by_code: dict, r
                 breakout_window=breakout_window, min_adx=min_adx,
                 require_vol_contraction=require_vol_contraction,
                 require_hard_breakout=require_hard_breakout,
+                use_ma5_base=use_ma5_base, require_ma_pattern=require_ma_pattern,
             )
 
             while slots_available > 0 and candidates:
@@ -674,6 +749,7 @@ def run_momentum_breakout_backtest(price_data: dict, indicators_by_code: dict, r
                     max_gap_pct=max_gap_pct,
                     trailing_activation_days=trailing_activation_days,
                     trailing_activation_profit_atr=trailing_activation_profit_atr,
+                    breakeven_after_profit=breakeven_after_profit,
                 )
                 if new_position is None:
                     break

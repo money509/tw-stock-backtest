@@ -416,6 +416,19 @@ def _process_mr_day(position, row, date, trades, max_hold_days, cooldown_until, 
         _close_mr_trade(position, row["Close"], "forced_close", date, trades)
         return None
 
+    if position.get("breakeven_after_profit"):
+        # 保本停損：只要浮動獲利轉正(不含滑價的粗略判斷，跟停損/停利判斷一致)，
+        # 就把停損價移到成本價，不會再往回移——避免「已經賺錢後又跌回去倒賠」，
+        # 這是獨立於移動停利之外的一道地板，不管有沒有開移動停利都會生效。
+        close = row["Close"]
+        entry = position["e_price"]
+        if position["side"] == "long" and close > entry:
+            if entry > position["stop_price"]:
+                position["stop_price"] = entry
+        elif position["side"] == "short" and close < entry:
+            if entry < position["stop_price"]:
+                position["stop_price"] = entry
+
     if position.get("trailing_stop"):
         # 移動停利延遲啟動：預設兩個門檻都是0，也就是「hold_days>=0」恆真、
         # 立即啟動，維持舊版行為完全不變。只有明確設定trailing_activation_days>0

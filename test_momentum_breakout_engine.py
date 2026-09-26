@@ -10,6 +10,7 @@ import pandas as pd
 import pytest
 
 import momentum_breakout_engine as mbe
+import mean_reversion_engine as mre
 from mean_reversion_engine import precompute_regime_series
 
 
@@ -451,6 +452,90 @@ class TestTryEnterBreakoutTrailingActivationFields:
         assert pos["trailing_activation_days"] == 2
         assert pos["trailing_activation_profit_atr"] == pytest.approx(1.5)
 
+    def test_breakeven_after_profit_defaults_to_false(self):
+        df = make_price_df([100.0, 100.1], opens=[100.0, 100.1])
+        price_data = {"1101": df}
+        candidates = [{"code": "1101", "side": "long", "c_prev": 100.0, "atr": 2.0}]
+        pos = mbe.try_enter_breakout(price_data, candidates, df.index[1], starting_capital=1_000_000)
+        assert pos["breakeven_after_profit"] is False
+
+    def test_breakeven_after_profit_carries_configured_value(self):
+        df = make_price_df([100.0, 100.1], opens=[100.0, 100.1])
+        price_data = {"1101": df}
+        candidates = [{"code": "1101", "side": "long", "c_prev": 100.0, "atr": 2.0}]
+        pos = mbe.try_enter_breakout(
+            price_data, candidates, df.index[1], starting_capital=1_000_000, breakeven_after_profit=True,
+        )
+        assert pos["breakeven_after_profit"] is True
+
+
+class TestBreakevenAfterProfitExit:
+    """保本停損：浮動獲利轉正後把停損移到成本價，不管有沒有開移動停利都會生效。"""
+
+    def _make_long_position(self, breakeven=True, e_price=100.0, atr=2.0):
+        return {
+            "code": "1101", "side": "long", "entry_date": pd.Timestamp("2024-01-02"),
+            "e_price": e_price, "target_price": None, "stop_price": e_price - atr,
+            "lots": 1, "hold_days": 1, "margin_used": 0.0,
+            "breakeven_after_profit": breakeven, "atr_entry": atr,
+        }
+
+    def test_stop_floors_to_entry_once_price_above_entry(self):
+        position = self._make_long_position(breakeven=True)
+        row = pd.Series({"Open": 101.0, "High": 102.0, "Low": 100.5, "Close": 101.5})
+        updated = mre._process_mr_day(position, row, pd.Timestamp("2024-01-03"), [], max_hold_days=250,
+                                       cooldown_until={})
+        assert updated is not None
+        assert updated["stop_price"] == pytest.approx(100.0)
+
+    def test_stop_untouched_when_price_still_below_entry(self):
+        position = self._make_long_position(breakeven=True)
+        original_stop = position["stop_price"]
+        row = pd.Series({"Open": 99.0, "High": 99.5, "Low": 98.8, "Close": 99.2})
+        updated = mre._process_mr_day(position, row, pd.Timestamp("2024-01-03"), [], max_hold_days=250,
+                                       cooldown_until={})
+        assert updated is not None
+        assert updated["stop_price"] == pytest.approx(original_stop)
+
+    def test_disabled_by_default_leaves_stop_unchanged(self):
+        position = self._make_long_position(breakeven=False)
+        original_stop = position["stop_price"]
+        row = pd.Series({"Open": 101.0, "High": 102.0, "Low": 100.5, "Close": 101.5})
+        updated = mre._process_mr_day(position, row, pd.Timestamp("2024-01-03"), [], max_hold_days=250,
+                                       cooldown_until={})
+        assert updated is not None
+        assert updated["stop_price"] == pytest.approx(original_stop)
+
+    def test_short_side_floors_to_entry_once_price_below_entry(self):
+        position = {
+            "code": "1101", "side": "short", "entry_date": pd.Timestamp("2024-01-02"),
+            "e_price": 100.0, "target_price": None, "stop_price": 102.0,
+            "lots": 1, "hold_days": 1, "margin_used": 0.0,
+            "breakeven_after_profit": True, "atr_entry": 2.0,
+        }
+        row = pd.Series({"Open": 99.0, "High": 99.5, "Low": 98.0, "Close": 98.5})
+        updated = mre._process_mr_day(position, row, pd.Timestamp("2024-01-03"), [], max_hold_days=250,
+                                       cooldown_until={})
+        assert updated is not None
+        assert updated["stop_price"] == pytest.approx(100.0)
+
+    def test_combines_with_trailing_stop_as_a_floor_beneath_it(self):
+        # 保本停損(地板) + 移動停利同時開啟：移動停利算出來的停損比成本價還高時，
+        # 用移動停利的值(更有利)；不會因為保本邏輯先跑就把停損鎖死在成本價。
+        position = self._make_long_position(breakeven=True)
+        position["trailing_stop"] = True
+        position["trailing_atr_mult"] = 1.0
+        position["trailing_anchor"] = 100.0
+        position["trailing_activation_days"] = 0
+        position["trailing_activation_profit_atr"] = 0.0
+        row = pd.Series({"Open": 104.0, "High": 105.0, "Low": 103.5, "Close": 104.5})
+        updated = mre._process_mr_day(position, row, pd.Timestamp("2024-01-03"), [], max_hold_days=250,
+                                       cooldown_until={})
+        assert updated is not None
+        # 保本邏輯先把停損拉到100(成本價)，移動停利再用「今天收盤價104.5 - 1倍ATR(2.0)=102.5」
+        # 比100更高，所以最終停損應該是移動停利算出來的102.5，不是被鎖死在100。
+        assert updated["stop_price"] == pytest.approx(102.5)
+
 
 class TestRunMomentumBreakoutBacktestSmoke:
     def test_runs_without_error_and_produces_summarizable_trades(self):
@@ -771,6 +856,7 @@ class TestScanWithNewGateParams:
         "BullishCandleScore": 0.0, "BearishCandleScore": 0.0,
         "ForeignRatio": np.nan, "TrustRatio": np.nan,
         "ADX": 30.0, "VolContractionRatio": 0.5,
+        "MASpreadOverATR": 3.0, "MA5Slope5": 0.0, "MA20Slope5": 0.0, "MA60Slope5": 0.0,
     }
 
     def _build_indicators(self, code_specs, as_of_pos=65):
@@ -874,6 +960,58 @@ class TestScanWithNewGateParams:
         )
         codes_in_order = [c["code"] for c in result]
         assert codes_in_order.index("0002") < codes_in_order.index("0001")
+
+    def test_use_ma5_base_admits_candidate_above_ma5_but_below_ma20(self):
+        # 收盤價站上MA5但還沒站上MA20：預設(MA20基礎)應該被擋掉，use_ma5_base=True應該放行
+        specs = {"0001": {"Close": 97.0, "MA5": 96.0, "MA20": 100.0, "RollingHigh": 105.0}}
+        indicators_by_code, as_of_date = self._build_indicators(specs)
+        result_default = self._scan(indicators_by_code, as_of_date, require_hard_breakout=False)
+        result_ma5 = self._scan(
+            indicators_by_code, as_of_date, require_hard_breakout=False, use_ma5_base=True,
+        )
+        assert result_default == []
+        assert {c["code"] for c in result_ma5} == {"0001"}
+
+    def test_require_ma_pattern_blocks_when_neither_convergence_nor_bullish_slope(self):
+        # 三線沒有貼在一起(MASpreadOverATR偏大)，斜率也是平的(0.0)，兩個型態都不符合 → 濾掉
+        specs = {"0001": {
+            "Close": 102.0, "MA5": 96.0, "MA20": 95.0, "MA60": 90.0,
+            "MASpreadOverATR": 3.0, "MA5Slope5": 0.0, "MA20Slope5": 0.0, "MA60Slope5": 0.0,
+        }}
+        indicators_by_code, as_of_date = self._build_indicators(specs)
+        result = self._scan(indicators_by_code, as_of_date, require_hard_breakout=False, require_ma_pattern=True)
+        assert result == []
+
+    def test_require_ma_pattern_admits_on_convergence(self):
+        # 三線貼在一起(MASpreadOverATR很小)，就算斜率是平的，也算符合「均線糾結」型態
+        specs = {"0001": {
+            "Close": 102.0, "MA5": 96.0, "MA20": 95.0, "MA60": 90.0,
+            "MASpreadOverATR": 0.1, "MA5Slope5": 0.0, "MA20Slope5": 0.0, "MA60Slope5": 0.0,
+        }}
+        indicators_by_code, as_of_date = self._build_indicators(specs)
+        result = self._scan(indicators_by_code, as_of_date, require_hard_breakout=False, require_ma_pattern=True)
+        assert {c["code"] for c in result} == {"0001"}
+
+    def test_require_ma_pattern_admits_on_bullish_slope_even_without_convergence(self):
+        # 三線沒有貼在一起，但排列順序正確且三線都同步向上 → 算符合「多頭並列同步向上」型態
+        specs = {"0001": {
+            "Close": 102.0, "MA5": 96.0, "MA20": 95.0, "MA60": 90.0,
+            "MASpreadOverATR": 3.0, "MA5Slope5": 1.0, "MA20Slope5": 0.5, "MA60Slope5": 0.2,
+        }}
+        indicators_by_code, as_of_date = self._build_indicators(specs)
+        result = self._scan(indicators_by_code, as_of_date, require_hard_breakout=False, require_ma_pattern=True)
+        assert {c["code"] for c in result} == {"0001"}
+
+    def test_require_ma_pattern_blocks_when_order_right_but_one_ma_sloping_down(self):
+        # 排列順序正確(MA5>MA20>MA60)，但MA60本身是往下走(不是真的同步向上)，
+        # 且沒有糾結 → 兩個型態都不符合，應該被濾掉
+        specs = {"0001": {
+            "Close": 102.0, "MA5": 96.0, "MA20": 95.0, "MA60": 90.0,
+            "MASpreadOverATR": 3.0, "MA5Slope5": 1.0, "MA20Slope5": 0.5, "MA60Slope5": -0.2,
+        }}
+        indicators_by_code, as_of_date = self._build_indicators(specs)
+        result = self._scan(indicators_by_code, as_of_date, require_hard_breakout=False, require_ma_pattern=True)
+        assert result == []
 
 
 class TestRunMomentumBreakoutBacktestWithNewGates:
