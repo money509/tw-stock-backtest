@@ -389,6 +389,69 @@ class TestTryEnterBreakout:
         assert "trailing_stop" not in pos
 
 
+class TestTryEnterBreakoutGapUpperBound:
+    """開盤跳空上限：跟既有的下限方向相反，多單跳空超過正的max_gap_pct就放棄，
+    避免追在隔日沖已經拉高、獲利空間被追價盤吃乾抹淨的位置。預設None不檢查上限，
+    維持舊版行為完全不變。"""
+
+    def test_default_none_does_not_block_large_gap_up(self):
+        df = make_price_df([100.0, 103.0], opens=[100.0, 103.0])  # 跳空+3%
+        price_data = {"1101": df}
+        candidates = [{"code": "1101", "side": "long", "c_prev": 100.0, "atr": 2.0}]
+        pos = mbe.try_enter_breakout(price_data, candidates, df.index[1], starting_capital=1_000_000)
+        assert pos is not None
+
+    def test_long_blocked_when_gap_exceeds_upper_bound(self):
+        df = make_price_df([100.0, 103.0], opens=[100.0, 103.0])  # 跳空+3% > 2.5%上限
+        price_data = {"1101": df}
+        candidates = [{"code": "1101", "side": "long", "c_prev": 100.0, "atr": 2.0}]
+        pos = mbe.try_enter_breakout(
+            price_data, candidates, df.index[1], starting_capital=1_000_000, max_gap_pct=0.025,
+        )
+        assert pos is None
+
+    def test_long_allowed_when_gap_within_upper_bound(self):
+        df = make_price_df([100.0, 101.5], opens=[100.0, 101.5])  # 跳空+1.5% <= 2.5%上限
+        price_data = {"1101": df}
+        candidates = [{"code": "1101", "side": "long", "c_prev": 100.0, "atr": 2.0}]
+        pos = mbe.try_enter_breakout(
+            price_data, candidates, df.index[1], starting_capital=1_000_000, max_gap_pct=0.025,
+        )
+        assert pos is not None
+
+    def test_short_blocked_when_gap_exceeds_upper_bound_downward(self):
+        df = make_price_df([100.0, 97.0], opens=[100.0, 97.0])  # 跳空-3%，對空單來說跳過頭
+        price_data = {"1101": df}
+        candidates = [{"code": "1101", "side": "short", "c_prev": 100.0, "atr": 2.0}]
+        pos = mbe.try_enter_breakout(
+            price_data, candidates, df.index[1], starting_capital=1_000_000, max_gap_pct=0.025,
+        )
+        assert pos is None
+
+
+class TestTryEnterBreakoutTrailingActivationFields:
+    def test_activation_fields_default_to_zero(self):
+        df = make_price_df([100.0, 100.1], opens=[100.0, 100.1])
+        price_data = {"1101": df}
+        candidates = [{"code": "1101", "side": "long", "c_prev": 100.0, "atr": 2.0}]
+        pos = mbe.try_enter_breakout(
+            price_data, candidates, df.index[1], starting_capital=1_000_000, use_trailing_stop=True,
+        )
+        assert pos["trailing_activation_days"] == 0
+        assert pos["trailing_activation_profit_atr"] == pytest.approx(0.0)
+
+    def test_activation_fields_carry_configured_values(self):
+        df = make_price_df([100.0, 100.1], opens=[100.0, 100.1])
+        price_data = {"1101": df}
+        candidates = [{"code": "1101", "side": "long", "c_prev": 100.0, "atr": 2.0}]
+        pos = mbe.try_enter_breakout(
+            price_data, candidates, df.index[1], starting_capital=1_000_000, use_trailing_stop=True,
+            trailing_activation_days=2, trailing_activation_profit_atr=1.5,
+        )
+        assert pos["trailing_activation_days"] == 2
+        assert pos["trailing_activation_profit_atr"] == pytest.approx(1.5)
+
+
 class TestRunMomentumBreakoutBacktestSmoke:
     def test_runs_without_error_and_produces_summarizable_trades(self):
         np.random.seed(0)
@@ -634,3 +697,239 @@ class TestRunMomentumBreakoutBacktestMultiPosition:
             max_concurrent_positions=2, slippage_pct=0.002, risk_pct_per_trade=0.02,
         )
         assert isinstance(trades, list)
+
+
+class TestComputeAdx:
+    def test_strong_uptrend_gives_high_adx_eventually(self):
+        close = pd.Series(np.linspace(10, 60, 100))
+        df = make_price_df(list(close))
+        adx = mbe.compute_adx(df)
+        assert adx.iloc[-1] > 25  # 明確單邊趨勢，ADX應該偏高
+
+    def test_flat_sideways_gives_low_adx(self):
+        np.random.seed(0)
+        close = pd.Series(100.0 + np.random.normal(0, 0.3, 100))
+        df = make_price_df(list(close))
+        adx = mbe.compute_adx(df)
+        assert adx.iloc[-1] < 25  # 盤整無方向，ADX應該偏低
+
+
+class TestExtraBreakoutWindowsAndVolContraction:
+    def test_extra_rolling_high_low_columns_exist_for_default_windows(self):
+        closes = [100.0] * 260
+        df = make_price_df(closes)
+        index_close = pd.Series(100.0, index=df.index)
+        ind = mbe.precompute_breakout_indicators(df, index_close)
+        for w in (5, 60, 250):
+            assert f"RollingHigh_{w}" in ind.columns
+            assert f"RollingLow_{w}" in ind.columns
+
+    def test_5day_window_breaks_out_earlier_than_250day_window_which_still_remembers_old_spike(self):
+        # 很久以前有過一次尖峰(200)，接著長期盤整在100附近，然後溫和回升到150：
+        # 5日窗口很快就會判定「創新高」(突破近期盤整區間的前高)；250日窗口因為
+        # 還記得很久以前的舊高點(200)，遲遲不會判定突破——這正是想測的東西：
+        # 短窗口進場更早，但也可能只是突破了近期雜訊；長窗口濾掉雜訊，但也可能
+        # 讓你錯過還沒漲到歷史天價、但已經明顯轉強的中段行情。
+        # 舊高點要落在250日窗口涵蓋範圍內才有意義，所以要精算位置：spike放在index 50，
+        # 之後盤整200天到index 250，緊接著回升，這樣檢查點(index 254)往前250天
+        # 剛好還能看到index 50的舊高點，但5日窗口早就看不到了。
+        closes = [100.0] * 50 + [200.0] + [100.0] * 200 + list(np.linspace(100.0, 150.0, 10)) + [150.0] * 5
+        df = make_price_df(closes)
+        index_close = pd.Series(100.0, index=df.index)
+        ind = mbe.precompute_breakout_indicators(df, index_close)
+        mid_ramp = ind.iloc[254]  # 溫和回升的第4天，還遠低於很久以前的舊高點200
+        assert mid_ramp["RollingHigh_250"] == pytest.approx(200.0)
+        assert mid_ramp["Close"] > mid_ramp["RollingHigh_5"]   # 5日窗口：已經算突破
+        assert mid_ramp["Close"] < mid_ramp["RollingHigh_250"]  # 250日窗口：還沒突破
+
+    def test_vol_contraction_ratio_below_one_after_calm_period_following_volatile_period(self):
+        np.random.seed(1)
+        volatile = 100 + np.cumsum(np.random.normal(0, 3, 40))
+        calm = volatile[-1] + np.cumsum(np.random.normal(0, 0.3, 40))
+        closes = list(volatile) + list(calm)
+        df = make_price_df(closes)
+        index_close = pd.Series(100.0, index=df.index)
+        ind = mbe.precompute_breakout_indicators(df, index_close)
+        assert ind["VolContractionRatio"].iloc[-1] < 1.0
+
+
+class TestScanWithNewGateParams:
+    """用跟TestScanMomentumBreakoutCandidates一樣的手法：直接構造指標DataFrame，
+    只在「as_of_date前一天」那一列塞想測的數值，精準控制單一變數，不用依賴真實
+    價格路徑推算出正確的指標值(容易因為T-1查表的位移算錯预期值)。"""
+
+    DEFAULT_COLS = {
+        "Close": 100.0, "MA5": 96.0, "MA20": 95.0, "MA60": 90.0, "ATR": 2.0,
+        "VolumeRatio": 1.0, "RollingHigh": 105.0, "RollingLow": 95.0,
+        "RollingHigh_5": 105.0, "RollingLow_5": 95.0,
+        "RollingHigh_60": 105.0, "RollingLow_60": 95.0,
+        "RollingHigh_250": 105.0, "RollingLow_250": 95.0,
+        "RSI": 50.0, "MACDHist": 0.0, "RelStrength": 0.0,
+        "GoldenCrossFlag": 0.0, "DeathCrossFlag": 0.0,
+        "PriceVolNewHighLong": 0.0, "PriceVolNewHighShort": 0.0,
+        "GapUpFlag": 0.0, "GapDownFlag": 0.0,
+        "BullishCandleScore": 0.0, "BearishCandleScore": 0.0,
+        "ForeignRatio": np.nan, "TrustRatio": np.nan,
+        "ADX": 30.0, "VolContractionRatio": 0.5,
+    }
+
+    def _build_indicators(self, code_specs, as_of_pos=65):
+        n = as_of_pos + 5
+        idx = pd.date_range("2024-01-01", periods=n, freq="B")
+        indicators_by_code = {}
+        for code, spec in code_specs.items():
+            df = pd.DataFrame({col: val for col, val in self.DEFAULT_COLS.items()}, index=idx)
+            for col, val in spec.items():
+                df.loc[idx[as_of_pos - 1], col] = val
+            indicators_by_code[code] = df
+        return indicators_by_code, idx[as_of_pos]
+
+    def _scan(self, indicators_by_code, as_of_date, **kwargs):
+        return mbe.scan_momentum_breakout_candidates(
+            indicators_by_code, as_of_date, regime="neutral", excluded_codes=set(),
+            allow_short=False, top_n=5, **kwargs,
+        )
+
+    def test_breakout_window_20_default_uses_rolling_high_column(self):
+        specs = {"0001": {"Close": 110.0, "MA20": 100.0, "RollingHigh": 105.0, "RollingHigh_5": 115.0}}
+        indicators_by_code, as_of_date = self._build_indicators(specs)
+        # 20日窗口用RollingHigh=105，Close(110)>105 → 通過，不受RollingHigh_5影響
+        result = self._scan(indicators_by_code, as_of_date, breakout_window=20)
+        assert {c["code"] for c in result} == {"0001"}
+
+    def test_breakout_window_5_switches_to_alternate_column(self):
+        specs = {"0001": {"Close": 110.0, "MA20": 100.0, "RollingHigh": 105.0, "RollingHigh_5": 115.0}}
+        indicators_by_code, as_of_date = self._build_indicators(specs)
+        # 5日窗口改用RollingHigh_5=115，Close(110)沒有超過 → 被濾掉，即使20日窗口會通過
+        result = self._scan(indicators_by_code, as_of_date, breakout_window=5)
+        assert result == []
+
+    def test_min_adx_filters_out_low_trend_strength_candidates(self):
+        specs = {"0001": {"Close": 110.0, "MA20": 100.0, "RollingHigh": 105.0, "ADX": 15.0}}
+        indicators_by_code, as_of_date = self._build_indicators(specs)
+        result_no_filter = self._scan(indicators_by_code, as_of_date, min_adx=0.0)
+        result_filtered = self._scan(indicators_by_code, as_of_date, min_adx=25.0)
+        assert {c["code"] for c in result_no_filter} == {"0001"}
+        assert result_filtered == []
+
+    def test_min_adx_passes_when_adx_above_threshold(self):
+        specs = {"0001": {"Close": 110.0, "MA20": 100.0, "RollingHigh": 105.0, "ADX": 40.0}}
+        indicators_by_code, as_of_date = self._build_indicators(specs)
+        result = self._scan(indicators_by_code, as_of_date, min_adx=25.0)
+        assert {c["code"] for c in result} == {"0001"}
+
+    def test_require_vol_contraction_filters_out_when_ratio_above_threshold(self):
+        specs = {"0001": {"Close": 110.0, "MA20": 100.0, "RollingHigh": 105.0, "VolContractionRatio": 1.2}}
+        indicators_by_code, as_of_date = self._build_indicators(specs)
+        result_off = self._scan(indicators_by_code, as_of_date, require_vol_contraction=False)
+        result_on = self._scan(indicators_by_code, as_of_date, require_vol_contraction=True)
+        assert {c["code"] for c in result_off} == {"0001"}
+        assert result_on == []
+
+    def test_require_vol_contraction_passes_when_ratio_below_threshold(self):
+        specs = {"0001": {"Close": 110.0, "MA20": 100.0, "RollingHigh": 105.0, "VolContractionRatio": 0.5}}
+        indicators_by_code, as_of_date = self._build_indicators(specs)
+        result = self._scan(indicators_by_code, as_of_date, require_vol_contraction=True)
+        assert {c["code"] for c in result} == {"0001"}
+
+    def test_require_hard_breakout_default_true_matches_old_behavior(self):
+        # 站上MA20但沒有真的突破前高 → 舊版行為(預設require_hard_breakout=True)應該濾掉
+        specs = {"0001": {"Close": 102.0, "MA20": 100.0, "RollingHigh": 105.0}}
+        indicators_by_code, as_of_date = self._build_indicators(specs)
+        result = self._scan(indicators_by_code, as_of_date)
+        assert result == []
+
+    def test_require_hard_breakout_false_admits_candidate_above_ma20_without_breakout(self):
+        # 同樣站上MA20但沒有突破前高，require_hard_breakout=False時只看MA20結構資格 → 應該放行
+        specs = {"0001": {"Close": 102.0, "MA20": 100.0, "RollingHigh": 105.0}}
+        indicators_by_code, as_of_date = self._build_indicators(specs)
+        result = self._scan(indicators_by_code, as_of_date, require_hard_breakout=False)
+        assert {c["code"] for c in result} == {"0001"}
+
+    def test_require_hard_breakout_false_still_blocks_candidate_below_ma20(self):
+        # 軟性排名模式下，跌破MA20的多方候選仍然要被擋掉(MA20是最基本的結構性資格)
+        specs = {"0001": {"Close": 98.0, "MA20": 100.0, "RollingHigh": 105.0}}
+        indicators_by_code, as_of_date = self._build_indicators(specs)
+        result = self._scan(indicators_by_code, as_of_date, require_hard_breakout=False)
+        assert result == []
+
+    def test_require_hard_breakout_true_still_admits_real_breakout(self):
+        # require_hard_breakout=True時，真的突破前高的候選還是正常放行(不影響舊行為)
+        specs = {"0001": {"Close": 110.0, "MA20": 100.0, "RollingHigh": 105.0}}
+        indicators_by_code, as_of_date = self._build_indicators(specs)
+        result = self._scan(indicators_by_code, as_of_date, require_hard_breakout=True)
+        assert {c["code"] for c in result} == {"0001"}
+
+    def test_score_breakout_strength_ranks_larger_atr_distance_higher(self):
+        # 兩檔都通過軟性排名的MA20資格，但0002離前高的ATR倍數距離更大(更接近/超過突破)，
+        # score_breakout_strength應該把0002排在0001前面
+        specs = {
+            "0001": {"Close": 101.0, "MA20": 100.0, "RollingHigh": 105.0, "ATR": 2.0},  # (101-105)/2=-2.0
+            "0002": {"Close": 104.0, "MA20": 100.0, "RollingHigh": 105.0, "ATR": 2.0},  # (104-105)/2=-0.5
+        }
+        indicators_by_code, as_of_date = self._build_indicators(specs)
+        result = self._scan(
+            indicators_by_code, as_of_date, require_hard_breakout=False,
+            signal_weights={"score_breakout_strength": 1.0},
+        )
+        codes_in_order = [c["code"] for c in result]
+        assert codes_in_order.index("0002") < codes_in_order.index("0001")
+
+
+class TestRunMomentumBreakoutBacktestWithNewGates:
+    def test_runs_with_breakout_window_min_adx_vol_contraction_without_error(self):
+        np.random.seed(4)
+        n = 300
+        real_codes = ["1101", "1102", "1210", "1216", "1301", "1303"]
+        universe, price_data = {}, {}
+        for i, code in enumerate(real_codes):
+            base = 100 + i * 5
+            trend = np.linspace(0, 20, n) if i % 2 == 0 else np.linspace(0, -10, n)
+            noise = np.random.normal(0, 1, n)
+            closes = np.maximum(base + trend + noise, 1.0)
+            price_data[code] = make_price_df(list(closes), start="2024-01-01")
+            universe[code] = {}
+        index_code = real_codes[0]
+
+        indicators_by_code = mbe.precompute_all_breakout_indicators(price_data, universe, index_code=index_code)
+        regime_series = precompute_regime_series(price_data[index_code])
+
+        for window in (5, 20, 60, 250):
+            trades = mbe.run_momentum_breakout_backtest(
+                price_data=price_data, indicators_by_code=indicators_by_code, regime_series=regime_series,
+                master_calendar=price_data[index_code].index, max_hold_days=15, starting_capital=1_000_000,
+                allow_short=True, lots=2, top_n=2, breakout_window=window,
+            )
+            assert isinstance(trades, list)
+
+        trades_adx = mbe.run_momentum_breakout_backtest(
+            price_data=price_data, indicators_by_code=indicators_by_code, regime_series=regime_series,
+            master_calendar=price_data[index_code].index, max_hold_days=15, starting_capital=1_000_000,
+            allow_short=True, lots=2, top_n=2, min_adx=20.0,
+        )
+        assert isinstance(trades_adx, list)
+
+        trades_vc = mbe.run_momentum_breakout_backtest(
+            price_data=price_data, indicators_by_code=indicators_by_code, regime_series=regime_series,
+            master_calendar=price_data[index_code].index, max_hold_days=15, starting_capital=1_000_000,
+            allow_short=True, lots=2, top_n=2, require_vol_contraction=True,
+        )
+        assert isinstance(trades_vc, list)
+
+        # 「只吃魚身」出場配置：跳空上限+移動停利延遲啟動，只在移動停利模式下有意義
+        trades_exit_style = mbe.run_momentum_breakout_backtest(
+            price_data=price_data, indicators_by_code=indicators_by_code, regime_series=regime_series,
+            master_calendar=price_data[index_code].index, max_hold_days=10, starting_capital=1_000_000,
+            allow_short=True, lots=2, top_n=2, use_trailing_stop=True, trailing_atr_mult=1.0,
+            max_gap_pct=0.025, trailing_activation_days=2, trailing_activation_profit_atr=1.5,
+        )
+        assert isinstance(trades_exit_style, list)
+
+        # 軟性排名模式(require_hard_breakout=False)：只留MA20結構性資格，
+        # 突破強度改用score_breakout_strength相對排名
+        trades_soft_ranking = mbe.run_momentum_breakout_backtest(
+            price_data=price_data, indicators_by_code=indicators_by_code, regime_series=regime_series,
+            master_calendar=price_data[index_code].index, max_hold_days=15, starting_capital=1_000_000,
+            allow_short=True, lots=2, top_n=2, require_hard_breakout=False,
+        )
+        assert isinstance(trades_soft_ranking, list)

@@ -70,6 +70,25 @@ compare_breakout.py
    自動併入既有的門檻比較(階段2)一起排名，不需要額外的CLI參數，也不需要動引擎——
    單純是GATE_VARIANTS新增兩組kwargs組合。這是用交易筆數換訊號純度的假設，跟出場端
    一樣，是需要驗證、不能先驗認定答案的假設。
+10. **「專業投資經理」設計：相對排名取代絕對值硬門檻(新增的「階段0.7」)**：回應
+    「不追求「準」，追求「賠得少、賺得多、選得穩」」這個核心哲學。前幾輪測試發現：
+    既有的score_*訊號全部都是相對排名(percentile_score)，在標的池從50~100檔擴大到
+    全市場320檔時相對穩定；但「收盤價>突破窗口高/低點」這個結構性硬門檻是絕對值判定，
+    同樣的擴大測試中表現大幅震盪(甚至整套邏輯站不住)。這一輪新增：
+    a. **score_breakout_strength**：突破強度改成連續分數——「離突破窗口高/低點還有幾倍
+       ATR距離」，再用既有的percentile_score()相對排名，取代非黑即白的「有沒有突破」。
+    b. **require_hard_breakout參數**(momentum_breakout_engine.py)：預設True維持舊版
+       行為(一定要收盤價>前高/前低才算候選)；False時改用「軟性排名」模式，只留最基本的
+       「站上/跌破20日均線」當結構性資格，突破強度完全交給上面的相對排名去決定「這批
+       候選裡誰的突破比較像樣」，不再用一個固定的絕對值切斷候選。
+    c. **突破風格比較(階段0.7)**：在突破窗口選定之後、訊號拆解之前，新增一個小比較：
+       硬門檻 vs 軟性排名，兩種都用等權重訊號+基本門檻，選總損益較高的一個，固定下來
+       套用到後面所有階段(訊號拆解/門檻比較/ATR網格/最終驗證/跨週期驗證)。
+    d. **execution_kwargs一致性修正**：上一輪發現的方法論問題——ATR敏感度網格
+       (階段2.5)跟出場配置比較(階段2.6)過去寫死lots=2，沒有套用--risk-pct-per-trade/
+       --max-concurrent-positions，導致「篩選階段選出的最佳組合」跟「最終驗證實際
+       套用的部位大小」不是同一套規則，篩選結果可能失真。這一輪把這兩個函式改成
+       接收真正的execution_kwargs，確保篩選跟最終驗證用同一套部位大小規則。
 
 用法：
     python3 compare_breakout.py --start 2023-09-15 --end 2026-09-14 --max-stocks 50
@@ -116,6 +135,7 @@ SIGNAL_LABELS = {
     "score_candle_body": "K棒實體比例",
     "score_foreign_ratio": "外資買超比重",
     "score_trust_ratio": "投信買超比重",
+    "score_breakout_strength": "突破強度(ATR倍數相對排名)",
 }
 
 HOLD_DAYS_OPTIONS = [("短線5天", 5), ("中期15天", 15)]
@@ -147,6 +167,16 @@ BREAKOUT_WINDOW_VARIANTS = [
     ("20日創新高(原本設定)", 20),
     ("60日創新高(季線級別)", 60),
     ("52週創新高(年線級別)", 250),
+]
+
+# 突破風格比較(新增的「階段0.7」)：硬門檻(舊版，一定要收盤價>突破窗口高/低點才算候選)
+# vs 軟性排名(只留最基本的「站上/跌破20日均線」當結構性資格，突破強度改交給
+# score_breakout_strength做相對排名，不再用絕對值判定「有沒有突破」)。回應「專業投資經理」
+# 設計裡的核心觀察：既有的score_*訊號(全部都是相對排名)在標的池大小變動時比二元的硬門檻
+# 穩定，這裡直接測試「把突破確認本身也改成相對排名」是不是能提高穩定性。
+BREAKOUT_STYLE_VARIANTS = [
+    ("硬門檻(收盤價需站上突破窗口高/低點)", True),
+    ("軟性排名(僅站上/跌破20日均線+相對排名)", False),
 ]
 
 # 移動停利模式下的ATR倍數敏感度網格：(初始停損倍數, 移動停利倍數)。
@@ -247,6 +277,18 @@ def select_winning_breakout_window(window_df, min_trades=MIN_TRADES_FOR_GATE_RAN
     return best_row["window_label"], int(best_row["breakout_window"])
 
 
+def select_winning_breakout_style(style_df, min_trades=MIN_TRADES_FOR_GATE_RANKING):
+    """從突破風格比較(硬門檻 vs 軟性排名)結果裡，挑總損益最高、且交易筆數不會太少的那個風格。"""
+    pool = _prefer_nonzero_trades(style_df)
+    reliable = pool[pool["trade_count"] >= min_trades]
+    if reliable.empty:
+        reliable = pool
+    if reliable.empty:
+        return BREAKOUT_STYLE_VARIANTS[0]  # 找不到任何可用結果時，退回硬門檻(舊版行為)
+    best_row = reliable.sort_values("total_pnl_ntd", ascending=False).iloc[0]
+    return best_row["style_label"], bool(best_row["require_hard_breakout"])
+
+
 def run_breakout_window_comparison(price_data, indicators_by_code, regime_series, is_calendar,
                                     starting_capital, hold_days, all_signal_names, extra_kwargs=None):
     """用全部訊號等權重+基本門檻當基準，只換突破窗口(5/20/60/250日)，測哪個進場時點
@@ -268,6 +310,33 @@ def run_breakout_window_comparison(price_data, indicators_by_code, regime_series
         stats = summarize_mr(trades, starting_capital)
         rows.append({
             "window_label": label, "breakout_window": window,
+            "trade_count": stats["trade_count"], "profit_factor": stats["profit_factor"],
+            "total_pnl_ntd": stats["total_pnl_ntd"], "win_rate": stats["win_rate"],
+        })
+        print(f"  {label} -> {stats['trade_count']}筆, PF={_fmt_pf(stats['profit_factor'])}, "
+              f"勝率={stats['win_rate']:.1f}%, 損益={stats['total_pnl_ntd']:,.0f}", flush=True)
+    return pd.DataFrame(rows)
+
+
+def run_breakout_style_comparison(price_data, indicators_by_code, regime_series, is_calendar,
+                                   starting_capital, hold_days, all_signal_names, extra_kwargs=None):
+    """突破窗口選定之後，測「硬門檻(絕對值判定有沒有突破)」vs「軟性排名(只留MA20結構性
+    資格，突破強度改用相對排名)」哪個比較好。一樣用全部訊號等權重+基本門檻，只換
+    require_hard_breakout這一個變數，先回答「突破確認本身該不該用絕對值判定」這個問題，
+    選出來的風格會固定下來，之後的訊號拆解/門檻比較/ATR網格/最終驗證都套用。"""
+    extra_kwargs = extra_kwargs or {}
+    rows = []
+    equal_weights = {name: 1.0 for name in all_signal_names}
+    for label, require_hard in BREAKOUT_STYLE_VARIANTS:
+        trades = run_momentum_breakout_backtest(
+            price_data=price_data, indicators_by_code=indicators_by_code, regime_series=regime_series,
+            master_calendar=is_calendar, max_hold_days=hold_days, starting_capital=starting_capital,
+            allow_short=True, lots=2, atr_stop_mult=1.0, atr_target_mult=2.0,
+            signal_weights=equal_weights, require_hard_breakout=require_hard, **extra_kwargs,
+        )
+        stats = summarize_mr(trades, starting_capital)
+        rows.append({
+            "style_label": label, "require_hard_breakout": require_hard,
             "trade_count": stats["trade_count"], "profit_factor": stats["profit_factor"],
             "total_pnl_ntd": stats["total_pnl_ntd"], "win_rate": stats["win_rate"],
         })
@@ -350,18 +419,26 @@ def run_gate_comparison(price_data, indicators_by_code, regime_series, is_calend
 
 
 def run_atr_sensitivity_grid(price_data, indicators_by_code, regime_series, is_calendar,
-                              starting_capital, signal_weights, gate_kwargs, extra_kwargs):
+                              starting_capital, signal_weights, gate_kwargs, extra_kwargs,
+                              execution_kwargs=None):
     """僅移動停利模式使用：在最佳訊號/門檻組合固定之後，測一個小網格的
-    (初始停損倍數, 移動停利倍數)，只在IS內搜尋，回傳完整結果表 + PF最高的一組。"""
+    (初始停損倍數, 移動停利倍數)，只在IS內搜尋，回傳完整結果表 + PF最高的一組。
+
+    execution_kwargs：最終驗證會用到的真實部位大小設定(risk_pct_per_trade或lots、
+    max_concurrent_positions)。不傳時退回舊版寫死的lots=2/單一部位，但這樣選出來的
+    「最佳ATR倍數」是在跟最終驗證不同的部位大小規則下選的，可能不是真的最佳——
+    見這一輪修正的execution_kwargs一致性問題，這裡改成預設吃真正的執行參數，
+    確保篩選階段跟最終驗證用同一套部位大小規則。"""
+    execution_kwargs = dict(execution_kwargs) if execution_kwargs else {"lots": 2}
     rows = []
     for stop_mult, trail_mult in ATR_SENSITIVITY_GRID:
         trades = run_momentum_breakout_backtest(
             price_data=price_data, indicators_by_code=indicators_by_code, regime_series=regime_series,
             master_calendar=is_calendar, max_hold_days=TRAILING_STOP_MAX_HOLD_DAYS,
-            starting_capital=starting_capital, allow_short=True, lots=2,
+            starting_capital=starting_capital, allow_short=True,
             signal_weights=signal_weights, atr_stop_mult=stop_mult,
             use_trailing_stop=True, trailing_atr_mult=trail_mult,
-            **gate_kwargs, **extra_kwargs,
+            **gate_kwargs, **extra_kwargs, **execution_kwargs,
         )
         stats = summarize_mr(trades, starting_capital)
         rows.append({
@@ -385,10 +462,14 @@ def run_atr_sensitivity_grid(price_data, indicators_by_code, regime_series, is_c
 
 def run_exit_style_comparison(price_data, indicators_by_code, regime_series, is_calendar,
                                starting_capital, signal_weights, gate_kwargs, atr_stop_mult, trailing_atr_mult,
-                               extra_kwargs):
+                               extra_kwargs, execution_kwargs=None):
     """「只吃魚身」出場配置比較(僅移動停利模式使用)：ATR倍數固定之後，另外測試持有天數
     上限/移動停利延遲啟動/開盤跳空上限這幾個進出場配置組合，只在IS內搜尋。額外印出
-    平均持有天數，用來檢查有沒有真的抓到預期的短波段長度，不是憑感覺猜參數。"""
+    平均持有天數，用來檢查有沒有真的抓到預期的短波段長度，不是憑感覺猜參數。
+
+    execution_kwargs：同run_atr_sensitivity_grid()，預設吃真正的部位大小設定，
+    確保這裡選出的「最佳出場配置」是在跟最終驗證相同的部位大小規則下選的。"""
+    execution_kwargs = dict(execution_kwargs) if execution_kwargs else {"lots": 2}
     rows = []
     for label, style_kwargs in EXIT_STYLE_VARIANTS:
         style_kwargs = dict(style_kwargs)
@@ -396,10 +477,10 @@ def run_exit_style_comparison(price_data, indicators_by_code, regime_series, is_
         trades = run_momentum_breakout_backtest(
             price_data=price_data, indicators_by_code=indicators_by_code, regime_series=regime_series,
             master_calendar=is_calendar, max_hold_days=max_hold_days,
-            starting_capital=starting_capital, allow_short=True, lots=2,
+            starting_capital=starting_capital, allow_short=True,
             signal_weights=signal_weights, atr_stop_mult=atr_stop_mult,
             use_trailing_stop=True, trailing_atr_mult=trailing_atr_mult,
-            **gate_kwargs, **extra_kwargs, **style_kwargs,
+            **gate_kwargs, **extra_kwargs, **style_kwargs, **execution_kwargs,
         )
         stats = summarize_mr(trades, starting_capital)
         rows.append({
@@ -644,6 +725,7 @@ def main():
     all_gate_comparison = {}
     all_atr_grid = {}
     all_exit_style = {}
+    all_breakout_style = {}
     all_combo_results = {}  # {hold_label: {"對照組": {...}, "最佳組合": {...}}}
     all_multi_period = {}
     signal_reliable_flags = {}
@@ -666,6 +748,18 @@ def main():
         window_label, winning_window = select_winning_breakout_window(window_df)
         print(f"  → 選出突破窗口：{window_label}\n")
         window_extra_kwargs = dict(extra_kwargs, breakout_window=winning_window)
+
+        print("[階段0.7] 突破風格比較 (硬門檻 vs 軟性排名，只在IS內，等權重訊號+基本門檻) ...")
+        style_df = run_breakout_style_comparison(
+            price_data, indicators_by_code, regime_series, is_calendar,
+            args.starting_capital, hold_days, signal_names_for_window, extra_kwargs=window_extra_kwargs,
+        )
+        all_breakout_style[hold_label] = style_df
+        style_df.to_csv(os.path.join(RESULTS_DIR, f"breakout_style_{hold_label}.csv"),
+                         index=False, encoding="utf-8-sig")
+        style_label, winning_require_hard_breakout = select_winning_breakout_style(style_df)
+        print(f"  → 選出突破風格：{style_label}\n")
+        window_extra_kwargs = dict(window_extra_kwargs, require_hard_breakout=winning_require_hard_breakout)
 
         print("[階段1] 單一訊號拆解 (只在IS內，基本門檻) ...")
         ablation_df, signal_names_used = run_signal_ablation(
@@ -702,6 +796,7 @@ def main():
             atr_grid_df, (atr_stop_mult, trailing_atr_mult) = run_atr_sensitivity_grid(
                 price_data, indicators_by_code, regime_series, is_calendar,
                 args.starting_capital, winning_signal_weights, winning_gate_kwargs, window_extra_kwargs,
+                execution_kwargs=execution_kwargs,
             )
             all_atr_grid[hold_label] = atr_grid_df
             print(f"  → 選出：初始停損x{atr_stop_mult}, 移動停利x{trailing_atr_mult}")
@@ -711,6 +806,7 @@ def main():
                 price_data, indicators_by_code, regime_series, is_calendar,
                 args.starting_capital, winning_signal_weights, winning_gate_kwargs,
                 atr_stop_mult, trailing_atr_mult, window_extra_kwargs,
+                execution_kwargs=execution_kwargs,
             )
             all_exit_style[hold_label] = exit_style_df
             exit_style_df.to_csv(os.path.join(RESULTS_DIR, f"exit_style_{hold_label}.csv"),
@@ -727,7 +823,8 @@ def main():
             {"lots": 2, "max_concurrent_positions": 1},
         )
         winning_result = evaluate_combo(
-            f"最佳組合(訊號={winning_gate_label}, 突破窗口={window_label}, 出場={exit_style_label if args.use_trailing_stop else '固定天數'})",
+            f"最佳組合(訊號={winning_gate_label}, 突破窗口={window_label}, 突破風格={style_label}, "
+            f"出場={exit_style_label if args.use_trailing_stop else '固定天數'})",
             price_data, indicators_by_code, regime_series, is_calendar, oos_calendar, args.starting_capital,
             winning_hold_days, winning_signal_weights, winning_gate_kwargs, atr_stop_mult, trailing_atr_mult,
             args.use_trailing_stop, dict(window_extra_kwargs, **winning_exit_extra), execution_kwargs,
@@ -778,6 +875,17 @@ def main():
         for _, r in window_df.iterrows():
             summary_lines.append(
                 f"{r['window_label']:<24}{r['trade_count']:>8}{_fmt_pf(r['profit_factor']):>8}"
+                f"{r['win_rate']:>8.1f}{r['total_pnl_ntd']:>14,.0f}"
+            )
+
+        summary_lines.append(f"\n--- {hold_label} / 突破風格比較(IS，硬門檻 vs 軟性排名) ---")
+        style_df = all_breakout_style[hold_label].sort_values("total_pnl_ntd", ascending=False)
+        header0b = f"{'突破風格':<40}{'交易數':>8}{'PF':>8}{'勝率%':>8}{'總損益NT$':>14}"
+        summary_lines.append(header0b)
+        summary_lines.append("-" * len(header0b))
+        for _, r in style_df.iterrows():
+            summary_lines.append(
+                f"{r['style_label']:<40}{r['trade_count']:>8}{_fmt_pf(r['profit_factor']):>8}"
                 f"{r['win_rate']:>8.1f}{r['total_pnl_ntd']:>14,.0f}"
             )
 
@@ -883,6 +991,12 @@ def main():
         "追在隔日沖已經拉高的位置)。這段結果裡的「平均持有天數」是用來檢查有沒有真的抓到預期"
         "的短波段長度——如果選出來的配置平均持有天數還是偏長，代表天數上限或延遲啟動的參數"
         "要再調緊；如果偏短(例如不到2天就出場)，代表移動停利貼得太緊，健康拉回也被洗出場。"
+        "\n\n新增的「突破風格比較」是這一輪「不追求「準」，追求「賠得少、賺得多、選得穩」」"
+        "這個核心哲學的直接實作：測試把「收盤價一定要站上突破窗口高/低點」這個絕對值硬門檻，"
+        "換成只留最基本的均線結構資格、突破強度改用相對排名(score_breakout_strength)去決定"
+        "候選順序，是不是比絕對值判定更穩定——因為相對排名不管標的池大小或期間怎麼變，"
+        "永遠是拿候選互相比較，不是拿候選跟一個固定的magic number比較。這裡選出的風格"
+        "會固定套用到後面所有階段。"
     )
 
     summary_text = "\n".join(summary_lines)

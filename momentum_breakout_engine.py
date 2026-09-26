@@ -28,6 +28,17 @@
    score_candle_body           K棒實體比例(買盤/賣盤主導意願強不強)
    score_foreign_ratio         外資買超金額佔成交金額比重(可選，需要籌碼資料)
    score_trust_ratio           投信買超金額佔成交金額比重(可選，需要籌碼資料)
+   score_breakout_strength     突破強度：離結構性突破窗口的高/低點還有多少ATR倍數的距離
+                               (連續分數，不是二元判定；require_hard_breakout=False時，
+                               這是唯一還在間接反映「有沒有突破」的分數，取代原本「過了就算，
+                               沒過就不算」的硬門檻，見下方「軟性排名」說明)
+
+軟性排名模式(require_hard_breakout=False，這輪新增)：多輪測試發現「250日創新高」這類
+絕對值硬門檻，結果會隨標的池大小/期間劇烈變動、排名不穩定，改成只保留最基本的「站上20日
+均線」當結構性資格要求，其餘完全交給訊號評分(相對排名)決定要不要進場，包含上面的
+score_breakout_strength——概念是「不追求猜中絕對的突破時機，追求在候選裡相對排名夠前面」，
+對標的池組成的變動理論上應該比絕對值門檻更穩定，但這是需要驗證的假設，不是先驗認定的答案，
+見compare_breakout.py新增的「軟性排名 vs 硬性突破門檻」比較(階段0.7)。
 
 籌碼相關的欄位(ForeignRatio/TrustRatio)查的都是「嚴格早於進場日」的資料(用
 _lookup_prior_row)，不會有隔日衝那邊發現的「偷看當天籌碼」的時間差問題。
@@ -48,6 +59,7 @@ BREAKOUT_SIGNAL_NAMES = [
     "score_volume_ratio", "score_rel_strength", "score_rsi_cross", "score_macd",
     "score_golden_cross", "score_price_volume_new_high", "score_gap_breakout",
     "score_candle_body", "score_foreign_ratio", "score_trust_ratio",
+    "score_breakout_strength",
 ]
 
 # 這幾個訊號需要額外的籌碼資料才能算，沒有籌碼資料時會被自動跳過(不計分，不影響其他訊號)
@@ -282,6 +294,9 @@ def _rank_candidates(rows: list, side: str, signal_weights: dict, top_n: int) ->
     else:
         df["score_trust_ratio"] = 0.0
 
+    breakout_strength = df["breakout_strength_long"] if long_dir else df["breakout_strength_short"]
+    df["score_breakout_strength"] = percentile_score(breakout_strength, higher_is_better=True)
+
     total_weight = sum(signal_weights.get(name, 0.0) for name in BREAKOUT_SIGNAL_NAMES)
     if total_weight <= 0:
         total_weight = 1.0
@@ -308,7 +323,8 @@ def scan_momentum_breakout_candidates(indicators_by_code: dict, as_of_date, regi
                                        min_volume_ratio: float = 0.0,
                                        ex_dividend_dates_by_code: dict = None,
                                        breakout_window: int = 20, min_adx: float = 0.0,
-                                       require_vol_contraction: bool = False) -> list:
+                                       require_vol_contraction: bool = False,
+                                       require_hard_breakout: bool = True) -> list:
     """
     掃描全市場候選標的：先套結構性突破門檻(基本門檻永遠套用，其餘6個額外門檻可選)，
     通過門檻的候選再依加權分數排名，回傳前top_n名多方候選 + 前top_n名空方候選。
@@ -336,6 +352,13 @@ def scan_momentum_breakout_candidates(indicators_by_code: dict, as_of_date, regi
 
     require_vol_contraction：要求近期波動度明顯低於前一段時期(波動收縮比率<=0.85)才算
     候選，抓「盤整、籌碼沉澱後才發動」的突破，過濾「隨便哪天都在噴量」的雜訊股。
+
+    require_hard_breakout：預設True，維持舊版行為(一定要「收盤價>前N日高/低點」才算候選)。
+    設False時改用「軟性排名」模式：只保留最基本的「站上/跌破20日均線」當結構性資格，不再
+    要求絕對值意義上的「有沒有突破」，改交給score_breakout_strength(離突破窗口高/低點的
+    ATR倍數距離，連續分數)在訊號評分階段自然排出「誰比較接近/超過突破」的相對順序——
+    這是回應多輪測試裡「絕對值硬門檻對標的池大小/期間變動極度敏感」的問題，用相對排名
+    取代絕對值判定，理論上應該更穩定，但這是待驗證的假設。
     """
     if signal_weights is None:
         signal_weights = {name: 1.0 for name in BREAKOUT_SIGNAL_NAMES}
@@ -391,13 +414,15 @@ def scan_momentum_breakout_candidates(indicators_by_code: dict, as_of_date, regi
             "gap_up_flag": row["GapUpFlag"], "gap_down_flag": row["GapDownFlag"],
             "bullish_candle_score": row["BullishCandleScore"], "bearish_candle_score": row["BearishCandleScore"],
             "foreign_ratio": row["ForeignRatio"], "trust_ratio": row["TrustRatio"],
+            "breakout_strength_long": (close - rolling_high) / atr,
+            "breakout_strength_short": (rolling_low - close) / atr,
         }
 
         ma5 = row["MA5"]
         ma60 = row["MA60"]
 
         # 多方
-        if regime != "bear" and close > ma20 and close > rolling_high:
+        if regime != "bear" and close > ma20 and (not require_hard_breakout or close > rolling_high):
             ok = True
             if require_above_ma60:
                 ok = ok and not pd.isna(ma60) and close > ma60
@@ -410,7 +435,7 @@ def scan_momentum_breakout_candidates(indicators_by_code: dict, as_of_date, regi
                 long_rows.append(dict(base))
 
         # 空方(對稱)
-        if allow_short and regime != "bull" and close < ma20 and close < rolling_low:
+        if allow_short and regime != "bull" and close < ma20 and (not require_hard_breakout or close < rolling_low):
             ok = True
             if require_above_ma60:
                 ok = ok and not pd.isna(ma60) and close < ma60
@@ -560,7 +585,8 @@ def run_momentum_breakout_backtest(price_data: dict, indicators_by_code: dict, r
                                     require_vol_contraction: bool = False,
                                     max_gap_pct: float = None,
                                     trailing_activation_days: int = 0,
-                                    trailing_activation_profit_atr: float = 0.0):
+                                    trailing_activation_profit_atr: float = 0.0,
+                                    require_hard_breakout: bool = True):
     """
     完整 day-by-day walk-forward 模擬。出場判定/強制平倉/停損冷卻期，重用
     mean_reversion_engine._process_mr_day()，跟均值回歸引擎共用同一套出場機制，
@@ -581,6 +607,10 @@ def run_momentum_breakout_backtest(price_data: dict, indicators_by_code: dict, r
     risk_pct_per_trade：給定時，每筆交易的口數改用風險預算反推(帳戶權益x risk_pct_per_trade
     ÷ 停損距離)，取代固定的lots，且帳戶權益會隨已實現損益動態調整(複利效果)，而不是
     永遠用starting_capital當基準。
+
+    require_hard_breakout：見scan_momentum_breakout_candidates()說明，預設True維持舊版
+    行為；False時改用軟性排名模式(只留MA20結構性資格，突破強度交給score_breakout_strength
+    做相對排名)。
     """
     trades = []
     cooldown_until = {}
@@ -630,6 +660,7 @@ def run_momentum_breakout_backtest(price_data: dict, indicators_by_code: dict, r
                 ex_dividend_dates_by_code=ex_dividend_dates_by_code,
                 breakout_window=breakout_window, min_adx=min_adx,
                 require_vol_contraction=require_vol_contraction,
+                require_hard_breakout=require_hard_breakout,
             )
 
             while slots_available > 0 and candidates:
