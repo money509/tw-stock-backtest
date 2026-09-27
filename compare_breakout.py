@@ -451,6 +451,26 @@ MANUAL_SIGNAL_COMBO_LABEL = "手動指定(MACD轉正+RSI>50+量比放大)"
 MANUAL_SIGNAL_COMBO = {"score_macd": 1.0, "score_rsi_cross": 1.0, "score_volume_ratio": 1.0}
 
 
+# 這組具體規則(訊號+門檻+突破窗口/風格+ATR倍數+出場配置)連續兩輪(本輪+上一輪)完整跑過
+# 整套選擇流程(訊號拆解→訊號組合比較→門檻比較→ATR網格→出場配置比較)後，都被自動選中，
+# 不是隨便挑的候選——但兩輪的歷史區間幾乎完全重疊(只差1天的起訖日)，嚴格來說不算獨立
+# 驗證過兩次，只能算「同一份資料重複跑，程式邏輯本身沒有隨機性導致結果一致」，這裡才
+# 用真正互相獨立、不重疊的歷史切段去測試這組固定規則，才是這個常數存在的意義。
+FIXED_WALKFORWARD_COMBO = {
+    "label": "固定候選(MACD柱狀圖+K棒實體比例, +站上季線, 52週窗口+軟性排名, ATR1.5/1.5, 魚身整合版出場)",
+    "signal_weights": {"score_macd": 1.0, "score_candle_body": 1.0},
+    "gate_kwargs": {"require_above_ma60": True},
+    "breakout_window": 250,
+    "require_hard_breakout": False,
+    "atr_stop_mult": 1.5,
+    "trailing_atr_mult": 1.5,
+    "exit_kwargs": {
+        "max_hold_days_override": 10, "trailing_activation_days": 2,
+        "trailing_activation_profit_atr": 1.5, "max_gap_pct": 0.025,
+    },
+}
+
+
 def run_signal_combo_comparison(price_data, indicators_by_code, regime_series, is_calendar,
                                  starting_capital, hold_days, auto_label, auto_weights, extra_kwargs=None):
     """比較「自動篩選出的訊號組合」vs 使用者手動指定的固定組合(MANUAL_SIGNAL_COMBO)。
@@ -853,6 +873,79 @@ def run_walkforward_validation(price_data, indicators_by_code, regime_series, ma
     return pd.DataFrame(rows)
 
 
+DEFAULT_FIXED_COMBO_WALKFORWARD_FOLDS = 6  # 見run_fixed_combo_walkforward()docstring：規則固定、
+# 不用每折重跑整套選擇流程，成本低很多，所以建議值比run_walkforward_validation()的3折高
+
+
+def run_fixed_combo_walkforward(price_data, indicators_by_code, regime_series, master_calendar,
+                                 starting_capital, extra_kwargs, execution_kwargs, n_folds,
+                                 fixed_combo=FIXED_WALKFORWARD_COMBO) -> pd.DataFrame:
+    """
+    把master_calendar切成n_folds個等長、完全不重疊、彼此獨立的連續區塊，每一塊都直接套用
+    同一組「固定死」的規則(fixed_combo，不重新挑選任何訊號/門檻/ATR倍數/出場配置)，各自
+    回測一次。跟run_walkforward_validation()(每折重新選一次組合)是互補、不是取代關係：
+    這裡驗證的是「一組已經定案的具體規則，本身跨時間穩不穩定」，因為規則是固定的、
+    不是每折現選的，這裡沒有run_walkforward_validation()那種「每折都在挑當下表現最好的
+    答案」的多重比較風險，所以可以放心切更多折(不用重跑整套選擇流程，每折只是單純
+    backtest一次，成本低很多)。
+
+    ⚠️ 這不是完全乾淨的盲測：fixed_combo這組規則本身，是从過去兩輪用全部歷史跑過的
+    完整選擇流程裡「觀察到」被選中的候選，這些折涵蓋的日期，有極大部分正是當初挑出
+    這組規則所使用的同一份歷史——不是先固定規則、才第一次看到這些資料。這裡驗證的是
+    「這組已知規則，在切成多段獨立區間分別看時是否維持一致的表現」，不是嚴格意義上
+    「這組規則在全新、從未用來挑選過任何東西的資料上」的驗證(後者是cross_period_validation.py
+    那種完全跳到不重疊歷史年份的做法在做的事)。
+
+    每個區塊只需要滿足這套引擎既有的60日暖身門檻(scan_momentum_breakout_candidates()裡
+    pos<60會跳過)，不需要額外的訓練窗口——因為規則不是從這個區塊的資料裡選出來的，這個
+    區塊前面的歷史(precompute階段已經算好的完整序列)已經提供了指標需要的暖身資料。
+
+    回傳DataFrame，一列一個區塊：區塊編號、起訖日期、交易數/PF/勝率/總損益/平均持有天數。
+    """
+    n = len(master_calendar)
+    bounds = [int(round(k * n / n_folds)) for k in range(n_folds + 1)]
+
+    exit_kwargs = dict(fixed_combo["exit_kwargs"])
+    max_hold_days = exit_kwargs.pop("max_hold_days_override", TRAILING_STOP_MAX_HOLD_DAYS)
+
+    rows = []
+    for i in range(n_folds):
+        chunk = master_calendar[bounds[i]:bounds[i + 1]]
+        if len(chunk) == 0:
+            print(f"  [固定規則walk-forward 第{i + 1}折] 區塊天數為0，跳過這一折", flush=True)
+            continue
+
+        trades = run_momentum_breakout_backtest(
+            price_data=price_data, indicators_by_code=indicators_by_code, regime_series=regime_series,
+            master_calendar=chunk, max_hold_days=max_hold_days, starting_capital=starting_capital,
+            allow_short=True, signal_weights=fixed_combo["signal_weights"],
+            atr_stop_mult=fixed_combo["atr_stop_mult"], use_trailing_stop=True,
+            trailing_atr_mult=fixed_combo["trailing_atr_mult"],
+            breakout_window=fixed_combo["breakout_window"],
+            require_hard_breakout=fixed_combo["require_hard_breakout"],
+            **fixed_combo["gate_kwargs"], **extra_kwargs, **exit_kwargs, **execution_kwargs,
+        )
+        stats = summarize_mr(trades, starting_capital)
+        if stats["trade_count"] < MIN_TRADES_FOR_GATE_RANKING:
+            print(f"  [固定規則walk-forward 第{i + 1}/{n_folds}折] "
+                  f"{chunk[0].date()}~{chunk[-1].date()}：交易筆數({stats['trade_count']}筆)"
+                  f"不足{MIN_TRADES_FOR_GATE_RANKING}筆，跳過這一折(不計入統計)", flush=True)
+            continue
+
+        rows.append({
+            "fold": i + 1,
+            "period_start": chunk[0].date().isoformat(), "period_end": chunk[-1].date().isoformat(),
+            "trade_count": stats["trade_count"], "profit_factor": stats["profit_factor"],
+            "win_rate": stats["win_rate"], "total_pnl_ntd": stats["total_pnl_ntd"],
+            "avg_hold_days": stats["avg_hold_days"],
+        })
+        print(f"  [固定規則walk-forward 第{i + 1}/{n_folds}折] {chunk[0].date()}~{chunk[-1].date()} "
+              f"-> {stats['trade_count']}筆, PF={_fmt_pf(stats['profit_factor'])}, "
+              f"勝率={stats['win_rate']:.1f}%, 損益={stats['total_pnl_ntd']:,.0f}", flush=True)
+
+    return pd.DataFrame(rows)
+
+
 def main():
     parser = argparse.ArgumentParser(description="右側順勢突破策略 - 訊號拆解 + 結構門檻 + 最終組合驗證")
     parser.add_argument("--start", default=(datetime.date.today() - datetime.timedelta(days=1095)).isoformat())
@@ -893,6 +986,15 @@ def main():
                               f"驗證選出的組合在多折之間是不是穩定，不是只有一次OOS切分。"
                               f"預設建議值{DEFAULT_WALKFORWARD_FOLDS}折(GitHub Actions有~2.5小時的"
                               f"時間預算，這是全新階段、實際耗時還沒有校準過，先保守設小一點)")
+    parser.add_argument("--fixed-combo-walkforward-folds", type=int, default=0,
+                         help="測試「同一組已經連續兩輪被自動選中的固定規則」(FIXED_WALKFORWARD_COMBO，"
+                              "訊號/門檻/突破窗口/ATR倍數/出場配置全部固定死，不重新挑選)跨N個獨立、"
+                              "不重疊歷史區塊的表現，0代表不啟用(預設)。跟--walkforward-folds不同的是"
+                              "這裡不是每折重新選一次組合，而是同一組規則原封不動套到每一個區塊，"
+                              "所以沒有--walkforward-folds那種每折都在挑當下最好答案的多重比較風險，"
+                              f"可以放心切更多折(成本低很多，不用重跑整套訊號拆解→訊號組合→門檻→"
+                              f"ATR網格→出場配置的選擇流程，每折只是單純backtest一次)。"
+                              f"預設建議值{DEFAULT_FIXED_COMBO_WALKFORWARD_FOLDS}折")
     args = parser.parse_args()
 
     os.makedirs(RESULTS_DIR, exist_ok=True)
@@ -1136,6 +1238,23 @@ def main():
             walkforward_df.to_csv(os.path.join(RESULTS_DIR, "walkforward_folds.csv"),
                                    index=False, encoding="utf-8-sig")
 
+    fixed_combo_walkforward_df = None
+    if args.fixed_combo_walkforward_folds > 0:
+        print(f"\n[固定規則walk-forward驗證] 把同一組已經連續兩輪被自動選中的固定規則"
+              f"({FIXED_WALKFORWARD_COMBO['label']})，原封不動套到"
+              f"{args.fixed_combo_walkforward_folds}個獨立、不重疊的歷史區塊各跑一次 ...")
+        print("⚠️ 這裡不重新挑選任何訊號/門檻/ATR倍數/出場配置，套的extra_kwargs是除權息清洗/"
+              "滑價這些執行細節，不是外層選出的突破窗口/突破風格(fixed_combo自己指定了"
+              "breakout_window/require_hard_breakout)，見run_fixed_combo_walkforward()docstring\n")
+        fixed_combo_walkforward_df = run_fixed_combo_walkforward(
+            price_data, indicators_by_code, regime_series, master_calendar,
+            args.starting_capital, extra_kwargs, execution_kwargs,
+            args.fixed_combo_walkforward_folds,
+        )
+        if not fixed_combo_walkforward_df.empty:
+            fixed_combo_walkforward_df.to_csv(os.path.join(RESULTS_DIR, "fixed_combo_walkforward.csv"),
+                                               index=False, encoding="utf-8-sig")
+
     summary_lines = [
         "=" * 100,
         f"右側順勢突破策略 訊號拆解 + 結構門檻 + 最終組合驗證",
@@ -1297,6 +1416,39 @@ def main():
                 f"\n  [穩定性] {len(walkforward_df)}折中出現{n_distinct_combos}種不同的訊號組合被選中"
                 f"({'同一組合每折都被選中，穩定性較高' if n_distinct_combos == 1 else '每折選到不同組合，穩定性較低，較可能是在追這段歷史的雜訊'})"
                 f"　{pf_range_str}"
+            )
+
+    if fixed_combo_walkforward_df is not None:
+        summary_lines.append(f"\n--- 固定規則walk-forward驗證(共{args.fixed_combo_walkforward_folds}個獨立、"
+                              f"不重疊區塊，同一組已連續兩輪被自動選中的固定規則，原封不動套用，不重新挑選) ---")
+        summary_lines.append(f"  固定規則：{FIXED_WALKFORWARD_COMBO['label']}")
+        if fixed_combo_walkforward_df.empty:
+            summary_lines.append("  ⚠️ 所有區塊都因為交易筆數太少被跳過，沒有任何可用結果")
+        else:
+            header_fcwf = (f"{'區塊':>4}{'期間':<24}{'交易數':>8}{'PF':>8}{'勝率%':>8}"
+                            f"{'總損益NT$':>14}{'平均持有天':>10}")
+            summary_lines.append(header_fcwf)
+            summary_lines.append("-" * len(header_fcwf))
+            for _, r in fixed_combo_walkforward_df.iterrows():
+                summary_lines.append(
+                    f"{int(r['fold']):>4}"
+                    f"{r['period_start'] + '~' + r['period_end']:<24}"
+                    f"{r['trade_count']:>8}{_fmt_pf(r['profit_factor']):>8}{r['win_rate']:>8.1f}"
+                    f"{r['total_pnl_ntd']:>14,.0f}{r['avg_hold_days']:>10.1f}"
+                )
+            finite_pf_fc = [pf for pf in fixed_combo_walkforward_df["profit_factor"] if pf != float("inf")]
+            has_inf_pf_fc = any(pf == float("inf") for pf in fixed_combo_walkforward_df["profit_factor"])
+            if finite_pf_fc:
+                pf_range_str_fc = (f"PF範圍(排除∞)：min={min(finite_pf_fc):.2f}, max={max(finite_pf_fc):.2f}, "
+                                    f"mean={sum(finite_pf_fc) / len(finite_pf_fc):.2f}"
+                                    f"{'(另有區塊PF=∞，通常代表交易筆數太少，不是真的沒有風險)' if has_inf_pf_fc else ''}")
+            else:
+                pf_range_str_fc = "PF範圍：全部區塊都是∞或無交易，無法計算平均"
+            n_positive_fc = sum(1 for pf in fixed_combo_walkforward_df["profit_factor"] if pf > 1)
+            summary_lines.append(
+                f"\n  [穩定性] {pf_range_str_fc}　PF>1的區塊：{n_positive_fc}/{len(fixed_combo_walkforward_df)}"
+                f"　PF範圍越窄、且大多數區塊PF>1，才代表這組規則真的跨時間穩定；範圍很寬或大部分<1，"
+                f"代表這組規則本身也站不住腳，不是選擇方法論的問題，是規則本身不夠好"
             )
 
     summary_lines.append(

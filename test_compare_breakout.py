@@ -108,3 +108,80 @@ class TestRunWalkforwardValidation:
         parser.add_argument("--walkforward-folds", type=int, default=0)
         args = parser.parse_args([])
         assert args.walkforward_folds == 0
+
+
+class TestRunFixedComboWalkforward:
+    def test_returns_one_row_per_chunk_with_expected_columns(self):
+        price_data, indicators_by_code, regime_series, master_calendar = _build_synthetic_universe()
+        df = cb.run_fixed_combo_walkforward(
+            price_data, indicators_by_code, regime_series, master_calendar,
+            starting_capital=1_000_000, extra_kwargs={}, execution_kwargs={"lots": 2},
+            n_folds=4,
+        )
+        expected_cols = {
+            "fold", "period_start", "period_end", "trade_count", "profit_factor",
+            "win_rate", "total_pnl_ntd", "avg_hold_days",
+        }
+        assert isinstance(df, pd.DataFrame)
+        if not df.empty:
+            assert expected_cols.issubset(set(df.columns))
+            # 區塊編號應該是遞增的、不重複的(彼此獨立、不重疊的切段)
+            assert list(df["fold"]) == sorted(df["fold"])
+
+    def test_chunks_below_min_trades_are_skipped_without_crashing(self):
+        # 只給很短的歷史、切成很多折，大部分區塊交易筆數會太少(甚至0)，應該被跳過
+        # 而不是拋例外，回傳的列數會少於n_folds(或整個是空的)
+        price_data, indicators_by_code, regime_series, master_calendar = _build_synthetic_universe(n=90)
+        df = cb.run_fixed_combo_walkforward(
+            price_data, indicators_by_code, regime_series, master_calendar,
+            starting_capital=1_000_000, extra_kwargs={}, execution_kwargs={"lots": 2},
+            n_folds=8,
+        )
+        assert isinstance(df, pd.DataFrame)
+        assert len(df) <= 8
+        if not df.empty:
+            assert (df["trade_count"] >= cb.MIN_TRADES_FOR_GATE_RANKING).all()
+
+    def test_does_not_touch_network_facing_loaders(self, monkeypatch):
+        import data_loader
+        import chip_data_loader
+
+        def _boom(*args, **kwargs):
+            raise AssertionError("run_fixed_combo_walkforward不應該呼叫任何資料下載函式")
+
+        monkeypatch.setattr(data_loader, "load_price_data", _boom)
+        monkeypatch.setattr(chip_data_loader, "load_chip_data", _boom)
+
+        price_data, indicators_by_code, regime_series, master_calendar = _build_synthetic_universe()
+        df = cb.run_fixed_combo_walkforward(
+            price_data, indicators_by_code, regime_series, master_calendar,
+            starting_capital=1_000_000, extra_kwargs={}, execution_kwargs={"lots": 2},
+            n_folds=3,
+        )
+        assert isinstance(df, pd.DataFrame)
+
+    def test_fixed_combo_constant_kwargs_are_runnable(self):
+        # FIXED_WALKFORWARD_COMBO的鍵要能直接餵進run_momentum_breakout_backtest，一個鍵名
+        # 打錯就會是TypeError(unexpected keyword argument)，不是靜默吞掉例外——這裡直接呼叫
+        # 整個run_fixed_combo_walkforward()，讓任何關鍵字不匹配都會真的丟出例外讓測試失敗。
+        price_data, indicators_by_code, regime_series, master_calendar = _build_synthetic_universe()
+        combo = cb.FIXED_WALKFORWARD_COMBO
+        assert set(combo.keys()) == {
+            "label", "signal_weights", "gate_kwargs", "breakout_window",
+            "require_hard_breakout", "atr_stop_mult", "trailing_atr_mult", "exit_kwargs",
+        }
+        df = cb.run_fixed_combo_walkforward(
+            price_data, indicators_by_code, regime_series, master_calendar,
+            starting_capital=1_000_000, extra_kwargs={}, execution_kwargs={"lots": 2},
+            n_folds=2,
+        )
+        assert isinstance(df, pd.DataFrame)
+
+    def test_default_fixed_combo_walkforward_folds_constant_is_six(self):
+        assert cb.DEFAULT_FIXED_COMBO_WALKFORWARD_FOLDS == 6
+
+    def test_fixed_combo_walkforward_folds_cli_flag_defaults_to_zero(self):
+        parser = argparse.ArgumentParser()
+        parser.add_argument("--fixed-combo-walkforward-folds", type=int, default=0)
+        args = parser.parse_args([])
+        assert args.fixed_combo_walkforward_folds == 0
