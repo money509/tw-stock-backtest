@@ -32,6 +32,18 @@
                                (連續分數，不是二元判定；require_hard_breakout=False時，
                                這是唯一還在間接反映「有沒有突破」的分數，取代原本「過了就算，
                                沒過就不算」的硬門檻，見下方「軟性排名」說明)
+   score_foreign_streak       外資連續買超天數(可選，需要籌碼資料，見chip_data_loader.
+                               precompute_chip_streak)，正值=連續買超、負值=連續賣超
+   score_trust_streak         投信連續買超天數(同上，換成投信)
+   score_institutional_net_1d/5d/10d
+                               主力(外資+投信合計)買賣超強度，近1/5/10日買賣超金額
+                               ÷ 近1/5/10日成交金額，三個窗口是同一個現象在不同時間
+                               解析度下的版本(可選，需要籌碼資料)
+   score_macd_divergence      MACD背離(近似實作，不是嚴謹的擺盪高低點背離偵測，見
+                               precompute_breakout_indicators()說明)：股價這段期間沒漲
+                               (跌)，但MACD線動能本身已經在轉強(弱)，早期反轉訊號
+   score_volume_spike         短窗(5日)成交量急增，跟score_volume_ratio的20日窗口刻意
+                               區隔開，抓的是「這一兩天突然爆量」而不是「近期量能持續偏高」
 
 軟性排名模式(require_hard_breakout=False，這輪新增)：多輪測試發現「250日創新高」這類
 絕對值硬門檻，結果會隨標的池大小/期間劇烈變動、排名不穩定，改成只保留最基本的「站上20日
@@ -63,12 +75,19 @@ from mean_reversion_engine import (
     DEFAULT_MARGIN_CAP_RATIO,
 )
 from overnight_momentum_engine import percentile_score
+from chip_data_loader import precompute_chip_streak
 
 BREAKOUT_SIGNAL_NAMES = [
     "score_volume_ratio", "score_rel_strength", "score_rsi_cross", "score_macd",
     "score_golden_cross", "score_price_volume_new_high", "score_gap_breakout",
     "score_candle_body", "score_foreign_ratio", "score_trust_ratio",
     "score_breakout_strength",
+    # 這一輪新增(見compare_breakout.py的SIGNAL_LABELS新增項目跟本檔案模組docstring)：
+    # 外資/投信連續買超天數(籌碼動能延續性)、主力(外資+投信合計)買賣超強度(1/5/10日窗口)、
+    # MACD背離近似訊號、5日窗口的短窗成交量急增(跟原本score_volume_ratio的20日窗口區隔開)。
+    "score_foreign_streak", "score_trust_streak",
+    "score_institutional_net_1d", "score_institutional_net_5d", "score_institutional_net_10d",
+    "score_macd_divergence", "score_volume_spike",
 ]
 
 # 均線型態門檻(require_ma_pattern=True時使用，見scan_momentum_breakout_candidates說明)：
@@ -79,7 +98,11 @@ MA_CONVERGENCE_THRESHOLD = 0.5
 MA_SLOPE_LOOKBACK = 5
 
 # 這幾個訊號需要額外的籌碼資料才能算，沒有籌碼資料時會被自動跳過(不計分，不影響其他訊號)
-CHIP_DEPENDENT_SIGNALS = {"score_foreign_ratio", "score_trust_ratio"}
+CHIP_DEPENDENT_SIGNALS = {
+    "score_foreign_ratio", "score_trust_ratio",
+    "score_foreign_streak", "score_trust_streak",
+    "score_institutional_net_1d", "score_institutional_net_5d", "score_institutional_net_10d",
+}
 
 
 def compute_macd(close: pd.Series, fast: int = 12, slow: int = 26, signal: int = 9):
@@ -103,6 +126,23 @@ def compute_institutional_ratio(chip_df: pd.DataFrame, price_df: pd.DataFrame, n
     net_shares = chip_df[net_col].reindex(price_df.index)
     amount = net_shares * close
     return amount / turnover_value
+
+
+def compute_institutional_combined_ratio(chip_df: pd.DataFrame, price_df: pd.DataFrame, window: int) -> pd.Series:
+    """
+    外資+投信合計買賣超金額，近window天加總 ÷ 近window天成交金額加總，對齊到price_df的日期索引。
+    是compute_institutional_ratio()的多日累加版本：單日買賣超雜訊較大，window天加總可以看
+    「這幾天主力是不是持續偏buy或偏sell」，不是只看單一天。window=1時等價於
+    (foreign_net+trust_net)換算金額的單日比重版本。
+    """
+    close = price_df["Close"]
+    volume = price_df["Volume"]
+    turnover_value = (close * volume).replace(0, np.nan)
+    combined_net_shares = (chip_df["foreign_net"] + chip_df["trust_net"]).reindex(price_df.index)
+    amount = combined_net_shares * close
+    amount_sum = amount.rolling(window).sum()
+    turnover_sum = turnover_value.rolling(window).sum()
+    return amount_sum / turnover_sum.replace(0, np.nan)
 
 
 def compute_adx(df: pd.DataFrame, period: int = 14) -> pd.Series:
@@ -138,7 +178,8 @@ def precompute_breakout_indicators(df: pd.DataFrame, index_close: pd.Series, chi
                                     golden_cross_lookback: int = 3, gap_lookback: int = 5,
                                     gap_threshold: float = 0.02, candle_lookback: int = 3,
                                     extra_breakout_windows: tuple = (5, 60, 250),
-                                    vol_contraction_short: int = 10, vol_contraction_prior: int = 20) -> pd.DataFrame:
+                                    vol_contraction_short: int = 10, vol_contraction_prior: int = 20,
+                                    divergence_lookback: int = 20) -> pd.DataFrame:
     """
     針對一檔股票的完整價格序列，一次算好突破策略需要的全部指標(技術面10個訊號用得到的欄位 +
     結構性門檻用得到的欄位)。所有rolling/shift計算在完整序列上一次算好，跟均值回歸引擎的
@@ -155,6 +196,9 @@ def precompute_breakout_indicators(df: pd.DataFrame, index_close: pd.Series, chi
     「近vol_contraction_short天的平均波動度」跟「再往前vol_contraction_prior天的平均波動度」
     的比值，比值明顯小於1代表波動剛收縮完，通常對應盤整、籌碼沉澱的階段，此時如果接著突破，
     比「隨便哪天」的突破更可信(不是每天都在噴出雜訊的股票，剛好那天噴了一根)。
+
+    divergence_lookback：MACD背離(score_macd_divergence，見下方計算)用的回顧天數，預設20天，
+    跟rel_strength_window一樣是固定窗口參數，不是動態算出來的。
     """
     close = df["Close"]
     open_ = df["Open"]
@@ -191,7 +235,29 @@ def precompute_breakout_indicators(df: pd.DataFrame, index_close: pd.Series, chi
     atr_pct_prior = atr_pct.shift(vol_contraction_short).rolling(vol_contraction_prior).mean()
     vol_contraction_ratio = atr_pct_recent / atr_pct_prior.replace(0, np.nan)
 
-    _, _, macd_hist = compute_macd(close)
+    macd_line, _, macd_hist = compute_macd(close)
+
+    # 短窗成交量急增(score_volume_spike用)：跟score_volume_ratio的20日窗口區隔開，
+    # 這裡用5日窗口，目的是抓「這一兩天突然爆量」而不是「這段期間量能持續偏高」，
+    # 兩者是不同的現象，用不同窗口才不會變成同一個訊號重複計分。
+    vol_avg5 = volume.rolling(5).mean()
+    volume_ratio_5d = volume / vol_avg5.replace(0, np.nan)
+
+    # MACD背離(score_macd_divergence，近似實作，不是精確的擺盪高低點背離偵測)：
+    # 嚴謹的技術分析定義的背離，是找股價的擺盪高/低點(swing high/low)，比較連續兩個
+    # 擺盪點價格跟MACD指標值的方向是否一致——這需要峰谷偵測(peak/trough finding)，
+    # 這個檔案裡其他指標都沒有用到這種非向量化、狀態機式的演算法，貿然加一個會讓
+    # 這個函式從「完整序列一次算好」變成需要逐日判斷擺盪點，複雜度不成比例。
+    # 這裡改用一個業界常見的近似做法：直接比較「股價這段期間(divergence_lookback天)
+    # 的變化」跟「MACD線(不是柱狀圖，是動能本身)這段期間的變化」方向是否背離——
+    # 多頭背離：股價這段期間走平或下跌，但MACD動能本身已經在轉強(早期反轉訊號，
+    # 股價還沒確認，動能已經先轉向)；空頭背離對稱。這不是嚴格意義上的「兩個擺盪點
+    # 之間背離」，只是「一段期間的價格變化 vs 動能變化」方向不一致，會比精確定義
+    # 更容易誤觸發(尤其是盤整區間)，是待驗證的近似訊號，不是精確訊號。
+    price_change_n = close.pct_change(divergence_lookback)
+    macd_change_n = macd_line.diff(divergence_lookback)
+    bullish_divergence = (-price_change_n).clip(lower=0) * macd_change_n.clip(lower=0)
+    bearish_divergence = price_change_n.clip(lower=0) * (-macd_change_n).clip(lower=0)
 
     stock_ret = close.pct_change(rel_strength_window)
     idx_aligned = index_close.reindex(close.index).ffill()
@@ -253,15 +319,27 @@ def precompute_breakout_indicators(df: pd.DataFrame, index_close: pd.Series, chi
         "ADX": adx, "VolContractionRatio": vol_contraction_ratio,
         "MASpreadOverATR": ma_spread_over_atr,
         "MA5Slope5": ma5_slope, "MA20Slope5": ma20_slope, "MA60Slope5": ma60_slope,
+        "VolumeRatio5D": volume_ratio_5d,
+        "BullishDivergence": bullish_divergence, "BearishDivergence": bearish_divergence,
         **extra_rolling_cols,
     }, index=df.index)
 
     if chip_df is not None:
         result["ForeignRatio"] = compute_institutional_ratio(chip_df, df, "foreign_net")
         result["TrustRatio"] = compute_institutional_ratio(chip_df, df, "trust_net")
+        result["ForeignStreak"] = precompute_chip_streak(chip_df, "foreign_net").reindex(df.index)
+        result["TrustStreak"] = precompute_chip_streak(chip_df, "trust_net").reindex(df.index)
+        result["InstitutionalNet1D"] = compute_institutional_combined_ratio(chip_df, df, window=1)
+        result["InstitutionalNet5D"] = compute_institutional_combined_ratio(chip_df, df, window=5)
+        result["InstitutionalNet10D"] = compute_institutional_combined_ratio(chip_df, df, window=10)
     else:
         result["ForeignRatio"] = np.nan
         result["TrustRatio"] = np.nan
+        result["ForeignStreak"] = np.nan
+        result["TrustStreak"] = np.nan
+        result["InstitutionalNet1D"] = np.nan
+        result["InstitutionalNet5D"] = np.nan
+        result["InstitutionalNet10D"] = np.nan
 
     return result
 
@@ -325,6 +403,39 @@ def _rank_candidates(rows: list, side: str, signal_weights: dict, top_n: int) ->
 
     breakout_strength = df["breakout_strength_long"] if long_dir else df["breakout_strength_short"]
     df["score_breakout_strength"] = percentile_score(breakout_strength, higher_is_better=True)
+
+    # 外資/投信連續買超天數(正值=連續買超、負值=連續賣超，見chip_data_loader.precompute_chip_streak)：
+    # 多方看「連續買超天數越多越好」，空方看「連續賣超(負值，絕對值越大)越好」，
+    # 跟score_rel_strength處理正負號的方式完全一樣，higher_is_better隨long_dir切換即可，
+    # 不需要另外加負號，percentile_score本身會依higher_is_better決定排序方向。
+    if df["foreign_streak"].notna().any():
+        df["score_foreign_streak"] = percentile_score(df["foreign_streak"], higher_is_better=long_dir)
+    else:
+        df["score_foreign_streak"] = 0.0
+    if df["trust_streak"].notna().any():
+        df["score_trust_streak"] = percentile_score(df["trust_streak"], higher_is_better=long_dir)
+    else:
+        df["score_trust_streak"] = 0.0
+
+    # 主力(外資+投信合計)買賣超強度，1/5/10日三個窗口——這就是使用者說的「主力的買賣超」，
+    # 三個窗口分別看「當天」「近一週」「近兩週」的力道是否持續偏buy或偏sell，不是三個
+    # 互相獨立的概念，是同一個現象在不同時間解析度下的版本，所以不另外設計「主力買賣超」
+    # 這個第4個訊號，避免重複計分。
+    for w, col in [(1, "institutional_net_1d"), (5, "institutional_net_5d"), (10, "institutional_net_10d")]:
+        score_name = f"score_institutional_net_{w}d"
+        if df[col].notna().any():
+            df[score_name] = percentile_score(df[col], higher_is_better=long_dir)
+        else:
+            df[score_name] = 0.0
+
+    # MACD背離(近似實作，見precompute_breakout_indicators()的說明)：多方看多頭背離強度，
+    # 空方看空頭背離強度，都是「越大越好」(不需要依long_dir切換higher_is_better，
+    # 因為bullish/bearish已經是依方向算好的兩個獨立欄位，不是同一個欄位帶正負號)。
+    divergence = df["bullish_divergence"] if long_dir else df["bearish_divergence"]
+    df["score_macd_divergence"] = percentile_score(divergence, higher_is_better=True)
+
+    # 短窗(5日)成交量急增，跟score_volume_ratio的20日窗口區隔開，抓的是「這一兩天突然爆量」
+    df["score_volume_spike"] = percentile_score(df["volume_ratio_5d"], higher_is_better=True)
 
     total_weight = sum(signal_weights.get(name, 0.0) for name in BREAKOUT_SIGNAL_NAMES)
     if total_weight <= 0:
@@ -462,6 +573,12 @@ def scan_momentum_breakout_candidates(indicators_by_code: dict, as_of_date, regi
             "foreign_ratio": row["ForeignRatio"], "trust_ratio": row["TrustRatio"],
             "breakout_strength_long": (close - rolling_high) / atr,
             "breakout_strength_short": (rolling_low - close) / atr,
+            "foreign_streak": row["ForeignStreak"], "trust_streak": row["TrustStreak"],
+            "institutional_net_1d": row["InstitutionalNet1D"],
+            "institutional_net_5d": row["InstitutionalNet5D"],
+            "institutional_net_10d": row["InstitutionalNet10D"],
+            "bullish_divergence": row["BullishDivergence"], "bearish_divergence": row["BearishDivergence"],
+            "volume_ratio_5d": row["VolumeRatio5D"],
         }
 
         ma_pattern_bullish = ma_pattern_bearish = True

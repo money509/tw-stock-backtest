@@ -109,6 +109,19 @@ compare_breakout.py
        「3天出場+保本停損」出場配置(強制出場天數從10天縮短到3天)。
     這幾個都是使用者盤感提出、還沒被驗證過的新假設，程式會照實測出來的PF/總損益排名，
     不會因為背後的邏輯聽起來合理就預設會贏。
+12. **新增7個訊號 + 明確跳過融資融券比/家數差 + 走勢前進(Walk-Forward)分折驗證(這輪新增)**：
+    a. 7個新訊號(見momentum_breakout_engine.py模組docstring/SIGNAL_LABELS)：外資/投信
+       連續買超天數(score_foreign_streak/score_trust_streak)、主力(外資+投信合計)買賣超
+       強度1/5/10日窗口(score_institutional_net_1d/5d/10d，這就是使用者說的「主力買賣超」)、
+       MACD背離近似訊號(score_macd_divergence，⚠️近似實作，不是嚴謹的擺盪高低點背離)、
+       短窗(5日)成交量急增(score_volume_spike，跟既有20日窗口的量比訊號刻意區隔開)。
+    b. **明確跳過融資融券比/家數差**：不是忘記做，是資料源缺口(需要另一個TWSE報表/
+       付費第三方資料)，見chip_data_loader.py模組docstring最後一段的完整說明。
+    c. **走勢前進(Walk-Forward)分折驗證**(新增`--walkforward-folds`，見
+       run_walkforward_validation())：回應「單一次OOS切分可能只是運氣好」的疑慮，把歷史
+       切成N+1個等長區塊，每折用擴張視窗重新跑一次完整選股流程，只在自己的測試窗口驗證，
+       用來檢查選出的訊號/門檻/出場配置跨時間是否穩定。0(預設)代表不啟用，不影響原本
+       單一次IS/OOS驗證的行為。詳見README「走勢前進(Walk-Forward)分折驗證」一節。
 
 用法：
     python3 compare_breakout.py --start 2023-09-15 --end 2026-09-14 --max-stocks 50
@@ -116,6 +129,7 @@ compare_breakout.py
     python3 compare_breakout.py --use-trailing-stop --atr-stop-mult 1.0
     python3 compare_breakout.py --use-trailing-stop --max-concurrent-positions 3 \\
         --risk-pct-per-trade 0.02 --slippage-pct 0.002 --multi-period-test
+    python3 compare_breakout.py --use-trailing-stop --walkforward-folds 3
 
 ⚠️ 誠實揭露：跟 mean_reversion_engine.py 共用的已知限制(結算日近似、大盤氛圍濾網用0050
 代理、跌停鎖死/注意股處置股未實作、倖存者偏差、保證金追繳/強制斷頭沒有完整模擬)在這裡
@@ -156,6 +170,13 @@ SIGNAL_LABELS = {
     "score_foreign_ratio": "外資買超比重",
     "score_trust_ratio": "投信買超比重",
     "score_breakout_strength": "突破強度(ATR倍數相對排名)",
+    "score_foreign_streak": "外資連續買超天數",
+    "score_trust_streak": "投信連續買超天數",
+    "score_institutional_net_1d": "主力買賣超(1日)",
+    "score_institutional_net_5d": "主力買賣超(5日)",
+    "score_institutional_net_10d": "主力買賣超(10日)",
+    "score_macd_divergence": "MACD背離(近似)",
+    "score_volume_spike": "成交量急增(5日窗口)",
 }
 
 HOLD_DAYS_OPTIONS = [("短線5天", 5), ("中期15天", 15)]
@@ -697,6 +718,141 @@ def run_multi_period_validation(universe, index_proxy_code, winning_signal_weigh
     return rows
 
 
+DEFAULT_WALKFORWARD_FOLDS = 3  # 見run_walkforward_validation()docstring：時間預算考量下的保守預設值
+WALKFORWARD_MIN_TRAIN_DAYS = 60  # 對應引擎裡「pos < 60」的最小暖身天數安全檢查(見下方docstring)
+
+
+def run_walkforward_validation(price_data, indicators_by_code, regime_series, master_calendar,
+                                starting_capital, extra_kwargs, execution_kwargs, n_folds, has_chip):
+    """
+    走勢前進(Walk-Forward)分折驗證：把master_calendar切成n_folds+1個等長區塊
+    (chunks[0], chunks[1], ..., chunks[n_folds])，第i折(i=0..n_folds-1)的訓練窗口
+    = chunks[0..i]接起來(擴張視窗，從最開始一路累積到第i折開始前)，測試窗口 =
+    chunks[i+1](緊接在訓練窗口之後、訓練時完全沒看過的一段連續日期)。這是刻意選的
+    最簡單切法(不是唯一合理的切法)，白話比喻：訓練窗口像是「模擬考題庫」，測試窗口
+    是「正式大考」，每一折的大考範圍都是前面模擬考完全沒出現過的一段，而且題庫
+    只會越滾越大(擴張視窗)，不會用到考試當下還沒發生的未來資料。
+
+    每一折都用訓練窗口重新跑一次完整的選股流程(訊號拆解 → 訊號組合比較 → 門檻比較 →
+    ATR敏感度網格 → 出場配置比較)，選出這一折自己的「最佳組合」，再原封不動套到這一折
+    的測試窗口驗證一次。這樣可以看出「同一組訊號/門檻/出場配置是不是每一折都被選中」
+    (穩定=可信，每折選到不同組合=不穩定，比較像是在追過去這段歷史的雜訊，不是抓到
+    真正跨時間都成立的優勢)。
+
+    ⚠️ 兩個明確的簡化/取捨(時間預算考量，見compare_breakout.py docstring)：
+    1. **不重跑突破窗口比較(階段0)跟突破風格比較(階段0.7)**：這兩階段選出的
+       breakout_window/require_hard_breakout，直接沿用外層(用全部歷史一次選出)的結果，
+       透過extra_kwargs傳進來，每一折不會重新選一次。這是一個需要驗證、目前沒有驗證的
+       簡化假設：這裡驗證的是「訊號/門檻/出場配置」的穩定性，不是「突破窗口/突破風格」
+       的穩定性——理由是這兩者理論上對「市場regime」的敏感度比訊號權重/門檻組合低
+       (窗口/風格改變的是「用哪個尺度定義突破」，不是「哪個訊號有效」)，但這是個判斷，
+       不是實測結果。
+    2. **每一折都固定跑移動停利模式**(ATR敏感度網格+出場配置比較這兩個階段本身就是
+       僅移動停利模式使用的階段)，不管外層main()有沒有加`--use-trailing-stop`。這是因為
+       走勢前進驗證的核心是「訊號/門檻/出場配置的穩定性」，而移動停利模式底下的出場配置
+       選項(天數上限/延遲啟動/跳空上限/保本停損)本身就是這次要驗證穩定性的一部分，固定
+       天數模式沒有這些可比較的維度。
+
+    price_data/indicators_by_code/regime_series：main()已經對完整歷史下載/預先算好一次的
+    結果，這裡直接重複使用(不重新下載、不重新precompute)，每一折只是換一段calendar去
+    呼叫已經內建no-I/O的比較函式，這是符合GitHub Actions時間預算(~2.5小時)的關鍵設計—
+    資料下載跟指標precompute只做一次，跟fold數量無關。
+
+    extra_kwargs：預期已經含有breakout_window/require_hard_breakout(外層選好的突破窗口/
+    風格)，以及ex_dividend_dates_by_code/slippage_pct這些「回測寫不寫實」的執行細節。
+    execution_kwargs：部位大小規則(lots或risk_pct_per_trade、max_concurrent_positions)，
+    篩選階段(訊號拆解/門檻比較)跟main()一樣不套用，只有ATR網格/出場配置比較/最終測試
+    套用，維持跟main()一致的「execution_kwargs一致性」設計。
+
+    回傳DataFrame，一列一折，找不到任何可用折(全部因為訓練窗口太短被跳過)時回傳空
+    DataFrame(呼叫端要自己檢查empty，不會拋例外)。
+    """
+    n = len(master_calendar)
+    total_chunks = n_folds + 1
+    bounds = [int(round(k * n / total_chunks)) for k in range(total_chunks + 1)]
+
+    signal_names = [s for s in BREAKOUT_SIGNAL_NAMES if has_chip or s not in CHIP_DEPENDENT_SIGNALS]
+    hold_days = TRAILING_STOP_MAX_HOLD_DAYS
+
+    rows = []
+    for i in range(n_folds):
+        train_calendar = master_calendar[bounds[0]:bounds[i + 1]]
+        test_calendar = master_calendar[bounds[i + 1]:bounds[i + 2]]
+
+        if len(train_calendar) < WALKFORWARD_MIN_TRAIN_DAYS or len(test_calendar) == 0:
+            print(f"  [walk-forward 第{i + 1}折] 訓練窗口({len(train_calendar)}天)或測試窗口"
+                  f"({len(test_calendar)}天)太短，跳過這一折", flush=True)
+            continue
+
+        print(f"  [walk-forward 第{i + 1}/{n_folds}折] 訓練={train_calendar[0].date()}~"
+              f"{train_calendar[-1].date()}({len(train_calendar)}天)，"
+              f"測試={test_calendar[0].date()}~{test_calendar[-1].date()}({len(test_calendar)}天) ...",
+              flush=True)
+
+        ablation_df, signal_names_used = run_signal_ablation(
+            price_data, indicators_by_code, regime_series, train_calendar,
+            starting_capital, hold_days, has_chip=has_chip, extra_kwargs=extra_kwargs,
+        )
+        winning_signals, _ = select_winning_signals(ablation_df)
+        auto_signal_weights = {name: 1.0 for name in winning_signals}
+        auto_signal_label = f"自動篩選({','.join(SIGNAL_LABELS[s] for s in winning_signals)})"
+
+        combo_df = run_signal_combo_comparison(
+            price_data, indicators_by_code, regime_series, train_calendar,
+            starting_capital, hold_days, auto_signal_label, auto_signal_weights,
+            extra_kwargs=extra_kwargs,
+        )
+        combo_label, winning_signal_weights = select_winning_signal_combo(
+            combo_df, auto_signal_label, auto_signal_weights,
+        )
+
+        gate_df = run_gate_comparison(
+            price_data, indicators_by_code, regime_series, train_calendar,
+            starting_capital, hold_days, list(winning_signal_weights.keys()), has_chip=has_chip,
+            extra_kwargs=extra_kwargs,
+        )
+        winning_gate_label, winning_gate_kwargs = select_winning_gate(gate_df)
+
+        atr_grid_df, (atr_stop_mult, trailing_atr_mult) = run_atr_sensitivity_grid(
+            price_data, indicators_by_code, regime_series, train_calendar,
+            starting_capital, winning_signal_weights, winning_gate_kwargs, extra_kwargs,
+            execution_kwargs=execution_kwargs,
+        )
+
+        exit_style_df = run_exit_style_comparison(
+            price_data, indicators_by_code, regime_series, train_calendar,
+            starting_capital, winning_signal_weights, winning_gate_kwargs,
+            atr_stop_mult, trailing_atr_mult, extra_kwargs,
+            execution_kwargs=execution_kwargs,
+        )
+        exit_style_label, winning_hold_days, winning_exit_extra = select_winning_exit_style(exit_style_df)
+
+        test_trades = run_momentum_breakout_backtest(
+            price_data=price_data, indicators_by_code=indicators_by_code, regime_series=regime_series,
+            master_calendar=test_calendar, max_hold_days=winning_hold_days, starting_capital=starting_capital,
+            allow_short=True, signal_weights=winning_signal_weights, atr_stop_mult=atr_stop_mult,
+            use_trailing_stop=True, trailing_atr_mult=trailing_atr_mult,
+            **winning_gate_kwargs, **extra_kwargs, **winning_exit_extra, **execution_kwargs,
+        )
+        test_stats = summarize_mr(test_trades, starting_capital)
+
+        rows.append({
+            "fold": i + 1,
+            "train_start": train_calendar[0].date().isoformat(), "train_end": train_calendar[-1].date().isoformat(),
+            "test_start": test_calendar[0].date().isoformat(), "test_end": test_calendar[-1].date().isoformat(),
+            "signal_combo": combo_label, "gate": winning_gate_label, "exit_style": exit_style_label,
+            "atr_stop_mult": atr_stop_mult, "trailing_atr_mult": trailing_atr_mult,
+            "trade_count": test_stats["trade_count"], "profit_factor": test_stats["profit_factor"],
+            "win_rate": test_stats["win_rate"], "total_pnl_ntd": test_stats["total_pnl_ntd"],
+            "avg_hold_days": test_stats["avg_hold_days"],
+        })
+        print(f"    → 訊號組合={combo_label}, 門檻={winning_gate_label}, 出場={exit_style_label} "
+              f"-> 測試期{test_stats['trade_count']}筆, PF={_fmt_pf(test_stats['profit_factor'])}, "
+              f"損益={test_stats['total_pnl_ntd']:,.0f}", flush=True)
+
+    return pd.DataFrame(rows)
+
+
 def main():
     parser = argparse.ArgumentParser(description="右側順勢突破策略 - 訊號拆解 + 結構門檻 + 最終組合驗證")
     parser.add_argument("--start", default=(datetime.date.today() - datetime.timedelta(days=1095)).isoformat())
@@ -730,6 +886,13 @@ def main():
     parser.add_argument("--multi-period-test", action="store_true",
                          help="額外把最終驗證出的組合套到2022年修正段、2021下半年~2022年初盤整段"
                               "這兩段跟近期多頭明顯不同市況的歷史期間，檢查是不是只吃到牛市紅利")
+    parser.add_argument("--walkforward-folds", type=int, default=0,
+                         help="走勢前進(Walk-Forward)分折驗證的折數，0代表不啟用(預設)。"
+                              f"設>0時，額外把歷史切成N+1個等長區塊，每一折用擴張視窗重新跑一次"
+                              f"完整選股流程(訊號拆解→訊號組合→門檻→ATR網格→出場配置)，"
+                              f"驗證選出的組合在多折之間是不是穩定，不是只有一次OOS切分。"
+                              f"預設建議值{DEFAULT_WALKFORWARD_FOLDS}折(GitHub Actions有~2.5小時的"
+                              f"時間預算，這是全新階段、實際耗時還沒有校準過，先保守設小一點)")
     args = parser.parse_args()
 
     os.makedirs(RESULTS_DIR, exist_ok=True)
@@ -957,6 +1120,22 @@ def main():
                 execution_kwargs, chip_data, args.refresh,
             )
 
+    walkforward_df = None
+    if args.walkforward_folds > 0:
+        print(f"\n[走勢前進(Walk-Forward)分折驗證] 切成{args.walkforward_folds + 1}個等長區塊，"
+              f"共{args.walkforward_folds}折，每折用擴張視窗重新跑一次完整選股流程 ...")
+        print("⚠️ 這個階段固定用移動停利模式跑(不管有沒有加--use-trailing-stop)、"
+              "且沿用上面已經選定的突破窗口/突破風格，不會每折重新選一次，見"
+              "run_walkforward_validation()docstring的簡化說明\n")
+        walkforward_df = run_walkforward_validation(
+            price_data, indicators_by_code, regime_series, master_calendar,
+            args.starting_capital, window_extra_kwargs, execution_kwargs,
+            args.walkforward_folds, args.with_chip_confirm,
+        )
+        if not walkforward_df.empty:
+            walkforward_df.to_csv(os.path.join(RESULTS_DIR, "walkforward_folds.csv"),
+                                   index=False, encoding="utf-8-sig")
+
     summary_lines = [
         "=" * 100,
         f"右側順勢突破策略 訊號拆解 + 結構門檻 + 最終組合驗證",
@@ -1085,6 +1264,40 @@ def main():
                 )
             if not all_multi_period[hold_label]:
                 summary_lines.append("  (所有額外期間都下載失敗或資料不足，無法驗證)")
+
+    if walkforward_df is not None:
+        summary_lines.append(f"\n--- 走勢前進(Walk-Forward)分折驗證(共{args.walkforward_folds}折，"
+                              f"每折用擴張視窗重新選一次訊號/門檻/出場配置，只在各折自己的測試窗口驗證) ---")
+        if walkforward_df.empty:
+            summary_lines.append("  ⚠️ 所有折都因為訓練窗口太短被跳過，沒有任何可用結果")
+        else:
+            header_wf = (f"{'折':>4}{'訓練期間':<24}{'測試期間':<24}{'訊號組合':<18}{'門檻':<14}"
+                          f"{'出場配置':<16}{'交易數':>8}{'PF':>8}{'勝率%':>8}{'總損益NT$':>14}{'平均持有天':>10}")
+            summary_lines.append(header_wf)
+            summary_lines.append("-" * len(header_wf))
+            for _, r in walkforward_df.iterrows():
+                summary_lines.append(
+                    f"{int(r['fold']):>4}"
+                    f"{r['train_start'] + '~' + r['train_end']:<24}"
+                    f"{r['test_start'] + '~' + r['test_end']:<24}"
+                    f"{r['signal_combo'][:16]:<18}{r['gate'][:12]:<14}{r['exit_style'][:14]:<16}"
+                    f"{r['trade_count']:>8}{_fmt_pf(r['profit_factor']):>8}{r['win_rate']:>8.1f}"
+                    f"{r['total_pnl_ntd']:>14,.0f}{r['avg_hold_days']:>10.1f}"
+                )
+            n_distinct_combos = walkforward_df["signal_combo"].nunique()
+            finite_pf = [pf for pf in walkforward_df["profit_factor"] if pf != float("inf")]
+            has_inf_pf = any(pf == float("inf") for pf in walkforward_df["profit_factor"])
+            if finite_pf:
+                pf_range_str = (f"PF範圍(排除∞)：min={min(finite_pf):.2f}, max={max(finite_pf):.2f}, "
+                                 f"mean={sum(finite_pf) / len(finite_pf):.2f}"
+                                 f"{'(另有折PF=∞，通常代表交易筆數太少，不是真的沒有風險)' if has_inf_pf else ''}")
+            else:
+                pf_range_str = "PF範圍：全部折都是∞或無交易，無法計算平均"
+            summary_lines.append(
+                f"\n  [穩定性] {len(walkforward_df)}折中出現{n_distinct_combos}種不同的訊號組合被選中"
+                f"({'同一組合每折都被選中，穩定性較高' if n_distinct_combos == 1 else '每折選到不同組合，穩定性較低，較可能是在追這段歷史的雜訊'})"
+                f"　{pf_range_str}"
+            )
 
     summary_lines.append(
         "\n判讀方式：先看單一訊號拆解，PF明顯>1且交易筆數夠多的訊號才代表真的有預測力；"

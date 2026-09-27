@@ -139,6 +139,9 @@ class TestScanMomentumBreakoutCandidates:
         "GapUpFlag": 0.0, "GapDownFlag": 0.0,
         "BullishCandleScore": 0.0, "BearishCandleScore": 0.0,
         "ForeignRatio": np.nan, "TrustRatio": np.nan,
+        "ForeignStreak": np.nan, "TrustStreak": np.nan,
+        "InstitutionalNet1D": np.nan, "InstitutionalNet5D": np.nan, "InstitutionalNet10D": np.nan,
+        "BullishDivergence": 0.0, "BearishDivergence": 0.0, "VolumeRatio5D": 1.0,
     }
 
     def _build_indicators(self, code_specs, as_of_pos=65):
@@ -857,6 +860,9 @@ class TestScanWithNewGateParams:
         "ForeignRatio": np.nan, "TrustRatio": np.nan,
         "ADX": 30.0, "VolContractionRatio": 0.5,
         "MASpreadOverATR": 3.0, "MA5Slope5": 0.0, "MA20Slope5": 0.0, "MA60Slope5": 0.0,
+        "ForeignStreak": np.nan, "TrustStreak": np.nan,
+        "InstitutionalNet1D": np.nan, "InstitutionalNet5D": np.nan, "InstitutionalNet10D": np.nan,
+        "BullishDivergence": 0.0, "BearishDivergence": 0.0, "VolumeRatio5D": 1.0,
     }
 
     def _build_indicators(self, code_specs, as_of_pos=65):
@@ -1071,3 +1077,229 @@ class TestRunMomentumBreakoutBacktestWithNewGates:
             allow_short=True, lots=2, top_n=2, require_hard_breakout=False,
         )
         assert isinstance(trades_soft_ranking, list)
+
+
+class TestComputeInstitutionalCombinedRatio:
+    def test_ratio_positive_when_both_foreign_and_trust_buying(self):
+        df = make_price_df([100.0] * 10, volumes=[1000.0] * 10)
+        chip_df = pd.DataFrame(
+            {"foreign_net": [300.0] * 10, "trust_net": [200.0] * 10}, index=df.index,
+        )
+        # window=1：單日 (300+200)*100 / (1000*100) = 50000/100000 = 0.5
+        ratio = mbe.compute_institutional_combined_ratio(chip_df, df, window=1)
+        assert ratio.iloc[-1] == pytest.approx(0.5)
+
+    def test_window_5_sums_over_multiple_days(self):
+        df = make_price_df([100.0] * 10, volumes=[1000.0] * 10)
+        chip_df = pd.DataFrame(
+            {"foreign_net": [100.0] * 10, "trust_net": [100.0] * 10}, index=df.index,
+        )
+        # 每天合計買超200股*100元=20000元，成交金額每天100000元
+        # 5日加總：100000 / 500000 = 0.2，跟單日比重(0.2)一樣，因為每天數值都相同
+        ratio5 = mbe.compute_institutional_combined_ratio(chip_df, df, window=5)
+        assert ratio5.iloc[-1] == pytest.approx(0.2)
+
+    def test_nan_when_turnover_zero(self):
+        df = make_price_df([100.0] * 5, volumes=[0.0] * 5)
+        chip_df = pd.DataFrame({"foreign_net": [100.0] * 5, "trust_net": [50.0] * 5}, index=df.index)
+        ratio = mbe.compute_institutional_combined_ratio(chip_df, df, window=1)
+        assert ratio.isna().all()
+
+
+class TestChipStreakReuseInPrecompute:
+    def test_foreign_and_trust_streak_columns_match_precompute_chip_streak_directly(self):
+        import chip_data_loader as cdl
+
+        df = make_price_df([100.0] * 30)
+        index_close = pd.Series(100.0, index=df.index)
+        net_values_foreign = [10.0, 10.0, 10.0, -5.0, -5.0] * 6
+        net_values_trust = [-3.0, 3.0, 3.0, 3.0, -1.0] * 6
+        chip_df = pd.DataFrame(
+            {"foreign_net": net_values_foreign, "trust_net": net_values_trust}, index=df.index,
+        )
+        ind = mbe.precompute_breakout_indicators(df, index_close, chip_df=chip_df)
+
+        expected_foreign_streak = cdl.precompute_chip_streak(chip_df, "foreign_net").reindex(df.index)
+        expected_trust_streak = cdl.precompute_chip_streak(chip_df, "trust_net").reindex(df.index)
+
+        pd.testing.assert_series_equal(
+            ind["ForeignStreak"], expected_foreign_streak, check_names=False,
+        )
+        pd.testing.assert_series_equal(
+            ind["TrustStreak"], expected_trust_streak, check_names=False,
+        )
+
+    def test_institutional_net_columns_present_and_nan_without_chip_df(self):
+        df = make_price_df([100.0] * 15)
+        index_close = pd.Series(100.0, index=df.index)
+        ind = mbe.precompute_breakout_indicators(df, index_close, chip_df=None)
+        for col in ("ForeignStreak", "TrustStreak", "InstitutionalNet1D", "InstitutionalNet5D", "InstitutionalNet10D"):
+            assert col in ind.columns
+            assert ind[col].isna().all()
+
+    def test_institutional_net_columns_present_when_chip_df_given(self):
+        df = make_price_df([100.0] * 15, volumes=[1000.0] * 15)
+        index_close = pd.Series(100.0, index=df.index)
+        chip_df = pd.DataFrame(
+            {"foreign_net": [100.0] * 15, "trust_net": [50.0] * 15}, index=df.index,
+        )
+        ind = mbe.precompute_breakout_indicators(df, index_close, chip_df=chip_df)
+        for col in ("InstitutionalNet1D", "InstitutionalNet5D", "InstitutionalNet10D"):
+            assert ind[col].notna().any()
+
+
+class TestMacdDivergenceColumns:
+    def test_bullish_divergence_positive_when_downtrend_decelerates(self):
+        # 典型多頭背離情境：股價還在下跌段(20日回顧內淨變化仍是負的)，但下跌速度明顯放緩、
+        # MACD線動能已經從深跌轉為回升——「價格還沒確認轉強，動能已經先轉向」
+        down = list(np.linspace(150.0, 100.0, 60))
+        decelerating = list(np.linspace(100.0, 102.0, 20))
+        closes = down + decelerating
+        df = make_price_df(closes)
+        index_close = pd.Series(100.0, index=df.index)
+        ind = mbe.precompute_breakout_indicators(df, index_close, divergence_lookback=20)
+        row = ind.iloc[65]
+        assert row["BullishDivergence"] > 0
+
+    def test_bearish_divergence_positive_when_uptrend_decelerates(self):
+        # 對稱情境：股價還在上漲段(20日回顧內淨變化仍是正的)，但漲勢明顯放緩、
+        # MACD線動能已經從高檔轉為回落
+        up = list(np.linspace(100.0, 150.0, 60))
+        decelerating = list(np.linspace(150.0, 148.0, 20))
+        closes = up + decelerating
+        df = make_price_df(closes)
+        index_close = pd.Series(100.0, index=df.index)
+        ind = mbe.precompute_breakout_indicators(df, index_close, divergence_lookback=20)
+        row = ind.iloc[65]
+        assert row["BearishDivergence"] > 0
+
+    def test_bullish_and_bearish_divergence_not_both_positive_in_pure_uptrend(self):
+        # 純粹的單邊上漲(股價漲、MACD也同步轉強，方向一致，不是背離)：
+        # 多頭背離強度應該接近0(股價漲幅為正，(-price_change_n)被clip成0)
+        closes = list(np.linspace(100.0, 150.0, 80))
+        df = make_price_df(closes)
+        index_close = pd.Series(100.0, index=df.index)
+        ind = mbe.precompute_breakout_indicators(df, index_close, divergence_lookback=20)
+        assert ind["BullishDivergence"].iloc[-1] == pytest.approx(0.0)
+
+
+class TestNewSignalScoresInScan:
+    """跟 TestScanWithNewGateParams 一樣的手法(見該類別docstring)：直接構造指標DataFrame，
+    只在「as_of_date前一天」那一列塞想測的數值，這裡額外把這一輪新增的7個訊號欄位也塞進
+    DEFAULT_COLS，用同樣手法測試方向性(不繼承，避免pytest把父類別的測試方法重複收集一次)。"""
+
+    DEFAULT_COLS = dict(
+        TestScanWithNewGateParams.DEFAULT_COLS,
+        ForeignStreak=np.nan, TrustStreak=np.nan,
+        InstitutionalNet1D=np.nan, InstitutionalNet5D=np.nan, InstitutionalNet10D=np.nan,
+        BullishDivergence=0.0, BearishDivergence=0.0, VolumeRatio5D=1.0,
+    )
+
+    def _build_indicators(self, code_specs, as_of_pos=65):
+        n = as_of_pos + 5
+        idx = pd.date_range("2024-01-01", periods=n, freq="B")
+        indicators_by_code = {}
+        for code, spec in code_specs.items():
+            df = pd.DataFrame({col: val for col, val in self.DEFAULT_COLS.items()}, index=idx)
+            for col, val in spec.items():
+                df.loc[idx[as_of_pos - 1], col] = val
+            indicators_by_code[code] = df
+        return indicators_by_code, idx[as_of_pos]
+
+    def _scan(self, indicators_by_code, as_of_date, allow_short=False, **kwargs):
+        return mbe.scan_momentum_breakout_candidates(
+            indicators_by_code, as_of_date, regime="neutral", excluded_codes=set(),
+            allow_short=allow_short, top_n=5, **kwargs,
+        )
+
+    def test_foreign_streak_long_prefers_positive_streak(self):
+        specs = {
+            "0001": {"Close": 110.0, "MA20": 100.0, "RollingHigh": 105.0, "ForeignStreak": 5.0},
+            "0002": {"Close": 110.0, "MA20": 100.0, "RollingHigh": 105.0, "ForeignStreak": -3.0},
+        }
+        indicators_by_code, as_of_date = self._build_indicators(specs)
+        result = self._scan(indicators_by_code, as_of_date, signal_weights={"score_foreign_streak": 1.0})
+        assert result[0]["code"] == "0001"
+
+    def test_foreign_streak_short_prefers_negative_streak(self):
+        specs = {
+            "0001": {"Close": 90.0, "MA20": 100.0, "RollingLow": 95.0, "ForeignStreak": -5.0},
+            "0002": {"Close": 90.0, "MA20": 100.0, "RollingLow": 95.0, "ForeignStreak": 3.0},
+        }
+        indicators_by_code, as_of_date = self._build_indicators(specs)
+        result = self._scan(
+            indicators_by_code, as_of_date, allow_short=True, signal_weights={"score_foreign_streak": 1.0},
+        )
+        shorts = [c for c in result if c["side"] == "short"]
+        assert shorts[0]["code"] == "0001"
+
+    def test_trust_streak_long_prefers_positive_streak(self):
+        specs = {
+            "0001": {"Close": 110.0, "MA20": 100.0, "RollingHigh": 105.0, "TrustStreak": 4.0},
+            "0002": {"Close": 110.0, "MA20": 100.0, "RollingHigh": 105.0, "TrustStreak": -2.0},
+        }
+        indicators_by_code, as_of_date = self._build_indicators(specs)
+        result = self._scan(indicators_by_code, as_of_date, signal_weights={"score_trust_streak": 1.0})
+        assert result[0]["code"] == "0001"
+
+    def test_institutional_net_1d_5d_10d_long_prefer_higher_value(self):
+        for col, score_name in [
+            ("InstitutionalNet1D", "score_institutional_net_1d"),
+            ("InstitutionalNet5D", "score_institutional_net_5d"),
+            ("InstitutionalNet10D", "score_institutional_net_10d"),
+        ]:
+            specs = {
+                "0001": {"Close": 110.0, "MA20": 100.0, "RollingHigh": 105.0, col: 0.3},
+                "0002": {"Close": 110.0, "MA20": 100.0, "RollingHigh": 105.0, col: -0.1},
+            }
+            indicators_by_code, as_of_date = self._build_indicators(specs)
+            result = self._scan(indicators_by_code, as_of_date, signal_weights={score_name: 1.0})
+            assert result[0]["code"] == "0001", f"{score_name} 排序不符預期"
+
+    def test_macd_divergence_long_prefers_bullish_divergence(self):
+        specs = {
+            "0001": {"Close": 110.0, "MA20": 100.0, "RollingHigh": 105.0, "BullishDivergence": 2.0},
+            "0002": {"Close": 110.0, "MA20": 100.0, "RollingHigh": 105.0, "BullishDivergence": 0.0},
+        }
+        indicators_by_code, as_of_date = self._build_indicators(specs)
+        result = self._scan(indicators_by_code, as_of_date, signal_weights={"score_macd_divergence": 1.0})
+        assert result[0]["code"] == "0001"
+
+    def test_macd_divergence_short_prefers_bearish_divergence(self):
+        specs = {
+            "0001": {"Close": 90.0, "MA20": 100.0, "RollingLow": 95.0, "BearishDivergence": 2.0},
+            "0002": {"Close": 90.0, "MA20": 100.0, "RollingLow": 95.0, "BearishDivergence": 0.0},
+        }
+        indicators_by_code, as_of_date = self._build_indicators(specs)
+        result = self._scan(
+            indicators_by_code, as_of_date, allow_short=True, signal_weights={"score_macd_divergence": 1.0},
+        )
+        shorts = [c for c in result if c["side"] == "short"]
+        assert shorts[0]["code"] == "0001"
+
+    def test_volume_spike_prefers_higher_5day_ratio(self):
+        specs = {
+            "0001": {"Close": 110.0, "MA20": 100.0, "RollingHigh": 105.0, "VolumeRatio5D": 3.0},
+            "0002": {"Close": 110.0, "MA20": 100.0, "RollingHigh": 105.0, "VolumeRatio5D": 1.0},
+        }
+        indicators_by_code, as_of_date = self._build_indicators(specs)
+        result = self._scan(indicators_by_code, as_of_date, signal_weights={"score_volume_spike": 1.0})
+        assert result[0]["code"] == "0001"
+
+    def test_chip_dependent_new_signals_do_not_crash_when_all_nan(self):
+        # 5個籌碼相關新訊號全部NaN(沒有籌碼資料時的狀態)，仍應正常掃描不崩潰，
+        # 分數預設為0.0，兩檔候選在這幾個訊號上分數相同(見_rank_candidates的.notna().any()判斷)
+        specs = {
+            "0001": {"Close": 110.0, "MA20": 100.0, "RollingHigh": 105.0},
+            "0002": {"Close": 108.0, "MA20": 100.0, "RollingHigh": 105.0},
+        }
+        indicators_by_code, as_of_date = self._build_indicators(specs)
+        for score_name in (
+            "score_foreign_streak", "score_trust_streak",
+            "score_institutional_net_1d", "score_institutional_net_5d", "score_institutional_net_10d",
+        ):
+            result = self._scan(indicators_by_code, as_of_date, signal_weights={score_name: 1.0})
+            assert {c["code"] for c in result} == {"0001", "0002"}
+            # 兩者分數應該相同(都預設0.0)，total_score也應相同
+            scores = {c["code"]: c["score"] for c in result}
+            assert scores["0001"] == pytest.approx(scores["0002"])
