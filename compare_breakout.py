@@ -470,6 +470,37 @@ FIXED_WALKFORWARD_COMBO = {
     },
 }
 
+# 固定候選規則的變體比較：FIXED_WALKFORWARD_COMBO在6個獨立區塊上測出「穩定但平均PF<1
+# (0.95)」——這代表規則本身不是在追雜訊(範圍窄)，但也還沒有正期望值。這裡列出幾個
+# 「只改一個維度、其餘完全不變」的變體，同樣各自套到獨立區塊上跑固定規則walk-forward，
+# 想知道換哪個維度可以把平均PF推過1、同時不犧牲掉「範圍窄=穩定」這個已經驗證到的優點。
+# 每個變體都只改自FIXED_WALKFORWARD_COMBO(基準)裡的「一個」維度，方便歸因是哪個改動
+# 造成差異，不是同時改好幾個變數搞不清楚是誰的功勞。
+FIXED_WALKFORWARD_COMBO_VARIANTS = [
+    FIXED_WALKFORWARD_COMBO,
+    {
+        **FIXED_WALKFORWARD_COMBO,
+        "label": "固定候選B(訊號加入相對大盤強弱，其餘不變)",
+        "signal_weights": {"score_macd": 1.0, "score_candle_body": 1.0, "score_rel_strength": 1.0},
+    },
+    {
+        **FIXED_WALKFORWARD_COMBO,
+        "label": "固定候選C(門檻改為趨勢強度+站上季線雙重確認，其餘不變)",
+        "gate_kwargs": {"min_adx": 25.0, "require_above_ma60": True},
+    },
+    {
+        **FIXED_WALKFORWARD_COMBO,
+        "label": "固定候選D(ATR倍數改為1.0/1.0，交易數較多，其餘不變)",
+        "atr_stop_mult": 1.0,
+        "trailing_atr_mult": 1.0,
+    },
+    {
+        **FIXED_WALKFORWARD_COMBO,
+        "label": "固定候選E(出場改為單純10天強制出場，不含延遲啟動/跳空上限，其餘不變)",
+        "exit_kwargs": {"max_hold_days_override": 10},
+    },
+]
+
 
 def run_signal_combo_comparison(price_data, indicators_by_code, regime_series, is_calendar,
                                  starting_capital, hold_days, auto_label, auto_weights, extra_kwargs=None):
@@ -987,14 +1018,13 @@ def main():
                               f"預設建議值{DEFAULT_WALKFORWARD_FOLDS}折(GitHub Actions有~2.5小時的"
                               f"時間預算，這是全新階段、實際耗時還沒有校準過，先保守設小一點)")
     parser.add_argument("--fixed-combo-walkforward-folds", type=int, default=0,
-                         help="測試「同一組已經連續兩輪被自動選中的固定規則」(FIXED_WALKFORWARD_COMBO，"
-                              "訊號/門檻/突破窗口/ATR倍數/出場配置全部固定死，不重新挑選)跨N個獨立、"
-                              "不重疊歷史區塊的表現，0代表不啟用(預設)。跟--walkforward-folds不同的是"
-                              "這裡不是每折重新選一次組合，而是同一組規則原封不動套到每一個區塊，"
-                              "所以沒有--walkforward-folds那種每折都在挑當下最好答案的多重比較風險，"
-                              f"可以放心切更多折(成本低很多，不用重跑整套訊號拆解→訊號組合→門檻→"
-                              f"ATR網格→出場配置的選擇流程，每折只是單純backtest一次)。"
-                              f"預設建議值{DEFAULT_FIXED_COMBO_WALKFORWARD_FOLDS}折")
+                         help="測試幾組「固定死不重新挑選」的候選規則(FIXED_WALKFORWARD_COMBO_VARIANTS，"
+                              "基準+只改一個維度的變體)跨N個獨立、不重疊歷史區塊的表現，0代表不啟用(預設)。"
+                              "跟--walkforward-folds不同的是這裡不是每折重新選一次組合，而是同一組規則"
+                              "原封不動套到每一個區塊，所以沒有--walkforward-folds那種每折都在挑當下"
+                              f"最好答案的多重比較風險，可以放心切更多折(成本低很多，不用重跑整套"
+                              f"訊號拆解→訊號組合→門檻→ATR網格→出場配置的選擇流程，每折只是單純"
+                              f"backtest一次)。預設建議值{DEFAULT_FIXED_COMBO_WALKFORWARD_FOLDS}折")
     args = parser.parse_args()
 
     os.makedirs(RESULTS_DIR, exist_ok=True)
@@ -1238,22 +1268,29 @@ def main():
             walkforward_df.to_csv(os.path.join(RESULTS_DIR, "walkforward_folds.csv"),
                                    index=False, encoding="utf-8-sig")
 
-    fixed_combo_walkforward_df = None
+    fixed_combo_walkforward_results = []  # [(combo_dict, df), ...]，每個候選規則各一份walk-forward結果
     if args.fixed_combo_walkforward_folds > 0:
-        print(f"\n[固定規則walk-forward驗證] 把同一組已經連續兩輪被自動選中的固定規則"
-              f"({FIXED_WALKFORWARD_COMBO['label']})，原封不動套到"
-              f"{args.fixed_combo_walkforward_folds}個獨立、不重疊的歷史區塊各跑一次 ...")
+        print(f"\n[固定規則walk-forward比較] 把{len(FIXED_WALKFORWARD_COMBO_VARIANTS)}組候選規則"
+              f"(基準+只改一個維度的變體)分別原封不動套到{args.fixed_combo_walkforward_folds}個"
+              f"獨立、不重疊的歷史區塊各跑一次，比較哪一組規則的PF範圍最窄(穩定)、平均PF最高 ...")
         print("⚠️ 這裡不重新挑選任何訊號/門檻/ATR倍數/出場配置，套的extra_kwargs是除權息清洗/"
-              "滑價這些執行細節，不是外層選出的突破窗口/突破風格(fixed_combo自己指定了"
+              "滑價這些執行細節，不是外層選出的突破窗口/突破風格(每組候選規則自己指定了"
               "breakout_window/require_hard_breakout)，見run_fixed_combo_walkforward()docstring\n")
-        fixed_combo_walkforward_df = run_fixed_combo_walkforward(
-            price_data, indicators_by_code, regime_series, master_calendar,
-            args.starting_capital, extra_kwargs, execution_kwargs,
-            args.fixed_combo_walkforward_folds,
-        )
-        if not fixed_combo_walkforward_df.empty:
-            fixed_combo_walkforward_df.to_csv(os.path.join(RESULTS_DIR, "fixed_combo_walkforward.csv"),
-                                               index=False, encoding="utf-8-sig")
+        for combo in FIXED_WALKFORWARD_COMBO_VARIANTS:
+            print(f"  ...跑 {combo['label']}")
+            df = run_fixed_combo_walkforward(
+                price_data, indicators_by_code, regime_series, master_calendar,
+                args.starting_capital, extra_kwargs, execution_kwargs,
+                args.fixed_combo_walkforward_folds, fixed_combo=combo,
+            )
+            fixed_combo_walkforward_results.append((combo, df))
+            if not df.empty:
+                safe_label = combo["label"].split("(")[0]
+                df.to_csv(os.path.join(RESULTS_DIR, f"fixed_combo_walkforward_{safe_label}.csv"),
+                          index=False, encoding="utf-8-sig")
+
+    # 用baseline(FIXED_WALKFORWARD_COMBO本身)的結果維持跟舊版summary.txt區塊的相容性
+    fixed_combo_walkforward_df = fixed_combo_walkforward_results[0][1] if fixed_combo_walkforward_results else None
 
     summary_lines = [
         "=" * 100,
@@ -1418,38 +1455,66 @@ def main():
                 f"　{pf_range_str}"
             )
 
-    if fixed_combo_walkforward_df is not None:
-        summary_lines.append(f"\n--- 固定規則walk-forward驗證(共{args.fixed_combo_walkforward_folds}個獨立、"
-                              f"不重疊區塊，同一組已連續兩輪被自動選中的固定規則，原封不動套用，不重新挑選) ---")
-        summary_lines.append(f"  固定規則：{FIXED_WALKFORWARD_COMBO['label']}")
-        if fixed_combo_walkforward_df.empty:
+    if fixed_combo_walkforward_results:
+        summary_lines.append(f"\n--- 固定規則walk-forward比較(共{len(fixed_combo_walkforward_results)}組候選規則，"
+                              f"各自套到{args.fixed_combo_walkforward_folds}個獨立、不重疊區塊，不重新挑選) ---")
+        summary_lines.append("  候選規則：基準是連續兩輪被自動選中的原始組合，其餘每個變體都只改一個維度"
+                              "(訊號/門檻/ATR倍數/出場配置擇一)，方便歸因是哪個改動造成差異")
+
+        compare_rows = []
+        for combo, df in fixed_combo_walkforward_results:
+            if df.empty:
+                compare_rows.append((combo["label"], 0, None, None, None, 0))
+                continue
+            finite_pf = [pf for pf in df["profit_factor"] if pf != float("inf")]
+            n_positive = sum(1 for pf in df["profit_factor"] if pf > 1)
+            mean_pf = sum(finite_pf) / len(finite_pf) if finite_pf else None
+            pf_range = (min(finite_pf), max(finite_pf)) if finite_pf else None
+            compare_rows.append((combo["label"], len(df), pf_range, mean_pf, n_positive, int(df["trade_count"].sum())))
+
+        header_cmp = f"{'候選規則':<58}{'可用折數':>8}{'PF範圍':>16}{'平均PF':>8}{'PF>1折數':>10}{'總交易數':>8}"
+        summary_lines.append(header_cmp)
+        summary_lines.append("-" * len(header_cmp))
+        for label, n_used, pf_range, mean_pf, n_positive, total_trades in compare_rows:
+            pf_range_str = f"{pf_range[0]:.2f}~{pf_range[1]:.2f}" if pf_range else "—"
+            mean_pf_str = f"{mean_pf:.2f}" if mean_pf is not None else "—"
+            summary_lines.append(
+                f"{label:<58}{n_used:>8}{pf_range_str:>16}{mean_pf_str:>8}{f'{n_positive}/{n_used}':>10}"
+                f"{total_trades:>8}"
+            )
+
+        # 挑一個「值得繼續看」的候選：至少要有2個可用折才敢談穩不穩定(1折沒有範圍可言)，
+        # 在這些裡面選平均PF最高的；沒有任何候選滿足這個門檻時老實標成「無法判斷」，
+        # 不會為了選出一個而降低門檻。
+        eligible = [(label, mean_pf) for label, n_used, _, mean_pf, _, _ in compare_rows
+                    if n_used >= 2 and mean_pf is not None]
+        if eligible:
+            best_label, best_mean_pf = max(eligible, key=lambda x: x[1])
+            summary_lines.append(f"\n  平均PF最高且至少有2折可比較的候選：{best_label}(平均PF={best_mean_pf:.2f})"
+                                  f"——這只是這批候選裡相對最好的，不代表平均PF就已經驗證超過1、"
+                                  f"更不代表可以直接拿去實盤，仍要看PF範圍是否夠窄、總交易數是否夠多")
+        else:
+            summary_lines.append("\n  ⚠️ 沒有任何候選規則有至少2個可用折可以比較穩定性，這批候選在目前"
+                                  "區塊切法下樣本都太少，結果僅供參考")
+
+        # 詳細列出基準規則(FIXED_WALKFORWARD_COMBO)逐折結果，維持跟上一輪summary.txt一致的細節層級；
+        # 其他變體的逐折明細各自存成獨立csv(fixed_combo_walkforward_<label>.csv)，不全部印在這裡避免過長
+        baseline_df = fixed_combo_walkforward_results[0][1]
+        summary_lines.append(f"\n  基準規則逐折明細：{FIXED_WALKFORWARD_COMBO['label']}")
+        if baseline_df.empty:
             summary_lines.append("  ⚠️ 所有區塊都因為交易筆數太少被跳過，沒有任何可用結果")
         else:
             header_fcwf = (f"{'區塊':>4}{'期間':<24}{'交易數':>8}{'PF':>8}{'勝率%':>8}"
                             f"{'總損益NT$':>14}{'平均持有天':>10}")
             summary_lines.append(header_fcwf)
             summary_lines.append("-" * len(header_fcwf))
-            for _, r in fixed_combo_walkforward_df.iterrows():
+            for _, r in baseline_df.iterrows():
                 summary_lines.append(
                     f"{int(r['fold']):>4}"
                     f"{r['period_start'] + '~' + r['period_end']:<24}"
                     f"{r['trade_count']:>8}{_fmt_pf(r['profit_factor']):>8}{r['win_rate']:>8.1f}"
                     f"{r['total_pnl_ntd']:>14,.0f}{r['avg_hold_days']:>10.1f}"
                 )
-            finite_pf_fc = [pf for pf in fixed_combo_walkforward_df["profit_factor"] if pf != float("inf")]
-            has_inf_pf_fc = any(pf == float("inf") for pf in fixed_combo_walkforward_df["profit_factor"])
-            if finite_pf_fc:
-                pf_range_str_fc = (f"PF範圍(排除∞)：min={min(finite_pf_fc):.2f}, max={max(finite_pf_fc):.2f}, "
-                                    f"mean={sum(finite_pf_fc) / len(finite_pf_fc):.2f}"
-                                    f"{'(另有區塊PF=∞，通常代表交易筆數太少，不是真的沒有風險)' if has_inf_pf_fc else ''}")
-            else:
-                pf_range_str_fc = "PF範圍：全部區塊都是∞或無交易，無法計算平均"
-            n_positive_fc = sum(1 for pf in fixed_combo_walkforward_df["profit_factor"] if pf > 1)
-            summary_lines.append(
-                f"\n  [穩定性] {pf_range_str_fc}　PF>1的區塊：{n_positive_fc}/{len(fixed_combo_walkforward_df)}"
-                f"　PF範圍越窄、且大多數區塊PF>1，才代表這組規則真的跨時間穩定；範圍很寬或大部分<1，"
-                f"代表這組規則本身也站不住腳，不是選擇方法論的問題，是規則本身不夠好"
-            )
 
     summary_lines.append(
         "\n判讀方式：先看單一訊號拆解，PF明顯>1且交易筆數夠多的訊號才代表真的有預測力；"
