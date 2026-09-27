@@ -63,6 +63,10 @@ on:
         description: '固定規則walk-forward驗證的區塊數，0代表不啟用(預設)，建議值4'
         required: false
         default: '0'
+      refresh_cache:
+        description: '強制重新下載(忽略快取)。⚠️快取會用github actions cache跨次執行保留，如果之前抓過的日期/月份被誤判成「確認無資料」，即使程式碼後來修好bug了，沒開這個還是會沿用之前錯的空快取、不會重抓——loader程式碼有更新(例如修過bug)後第一次重跑，務必開true，之後正常跑可以關掉'
+        required: false
+        default: 'false'
 
 jobs:
   backtest:
@@ -127,6 +131,9 @@ jobs:
           fi
           if [ -n "${{ github.event.inputs.fixed_combo_walkforward_folds }}" ] && [ "${{ github.event.inputs.fixed_combo_walkforward_folds }}" != "0" ]; then
             ARGS="$ARGS --fixed-combo-walkforward-folds ${{ github.event.inputs.fixed_combo_walkforward_folds }}"
+          fi
+          if [ "${{ github.event.inputs.refresh_cache }}" = "true" ]; then
+            ARGS="$ARGS --refresh"
           fi
           python compare_equity_swing.py $ARGS
 
