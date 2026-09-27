@@ -1,4 +1,4 @@
-name: Run Momentum Breakout Backtest
+name: Run Equity Swing Backtest
 
 on:
   workflow_dispatch:
@@ -14,53 +14,53 @@ on:
       starting_capital:
         description: '模擬帳戶起始資金(新台幣)'
         required: false
-        default: '200000'
+        default: '1000000'
       max_stocks:
         description: '限制掃描股票數量，0代表全部320檔(第一次測試建議先設50，跑比較快)'
         required: false
         default: '50'
-      with_chip_confirm:
-        description: '是否額外測試外資連續買超確認訊號(需要多下載三大法人資料，會跑比較久)'
+      min_hold_weeks:
+        description: '最短持有週數'
         required: false
-        default: 'false'
-      clean_ex_dividend:
-        description: '是否排除除權息當天的股票(避免機械性跳空污染訊號，需要多下載除權息資料，會跑久一點)'
+        default: '2'
+      max_hold_weeks:
+        description: '最長持有週數(到期強制出場)'
         required: false
-        default: 'false'
-      use_trailing_stop:
-        description: '出場是否改用移動停利(不設固定天數/固定停利目標價，讓獲利奔跑)，取代原本短線5天/中期15天比較'
-        required: false
-        default: 'false'
+        default: '8'
       atr_stop_mult:
-        description: '初始停損的ATR倍數(移動停利模式下只用在對照組，最佳組合的倍數會由ATR敏感度網格自動搜出)'
+        description: 'ATR停損倍數(週級別持有，預設比短線引擎寬，避免正常波動洗出場)'
         required: false
-        default: '1.0'
-      trailing_atr_mult:
-        description: '移動停利的ATR倍數，留空代表跟初始停損用同一個值(同樣只用在對照組)'
+        default: '2.0'
+      max_concurrent_positions:
+        description: '最多同時持有幾檔(資金平分成這麼多槽位)'
+        required: false
+        default: '5'
+      risk_pct_per_trade:
+        description: '改用風險預算式股數計算的比例，例如0.02代表每筆風險2%帳戶權益，留空代表用槽位現金平分'
         required: false
         default: ''
       slippage_pct:
         description: '進場/停損出場的滑價假設，例如0.002代表0.2%，留空或0代表不模擬滑價'
         required: false
         default: '0'
-      max_concurrent_positions:
-        description: '最佳組合最終驗證時允許同時持有的最大部位數，預設1(一次一個部位)，>1代表多部位並行'
+      with_revenue:
+        description: '是否下載月營收資料(YoY/MoM訊號)。⚠️revenue_data_loader.py的URL格式未經真實驗證'
         required: false
-        default: '1'
-      risk_pct_per_trade:
-        description: '最佳組合改用風險預算式部位大小的比例，例如0.02代表每筆風險2%帳戶權益，留空代表維持固定2口'
+        default: 'true'
+      with_valuation:
+        description: '是否下載每日PE/PB/殖利率資料'
         required: false
-        default: ''
-      multi_period_test:
-        description: '是否額外把最佳組合套到2022年修正段/2021下半年盤整段這兩個跟近期多頭不同市況的期間驗證(會多跑久一點)'
+        default: 'true'
+      with_chip:
+        description: '是否下載三大法人籌碼資料(外資/投信連續買超訊號)'
+        required: false
+        default: 'true'
+      with_financial_statements:
+        description: '是否下載季度財報資料(EPS成長率/毛利率/ROE訊號)。⚠️financial_statement_loader.py明確未經驗證，逐股查詢會跑比較久，失敗不會中斷流程'
         required: false
         default: 'false'
-      walkforward_folds:
-        description: '走勢前進(Walk-Forward)分折驗證的折數，0代表不啟用(預設)。設3之類的數字會額外把歷史切成N+1個等長區塊，每折重新選一次訊號/門檻/出場配置並在自己的測試窗口驗證，用來檢查選出的組合跨時間是否穩定(會多跑久一點，且是全新階段、實際耗時還沒校準過，建議先從小數字開始試)'
-        required: false
-        default: '0'
       fixed_combo_walkforward_folds:
-        description: '固定規則walk-forward驗證的區塊數，0代表不啟用(預設)。設6之類的數字會把同一組已經連續兩輪被自動選中的固定規則(不重新挑選任何訊號/門檻/ATR倍數/出場配置)，原封不動套到N個獨立、不重疊的歷史區塊各跑一次，檢查這組已定案的規則本身跨時間是否穩定。因為規則固定、不用每折重跑整套選擇流程，成本比walkforward_folds低很多，建議值6'
+        description: '固定規則walk-forward驗證的區塊數，0代表不啟用(預設)，建議值4'
         required: false
         default: '0'
 
@@ -85,58 +85,53 @@ jobs:
       - name: Restore price data cache
         uses: actions/cache@v4
         with:
-          path: data_cache
-          key: price-data-cache-${{ github.run_id }}
+          path: |
+            data_cache
+            revenue_cache
+            valuation_cache
+            financial_cache
+            chip_cache
+          key: equity-swing-data-cache-${{ github.run_id }}
           restore-keys: |
-            price-data-cache-
+            equity-swing-data-cache-
 
-      - name: Run momentum breakout backtest
+      - name: Run equity swing backtest
         timeout-minutes: 150
         run: |
           ARGS="--starting-capital ${{ github.event.inputs.starting_capital }} --max-stocks ${{ github.event.inputs.max_stocks }}"
+          ARGS="$ARGS --min-hold-weeks ${{ github.event.inputs.min_hold_weeks }} --max-hold-weeks ${{ github.event.inputs.max_hold_weeks }}"
+          ARGS="$ARGS --atr-stop-mult ${{ github.event.inputs.atr_stop_mult }} --max-concurrent-positions ${{ github.event.inputs.max_concurrent_positions }}"
           if [ -n "${{ github.event.inputs.start_date }}" ]; then
             ARGS="$ARGS --start ${{ github.event.inputs.start_date }}"
           fi
           if [ -n "${{ github.event.inputs.end_date }}" ]; then
             ARGS="$ARGS --end ${{ github.event.inputs.end_date }}"
           fi
-          if [ "${{ github.event.inputs.with_chip_confirm }}" = "true" ]; then
-            ARGS="$ARGS --with-chip-confirm"
-          fi
-          if [ "${{ github.event.inputs.clean_ex_dividend }}" = "true" ]; then
-            ARGS="$ARGS --clean-ex-dividend"
-          fi
-          if [ "${{ github.event.inputs.use_trailing_stop }}" = "true" ]; then
-            ARGS="$ARGS --use-trailing-stop"
-          fi
-          if [ -n "${{ github.event.inputs.atr_stop_mult }}" ]; then
-            ARGS="$ARGS --atr-stop-mult ${{ github.event.inputs.atr_stop_mult }}"
-          fi
-          if [ -n "${{ github.event.inputs.trailing_atr_mult }}" ]; then
-            ARGS="$ARGS --trailing-atr-mult ${{ github.event.inputs.trailing_atr_mult }}"
+          if [ -n "${{ github.event.inputs.risk_pct_per_trade }}" ]; then
+            ARGS="$ARGS --risk-pct-per-trade ${{ github.event.inputs.risk_pct_per_trade }}"
           fi
           if [ -n "${{ github.event.inputs.slippage_pct }}" ] && [ "${{ github.event.inputs.slippage_pct }}" != "0" ]; then
             ARGS="$ARGS --slippage-pct ${{ github.event.inputs.slippage_pct }}"
           fi
-          if [ -n "${{ github.event.inputs.max_concurrent_positions }}" ]; then
-            ARGS="$ARGS --max-concurrent-positions ${{ github.event.inputs.max_concurrent_positions }}"
+          if [ "${{ github.event.inputs.with_revenue }}" = "true" ]; then
+            ARGS="$ARGS --with-revenue"
           fi
-          if [ -n "${{ github.event.inputs.risk_pct_per_trade }}" ]; then
-            ARGS="$ARGS --risk-pct-per-trade ${{ github.event.inputs.risk_pct_per_trade }}"
+          if [ "${{ github.event.inputs.with_valuation }}" = "true" ]; then
+            ARGS="$ARGS --with-valuation"
           fi
-          if [ "${{ github.event.inputs.multi_period_test }}" = "true" ]; then
-            ARGS="$ARGS --multi-period-test"
+          if [ "${{ github.event.inputs.with_chip }}" = "true" ]; then
+            ARGS="$ARGS --with-chip"
           fi
-          if [ -n "${{ github.event.inputs.walkforward_folds }}" ] && [ "${{ github.event.inputs.walkforward_folds }}" != "0" ]; then
-            ARGS="$ARGS --walkforward-folds ${{ github.event.inputs.walkforward_folds }}"
+          if [ "${{ github.event.inputs.with_financial_statements }}" = "true" ]; then
+            ARGS="$ARGS --with-financial-statements"
           fi
           if [ -n "${{ github.event.inputs.fixed_combo_walkforward_folds }}" ] && [ "${{ github.event.inputs.fixed_combo_walkforward_folds }}" != "0" ]; then
             ARGS="$ARGS --fixed-combo-walkforward-folds ${{ github.event.inputs.fixed_combo_walkforward_folds }}"
           fi
-          python compare_breakout.py $ARGS
+          python compare_equity_swing.py $ARGS
 
       - name: Upload results
         uses: actions/upload-artifact@v4
         with:
-          name: momentum-breakout-results
-          path: results_breakout/
+          name: equity-swing-results
+          path: results_equity_swing/
