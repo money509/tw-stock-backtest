@@ -626,6 +626,139 @@ OOS期間運氣好」。
 大部分區塊PF<1，代表這組規則本身也站不住腳——這時候問題不是「選擇方法論不夠嚴謹」，
 是這組規則本身就不夠好，不會因為它連續兩輪被自動選中就預設它有效。
 
+## 九、現股波段策略(基本面/籌碼面為主，2-8週持有，新增獨立策略)
+
+七、八兩節(均值回歸、右側突破)都是**股票期貨**策略：短線持有(數日)、ATR停損、期貨保證金/
+口數規則、每月結算日強制平倉。經過多輪測試(訊號拆解、門檻比較、ATR網格、跨週期驗證、
+walk-forward分折驗證)，都**沒有找到站得住腳的優勢**(詳見上面各節的誠實結論)。
+
+這一節是全新、獨立的第三套策略，跟股票期貨完全不同的典範：交易**實際股票(現股)**，
+持有2~8週(以週為單位，不是天)，訊號以**基本面(營收/評價/財報)跟籌碼面**為主，
+不是短線技術動能。之所以獨立成一套新策略、不是七/八節的變形，是因為底層機制本來就不同：
+
+| | 七、八節(股票期貨) | 九節(現股波段) |
+|---|---|---|
+| 標的 | 股票期貨(有到期日，每月結算) | 實際股票(現股，沒有到期日) |
+| 持有 | 數日(短線) | 2~8週(可設定) |
+| 資金 | 保證金/槓桿，口數 | 現金全額交割，1張=1000股整張進出 |
+| 出場限制 | 結算日前1~2天強制平倉 | 沒有結算日限制 |
+| 訊號 | 技術面為主(量比/RSI/MACD/突破強度) | 基本面(營收/評價/財報)+籌碼面為主 |
+| 方向 | 可多可空 | **只做多**(v1明確不做放空，見下方) |
+
+新增的程式檔案：`revenue_data_loader.py`、`valuation_data_loader.py`、
+`financial_statement_loader.py`(三個新資料源)、`equity_swing_engine.py`(回測引擎)、
+`compare_equity_swing.py`(主執行腳本)、`.github/workflows/equity_swing_backtest.yml`
+(新的GitHub Actions工作流程，獨立於現有的`momentum_breakout_backtest.yml`，不影響
+既有策略)。既有的股票期貨相關檔案(`momentum_breakout_engine.py`/`mean_reversion_engine.py`/
+`sizing.py`/`settlement_calendar.py`等)完全沒有被改動。
+
+### 三個新資料源，信心程度不同，誠實列出
+
+⚠️ 這三支loader都還沒有機會在這個開發環境對真實TWSE/MOPS端點實測過(對外連線被擋)，
+**第一次在GitHub Actions真實環境執行`equity_swing_backtest.yml`，才是它們的第一次真正測試**。
+不管信心程度高低，都應該用這個角度看待，不是「已經驗證過能用」：
+
+1. **`valuation_data_loader.py`(每日PE/PB/殖利率)——信心程度最高**：抓證交所官方
+   `BWIBBU`報表(逐日查詢，`https://www.twse.com.tw/rwd/zh/afterTrading/BWIBBU?date=...`)，
+   欄位命名風格/JSON結構跟已經在GitHub Actions實測驗證過的`chip_data_loader.py`(T86報表)
+   高度一致，用同一套「動態欄位名稱解析+序列請求+重試+硬性逾時」的做法。額外算出
+   implied EPS(收盤價/本益比)、implied每股淨值(收盤價/股價淨值比)兩個衍生欄位，
+   虧損公司(本益比缺失/負值)一律回傳NaN，不會硬算出不合理的數字。
+2. **`revenue_data_loader.py`(月營收YoY/MoM)——信心程度中等**：抓公開資訊觀測站(MOPS)
+   的月營收彙總表(`https://mops.twse.com.tw/nas/t21/sii/t21sc03_{民國年}_{月}_0.html`，
+   上櫃股用`t21sc04`)，這是HTML表格、不是JSON API，用`pandas.read_html()`解析，
+   欄位名稱動態比對。URL格式是根據公開資料社群常見引用推斷，不是實測確認過的格式。
+   公告日近似成「所屬月份的次月10日」，避免回測用到未來才公開的營收數字(look-ahead)。
+3. **`financial_statement_loader.py`(季度EPS/毛利率/ROE)——信心程度最低，明確標記
+   UNVERIFIED**：MOPS的季報查詢介面歷史上一直沒有穩定的公開JSON API，這支用「模擬
+   表單POST + HTML表格解析」，是這類查詢報表最常見、但也最脆弱的存取方式——MOPS
+   改版、調整表單參數、加防爬蟲機制，都會讓它失效。**這支loader是被明確設計成可選、
+   會優雅降級的**：`compare_equity_swing.py`用try/except包住它的呼叫，失敗/逾時/
+   回傳空值都不會讓整個回測中斷，對應的三個訊號(EPS成長率/毛利率/ROE)會自動退化成
+   中性分數0.0，精神上跟`momentum_breakout_engine.py`裡「沒有籌碼資料時
+   `score_foreign_ratio`/`score_trust_ratio`自動變成0分」完全一樣。也因為MOPS這個
+   查詢介面本身是逐股設計(不像T86/BWIBBU一次拿到全市場)，全市場下載這份資料是
+   `股票數 x 季度數`量級的請求，比另外兩支loader慢很多。
+
+### 訊號、門檻、出場邏輯
+
+10個訊號(`EQUITY_SIGNAL_NAMES`，加權排名、可單獨開關做ablation)：
+
+| 分類 | 訊號 |
+|---|---|
+| 營收(需要`--with-revenue`) | 月營收年增率(YoY)、月營收月增率(MoM) |
+| 評價(需要`--with-valuation`) | 本益比(越低越好)、股價淨值比(越低越好)、殖利率(越高越好) |
+| 財報(需要`--with-financial-statements`，⚠️未經驗證) | EPS季增率(QoQ)、毛利率、ROE |
+| 籌碼(需要`--with-chip`) | 外資連續買超天數、投信連續買超天數(重用`chip_data_loader.precompute_chip_streak()`) |
+
+結構性門檻(v1只有一個，不像七/八節有多個門檻變體可以比較)：**站上60日均線**(長版的
+「站上均線=基本上升趨勢背景」過濾，類比七/八節的`close > MA20`，但用更長的均線適配
+數週持有)；大盤氛圍濾網(2330代理指標)為空頭(`bear`)時完全停用進場，因為long-only沒有
+放空可以對沖空頭氛圍。
+
+出場：主要用**持有時間**(2~8週，可設定`--min-hold-weeks`/`--max-hold-weeks`)出場，
+到`max_hold_weeks`強制平倉；搭配**ATR停損**(可設定`--atr-stop-mult`，預設2.0倍，比
+七/八節短線引擎的1.0~1.5倍寬，因為週級別持有要容忍更大的正常波動，不能用短線的
+停損寬度)，停損可以在任何時候觸發(不受最短持有週數限制——停損是風險控管，不是
+「還沒到最短持有時間就不能停損」)。這是全新寫的day-by-day出場邏輯，**沒有**重用
+`mean_reversion_engine._process_mr_day()`(那支是為日等級移動停利/保本停損調校的，
+跟這裡的週等級語意不同)。
+
+### 資金/部位管理：現金 + 整張(v1明確排除放空)
+
+現股是現金全額交割，沒有期貨的保證金/槓桿概念。v1的股數計算：
+`floor(可用現金 / (進場價 x 1000)) x 1000`——只買整張(1張=1000股)，不買零股，
+算出來不足一張就放棄這個候選换下一名。支援兩種部位大小模式：
+- **固定並行部位數 + 現金平分**(預設，`--max-concurrent-positions`)：起始資金平分成
+  N個槽位，每個槽位固定分配到`起始資金/N`的現金，槽位彼此獨立、不會因為某個槽位
+  賺錢就把獲利拿去放大下一筆部位(v1簡化假設，見`equity_swing_engine.py`docstring)
+- **風險預算式**(`--risk-pct-per-trade`)：股數改用`帳戶權益 x 風險比例 ÷ ATR停損距離`
+  反推，再用槽位現金當上限
+
+⚠️ **v1明確不支援放空(long-only)**：現股放空在台灣市場需要券商信用交易額度、融券
+標借券機制，有一整套跟做多完全不同的成本結構(融券手續費、標借費、回補風險、平盤以下
+不能放空)，這裡沒有模擬，是刻意的範圍縮減，不是忘記做。之後如果要加，需要另外處理
+券源/融券成本的模組。
+
+交易成本也跟股票期貨(固定口數手續費)不同機制：買進手續費0.1425%(牌告費率)、賣出
+手續費0.1425%+證券交易稅0.3%，這是現股實際的成本結構，用金額比例課費，不是期貨的
+固定口數費用。
+
+### 怎麼跑
+
+**本機(小規模測試)**：
+```
+python compare_equity_swing.py --max-stocks 50 --with-revenue --with-valuation --with-chip
+```
+
+**GitHub Actions(`equity_swing_backtest.yml`)**：手動觸發(workflow_dispatch)，欄位跟
+`momentum_breakout_backtest.yml`同樣風格(plain string，`true`/`false`用小寫字串精確比對)：
+`start_date`/`end_date`/`starting_capital`/`max_stocks`/`min_hold_weeks`/`max_hold_weeks`/
+`atr_stop_mult`/`max_concurrent_positions`/`risk_pct_per_trade`/`slippage_pct`/
+`with_revenue`/`with_valuation`/`with_chip`/`with_financial_statements`(預設`false`，
+因為逐股查詢慢、且未經驗證)/`fixed_combo_walkforward_folds`。結果(`summary.txt`+CSV)
+上傳成artifact，路徑`results_equity_swing/`。
+
+### v1範圍縮減(誠實列出，不是忘記做)
+
+跟累積了十幾輪的`compare_breakout.py`比，這是刻意做小的v1，只有5個階段(資料下載→
+單一訊號拆解→站上MA60門檻→最終IS/OOS+bootstrap→固定規則walk-forward)，**沒有**做：
+訊號組合比較(自動vs手動指定)、多個門檻變體比較表、ATR倍數敏感度網格搜尋、跨市場週期
+驗證、「每折重新選一次」的walk-forward。這些留給之後有需要再逐輪加，不是這一輪做不到。
+
+### 固定規則walk-forward(從第一輪就納入，不是事後補的)
+
+七/八節花了好幾輪才學到「單一IS/OOS切分不可靠，要切成多個獨立不重疊的歷史區塊分別測試
+同一組固定規則，才是比較站得住腳的驗證方式」這個教訓(見上面「固定規則walk-forward」章節)。
+這一節從第一輪就把這個教訓學起來，用`--fixed-combo-walkforward-folds`(建議值4)把最終
+選出的訊號組合原封不動套到N個獨立區塊各跑一次，檢查PF跨時間是否穩定，不是等到發現
+單一切分結果好看就直接下結論。
+
+⚠️ **總結**：這整套策略是全新、未經任何驗證的假設，不是「找到了現股波段的優勢」。
+不管`summary.txt`印出的PF數字好不好看，在多做幾輪walk-forward/跨週期驗證、且
+`financial_statement_loader.py`真正被GitHub Actions實測過(能不能打通、格式對不對)
+之前，都不該被當作已經驗證過的策略。
+
 ## 五、重要限制（誠實告知，不要照單全收）
 
 1. **停損/停利同一天觸發時的判定是保守假設**：如果同一天內盤中股價曾經跌破停損、又曾經漲過停利，
