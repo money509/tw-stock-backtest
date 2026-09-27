@@ -12,11 +12,25 @@ https://mops.twse.com.tw/nas/t21/otc/t21sc04_{民國年}_{月}_0.html (上櫃)
 迴圈抓取，不是逐股迴圈——跟 chip_data_loader.py 的「逐日」抓T86是同一種設計精神
 (一次請求涵蓋全市場，減少請求總數)。
 
+【已修正的bug，尚未經真實端點驗證】本模組上一版沒有強制指定HTML編碼(只用
+`resp.encoding or "utf-8"`)，實際跑過GitHub Actions後74/74個月全部回傳
+「確認無資料」，100%失敗率。事後查證多份獨立公開的MOPS
+(t21sc03_{民國年}_{月}_0.html)爬蟲範例，一致明確指定`res.encoding = 'big5'`——
+這個頁面是Big5編碼，`requests`在Content-Type沒有明確charset時無法可靠自動判斷，
+猜錯編碼會讓「公司代號」「去年同月增減」等中文欄名變成亂碼，`_find_col()`比對
+不到候選字串，導致`target_df`一直是`None`，函式對每個月都回傳`None`(「無資料」)，
+過程中不會丟出任何例外，所以連重試機制都不會被觸發。已改成寫死
+`resp.encoding = "big5"`(不用or-fallback，因為這個頁面公認是Big5，不是「視情況
+而定」)，但這個修正本身仍未在這個sandbox對真實端點實測過，正確性要等下一次
+GitHub Actions真實環境執行才能確認。至於URL格式本身(t21sc03_{民國年}_{月}_0.html)，
+上述查證的外部範例也獨立印證這個格式是對的，這部分不在懷疑範圍內。
+
 已知限制(誠實列出，這一版都還沒有機會用GitHub Actions真實環境驗證，因為這個
 sandbox對twse.com.tw/mops.twse.com.tw的對外連線被proxy allowlist擋掉)：
 1. URL裡的「民國年」用西元年-1911換算，月份用整數(不補0)，這是根據公開資料社群
-   常見引用的格式推斷，不是已經實測確認過的格式——第一次真正在GitHub Actions
-   執行這支程式，才是這個URL格式對不對的真正驗證。
+   常見引用的格式推斷，並經外部範例獨立印證看起來是對的，但仍不是這個sandbox
+   自己實測確認過的格式——第一次真正在GitHub Actions執行這支程式，才是這個
+   URL格式對不對的真正驗證。
 2. 每月營收公告日期通常落後所屬月份約10天(例如2026年3月的營收約在2026年4月10日
    前後公告)。回測比對訊號時間點時，一定要用「公告日」而不是「所屬月份」去對齊
    股價資料，否則會用到當時market還看不到的未來資料(look-ahead bias)。這支模組
@@ -110,7 +124,7 @@ def fetch_revenue_month(year: int, month: int, market: str = "sii"):
         resp = requests.get(url, headers=HEADERS, timeout=HARD_TIMEOUT_SECONDS)
         if resp.status_code == 404:
             return None  # 這個月份確認查無彙總表(通常是還沒公告)
-        resp.encoding = resp.encoding or "utf-8"
+        resp.encoding = "big5"  # MOPS這個頁面固定是Big5編碼，不用or-fallback猜
         html_text = resp.text
     except Exception as e:
         raise FetchFailed(str(e))

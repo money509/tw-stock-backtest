@@ -7,8 +7,15 @@ chip_data_loader.py的T86報表高度一致)，但仍然**沒有**在這個sandb
 twse.com.tw端點實測過(對外連線被proxy allowlist擋掉)，第一次GitHub Actions
 真實環境執行才是最終驗證。
 
-資料來源：證交所官方「每日收盤價及月均價比、本益比、殖利率及股價淨值比」報表
-https://www.twse.com.tw/rwd/zh/afterTrading/BWIBBU?date=YYYYMMDD&selectType=ALL&response=json
+【已修正的bug，尚未經真實端點驗證】本模組上一版網址寫成不帶`_d`後綴的
+`BWIBBU`，實際跑過GitHub Actions後782/782天全部回傳stat!=OK(「確認無交易」)，
+100%失敗率。事後查證多份獨立公開資料(VBA爬蟲教學文章等)顯示，帶`date`參數
+逐日查詢的正確報表代碼是`BWIBBU_d`(`_d`=依日期查詢版本)，不是`BWIBBU`——
+已改用`BWIBBU_d`，但這個修正本身仍未在這個sandbox對真實端點實測過，正確性
+要等下一次GitHub Actions真實環境執行才能確認。
+
+資料來源：證交所官方「個股日本益比、殖利率及股價淨值比（依日期查詢）」報表
+https://www.twse.com.tw/rwd/zh/afterTrading/BWIBBU_d?date=YYYYMMDD&selectType=ALL&response=json
 這個端點一次回傳「當天全部上市股票」的PE/PB/殖利率，跟T86同樣是「一次拿到
 全市場」的彙總表，所以一樣用「逐日」迴圈抓取(不是逐股迴圈)。
 
@@ -107,7 +114,7 @@ def fetch_valuation_day(date_str: str):
     回傳 None 代表「確認當天無交易」(stat!=OK)；
     request本身失敗時丟出 FetchFailed，由呼叫端決定要不要重試。
     """
-    url = "https://www.twse.com.tw/rwd/zh/afterTrading/BWIBBU"
+    url = "https://www.twse.com.tw/rwd/zh/afterTrading/BWIBBU_d"
     params = {"date": date_str, "selectType": "ALL", "response": "json"}
     try:
         resp = requests.get(url, params=params, headers=HEADERS, timeout=HARD_TIMEOUT_SECONDS)
