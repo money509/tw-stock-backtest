@@ -59,6 +59,10 @@ on:
         description: '走勢前進(Walk-Forward)分折驗證的折數，0代表不啟用(預設)。設3之類的數字會額外把歷史切成N+1個等長區塊，每折重新選一次訊號/門檻/出場配置並在自己的測試窗口驗證，用來檢查選出的組合跨時間是否穩定(會多跑久一點，且是全新階段、實際耗時還沒校準過，建議先從小數字開始試)'
         required: false
         default: '0'
+      fixed_combo_walkforward_folds:
+        description: '固定規則walk-forward驗證的區塊數，0代表不啟用(預設)。設6之類的數字會把同一組已經連續兩輪被自動選中的固定規則(不重新挑選任何訊號/門檻/ATR倍數/出場配置)，原封不動套到N個獨立、不重疊的歷史區塊各跑一次，檢查這組已定案的規則本身跨時間是否穩定。因為規則固定、不用每折重跑整套選擇流程，成本比walkforward_folds低很多，建議值6'
+        required: false
+        default: '0'
 
 jobs:
   backtest:
@@ -125,6 +129,9 @@ jobs:
           fi
           if [ -n "${{ github.event.inputs.walkforward_folds }}" ] && [ "${{ github.event.inputs.walkforward_folds }}" != "0" ]; then
             ARGS="$ARGS --walkforward-folds ${{ github.event.inputs.walkforward_folds }}"
+          fi
+          if [ -n "${{ github.event.inputs.fixed_combo_walkforward_folds }}" ] && [ "${{ github.event.inputs.fixed_combo_walkforward_folds }}" != "0" ]; then
+            ARGS="$ARGS --fixed-combo-walkforward-folds ${{ github.event.inputs.fixed_combo_walkforward_folds }}"
           fi
           python compare_breakout.py $ARGS
 
