@@ -76,6 +76,7 @@ from mean_reversion_engine import (
 )
 from overnight_momentum_engine import percentile_score
 from chip_data_loader import precompute_chip_streak
+from squeeze_kdj_signal import compute_squeeze_kdj_features
 
 BREAKOUT_SIGNAL_NAMES = [
     "score_volume_ratio", "score_rel_strength", "score_rsi_cross", "score_macd",
@@ -88,6 +89,11 @@ BREAKOUT_SIGNAL_NAMES = [
     "score_foreign_streak", "score_trust_streak",
     "score_institutional_net_1d", "score_institutional_net_5d", "score_institutional_net_10d",
     "score_macd_divergence", "score_volume_spike",
+    # 布林通道+Keltner通道擠壓+KDJ訊號(這一輪新增，只做多方，見squeeze_kdj_signal.py
+    # 模組docstring)：這裡是「變體B/沿用ATR框架」版本，訊號只負責標記「今天是不是關鍵K棒」
+    # (0/1二元旗標，跟score_golden_cross/score_price_volume_new_high的處理方式一樣)，
+    # 出場完全交給既有的ATR停損/移動停利框架，才能跟其他單一訊號在同一套消融測試裡公平比較。
+    "score_squeeze_kdj",
 ]
 
 # 均線型態門檻(require_ma_pattern=True時使用，見scan_momentum_breakout_candidates說明)：
@@ -308,6 +314,12 @@ def precompute_breakout_indicators(df: pd.DataFrame, index_close: pd.Series, chi
     ma20_slope = ma20 - ma20.shift(MA_SLOPE_LOOKBACK)
     ma60_slope = ma60 - ma60.shift(MA_SLOPE_LOOKBACK)
 
+    # 布林通道+Keltner通道擠壓+KDJ訊號(只做多方，見squeeze_kdj_signal.py模組docstring)：
+    # EntryFlag是「這天是不是關鍵K棒」的0/1旗標，直接當score_squeeze_kdj的原始分數來源
+    # (跟GoldenCrossFlag/PriceVolNewHigh同樣的0/1旗標處理方式)。
+    squeeze_kdj_features = compute_squeeze_kdj_features(df)
+    squeeze_kdj_entry_long = squeeze_kdj_features["EntryFlag"].astype(float)
+
     result = pd.DataFrame({
         "Close": close, "MA5": ma5, "MA20": ma20, "MA60": ma60, "ATR": atr,
         "VolumeRatio": volume_ratio, "RollingHigh": rolling_high, "RollingLow": rolling_low,
@@ -321,6 +333,7 @@ def precompute_breakout_indicators(df: pd.DataFrame, index_close: pd.Series, chi
         "MA5Slope5": ma5_slope, "MA20Slope5": ma20_slope, "MA60Slope5": ma60_slope,
         "VolumeRatio5D": volume_ratio_5d,
         "BullishDivergence": bullish_divergence, "BearishDivergence": bearish_divergence,
+        "SqueezeKDJEntryLong": squeeze_kdj_entry_long,
         **extra_rolling_cols,
     }, index=df.index)
 
@@ -436,6 +449,14 @@ def _rank_candidates(rows: list, side: str, signal_weights: dict, top_n: int) ->
 
     # 短窗(5日)成交量急增，跟score_volume_ratio的20日窗口區隔開，抓的是「這一兩天突然爆量」
     df["score_volume_spike"] = percentile_score(df["volume_ratio_5d"], higher_is_better=True)
+
+    # 布林通道+Keltner通道擠壓+KDJ訊號：只支援多方(見squeeze_kdj_signal.py模組docstring)，
+    # 空方候選一律給中性分數0.0，不影響空方排名(跟CHIP_DEPENDENT_SIGNALS沒有資料時
+    # 退化成0分的處理方式一致)。
+    if long_dir:
+        df["score_squeeze_kdj"] = percentile_score(df["squeeze_kdj_entry_long"], higher_is_better=True)
+    else:
+        df["score_squeeze_kdj"] = 0.0
 
     total_weight = sum(signal_weights.get(name, 0.0) for name in BREAKOUT_SIGNAL_NAMES)
     if total_weight <= 0:
@@ -579,6 +600,9 @@ def scan_momentum_breakout_candidates(indicators_by_code: dict, as_of_date, regi
             "institutional_net_10d": row["InstitutionalNet10D"],
             "bullish_divergence": row["BullishDivergence"], "bearish_divergence": row["BearishDivergence"],
             "volume_ratio_5d": row["VolumeRatio5D"],
+            # 用.get()而不是[]：這一輪新增的欄位，既有測試手動組出來的indicators DataFrame
+            # 不一定會有這欄，缺席時當作「沒有訊號」(0.0)處理，不影響其他欄位/測試。
+            "squeeze_kdj_entry_long": row.get("SqueezeKDJEntryLong", 0.0),
         }
 
         ma_pattern_bullish = ma_pattern_bearish = True

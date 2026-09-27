@@ -46,12 +46,16 @@ import pandas as pd
 from data_loader import load_price_data, build_master_calendar
 from mean_reversion_engine import precompute_regime_series, compute_regime, summarize_mr
 from equity_swing_engine import (
-    EQUITY_SIGNAL_NAMES,
+    EQUITY_SIGNAL_NAMES, SHARES_PER_LOT, BROKERAGE_FEE_RATE, SECURITIES_TRANSACTION_TAX_RATE,
+    TRADING_DAYS_PER_WEEK,
     precompute_all_equity_indicators, run_equity_swing_backtest,
 )
 from robustness_analysis import bootstrap_resample_pnl, summarize_bootstrap, bootstrap_p_value
 from taifex_universe import STOCK_FUTURES_UNIVERSE
 from compare_breakout import split_is_oos, _fmt_pf, _prefer_nonzero_trades
+from squeeze_kdj_signal import (
+    compute_squeeze_kdj_features, simulate_variant_a_trades, simulate_variant_b_trades,
+)
 
 RESULTS_DIR = os.path.join(os.path.dirname(__file__), "results_equity_swing")
 
@@ -69,6 +73,7 @@ SIGNAL_LABELS = {
     "score_roe": "股東權益報酬率(ROE)",
     "score_foreign_streak": "外資連續買超天數",
     "score_trust_streak": "投信連續買超天數",
+    "score_squeeze_kdj": "布林+Keltner擠壓+KDJ(僅多方)",
 }
 
 DEFAULT_FIXED_COMBO_WALKFORWARD_FOLDS = 4
@@ -163,6 +168,60 @@ def run_fixed_combo_equity_walkforward(price_data, indicators_by_code, regime_se
         print(f"  [固定規則walk-forward 第{i + 1}/{n_folds}折] {chunk[0].date()}~{chunk[-1].date()} "
               f"-> {stats['trade_count']}筆, PF={_fmt_pf(stats['profit_factor'])}, "
               f"勝率={stats['win_rate']:.1f}%, 損益={stats['total_pnl_ntd']:,.0f}", flush=True)
+    return pd.DataFrame(rows)
+
+
+def _cost_squeeze_kdj_equity_trades(raw_trades: list, code: str) -> list:
+    """把squeeze_kdj_signal.py算出來的原始交易，套上現股(整張1000股、手續費+證交稅)的
+    成本模型，轉成summarize_mr()看得懂的trades格式(只做多方，這支引擎本來就long-only)。
+    這裡固定整張(SHARES_PER_LOT)進出，不做風險預算式股數計算——跟run_squeeze_kdj_
+    exit_style_comparison()一樣，是隔離比較用的簡化模擬，不是完整的資金管理回測。"""
+    out = []
+    for t in raw_trades:
+        e_price, exit_price = t["entry_price"], t["exit_price"]
+        shares = SHARES_PER_LOT
+        buy_cost = e_price * shares * BROKERAGE_FEE_RATE
+        sell_cost = exit_price * shares * (BROKERAGE_FEE_RATE + SECURITIES_TRANSACTION_TAX_RATE)
+        pnl_ntd = (exit_price - e_price) * shares - buy_cost - sell_cost
+        return_pct = pnl_ntd / (e_price * shares) if e_price > 0 else 0.0
+        out.append({
+            "code": code, "side": "long", "entry_date": t["entry_date"], "exit_date": t["exit_date"],
+            "e_price": e_price, "exit_price": exit_price, "exit_reason": t["exit_reason"],
+            "lots": 1, "pnl_ntd": pnl_ntd, "return_pct": return_pct, "hold_days": t["hold_days"],
+        })
+    return out
+
+
+def run_squeeze_kdj_exit_style_comparison_equity(price_data: dict, universe: dict, starting_capital: float,
+                                                   atr_stop_mult: float = 2.0,
+                                                   max_hold_weeks: int = 8) -> pd.DataFrame:
+    """
+    等價於compare_breakout.run_squeeze_kdj_exit_style_comparison()，但套用現股波段
+    引擎自己的出場框架跟成本模型：變體B用「ATR停損 + 最長持有max_hold_weeks週(這支
+    引擎主要靠持有時間到了出場，不是固定ATR停利目標價，見equity_swing_engine.py
+    模組docstring的出場邏輯說明)」，不是變體A(原規則)的「前K棒低點停損+K跌破80停利」。
+    一樣對universe裡每一檔股票各自獨立模擬，不透過完整的候選排名/資金管理流程，
+    理由見compare_breakout.py同名函式的docstring。
+    """
+    variant_a_trades, variant_b_trades = [], []
+    max_hold_days = max_hold_weeks * TRADING_DAYS_PER_WEEK
+    for code in universe:
+        df = price_data.get(code)
+        if df is None or len(df) < 60:
+            continue
+        features = compute_squeeze_kdj_features(df)
+        raw_a = simulate_variant_a_trades(df, features)
+        raw_b = simulate_variant_b_trades(df, features, atr_period=14, atr_stop_mult=atr_stop_mult,
+                                           atr_target_mult=None, max_hold_days=max_hold_days)
+        variant_a_trades.extend(_cost_squeeze_kdj_equity_trades(raw_a, code))
+        variant_b_trades.extend(_cost_squeeze_kdj_equity_trades(raw_b, code))
+
+    stats_a = summarize_mr(variant_a_trades, starting_capital)
+    stats_b = summarize_mr(variant_b_trades, starting_capital)
+    rows = [
+        {"variant": "變體A(原規則：前K棒低點停損+K跌破80停利)", **stats_a},
+        {"variant": f"變體B(沿用ATR框架：停損{atr_stop_mult}x ATR+最長持有{max_hold_weeks}週)", **stats_b},
+    ]
     return pd.DataFrame(rows)
 
 
@@ -309,6 +368,18 @@ def main():
           f"90%信賴區間=[{boot_stats['p5']:,.0f}, {boot_stats['p95']:,.0f}]\n", flush=True)
     pd.DataFrame(oos_trades).to_csv(os.path.join(RESULTS_DIR, "oos_trades.csv"), index=False)
 
+    # ---- 新增階段：布林+Keltner擠壓+KDJ訊號，變體A(原規則) vs 變體B(沿用ATR框架) ----
+    print("=== 新增階段：布林+Keltner擠壓+KDJ訊號比較 ===", flush=True)
+    squeeze_kdj_exit_df = run_squeeze_kdj_exit_style_comparison_equity(
+        price_data, universe, args.starting_capital,
+        atr_stop_mult=args.atr_stop_mult, max_hold_weeks=args.max_hold_weeks,
+    )
+    squeeze_kdj_exit_df.to_csv(os.path.join(RESULTS_DIR, "squeeze_kdj_exit_comparison.csv"), index=False)
+    for _, r in squeeze_kdj_exit_df.iterrows():
+        print(f"  [{r['variant']}] {r['trade_count']}筆, PF={_fmt_pf(r['profit_factor'])}, "
+              f"勝率={r['win_rate']:.1f}%, 平均持有{r['avg_hold_days']:.1f}天, "
+              f"總損益={r['total_pnl_ntd']:,.0f}", flush=True)
+
     # ---- 階段5：固定規則walk-forward ----
     fixed_combo_wf_df = None
     if args.fixed_combo_walkforward_folds > 0:
@@ -371,6 +442,16 @@ def main():
             summary_lines.append(f"\n  平均PF(排除無限大)={mean_pf:.2f}，"
                                   f"{len(fixed_combo_wf_df)}/{args.fixed_combo_walkforward_folds}折有足夠交易可比較")
 
+    summary_lines.append("\n--- 布林+Keltner擠壓+KDJ訊號：變體A(原規則) vs 變體B(沿用ATR框架) ---")
+    summary_lines.append("  (這個比較跟上面各階段獨立，直接用全部下載期間的資料，不分IS/OOS，只做多方)")
+    header_sk = f"{'出場變體':38s} {'交易數':>6s} {'PF':>8s} {'勝率%':>7s} {'平均持有天':>8s} {'總損益':>14s}"
+    summary_lines.append(header_sk)
+    summary_lines.append("-" * len(header_sk))
+    for _, r in squeeze_kdj_exit_df.iterrows():
+        summary_lines.append(
+            f"{r['variant']:38s} {r['trade_count']:>6d} {_fmt_pf(r['profit_factor']):>8s} "
+            f"{r['win_rate']:>6.1f}% {r['avg_hold_days']:>8.1f} {r['total_pnl_ntd']:>14,.0f}")
+
     summary_lines.append(
         "\n--- 怎麼判讀 ---\n"
         "這整支策略是全新、未經任何驗證的假設，跟其他既有引擎多輪測試後的結論一樣，\n"
@@ -381,7 +462,12 @@ def main():
         "score_gross_margin/score_roe這三個訊號全部是中性分數，不代表它們沒用，\n"
         "只代表這次沒有測試到。第一次在GitHub Actions真實環境執行，才是三個新loader\n"
         "(尤其是revenue_data_loader.py的URL格式、financial_statement_loader.py整支)\n"
-        "的第一次真正驗證，不是這裡的模擬資料/邏輯測試。"
+        "的第一次真正驗證，不是這裡的模擬資料/邏輯測試。\n\n"
+        "「布林+Keltner擠壓+KDJ」訊號是把一支加密貨幣1小時K線教學影片描述的TTM squeeze"
+        "概念翻譯成台股日線(見squeeze_kdj_signal.py模組docstring)，這支引擎裡的版本已經"
+        "以「變體B(沿用ATR框架)」併入上面的單一訊號拆解；額外的這張比較表把它單獨抽出來，"
+        "測試它自己的兩種出場方式哪個更好。擠壓回看窗口/武裝過期天數都是套用日線的合理"
+        "假設，不是實測調整過的參數，交易筆數偏少時PF數字的可信度要打折扣看待。"
     )
 
     summary_path = os.path.join(RESULTS_DIR, "summary.txt")

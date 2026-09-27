@@ -52,6 +52,7 @@ from mean_reversion_engine import (
 )
 from overnight_momentum_engine import percentile_score
 from chip_data_loader import precompute_chip_streak
+from squeeze_kdj_signal import compute_squeeze_kdj_features
 
 TRADING_DAYS_PER_WEEK = 5  # 粗略近似(不扣國定假日)，跟is_near_settlement一樣的精神：
                             # 假日已經隱含在價格資料本身裡(yfinance不會回傳休市日)，
@@ -91,6 +92,11 @@ EQUITY_SIGNAL_NAMES = [
     "score_valuation_pe", "score_valuation_pb", "score_dividend_yield",
     "score_eps_growth", "score_gross_margin", "score_roe",
     "score_foreign_streak", "score_trust_streak",
+    # 布林通道+Keltner通道擠壓+KDJ訊號(這一輪新增，只做多方，這支引擎本來就long-only，
+    # 見squeeze_kdj_signal.py模組docstring)：「變體B/沿用ATR框架」版本，訊號只標記
+    # 「今天是不是關鍵K棒」(0/1旗標)，出場沿用這支引擎既有的ATR停損框架
+    # (try_enter_equity_position的atr_stop_mult)，才能跟其他單一訊號公平比較。
+    "score_squeeze_kdj",
 ]
 
 
@@ -163,6 +169,11 @@ def precompute_equity_indicators(price_df: pd.DataFrame, revenue_df: pd.DataFram
         out["foreign_streak"] = np.nan
         out["trust_streak"] = np.nan
 
+    # 布林通道+Keltner通道擠壓+KDJ訊號(只做多方，見squeeze_kdj_signal.py模組docstring)：
+    # EntryFlag是「這天是不是關鍵K棒」的0/1旗標，直接當score_squeeze_kdj的原始分數來源。
+    squeeze_kdj_features = compute_squeeze_kdj_features(price_df)
+    out["squeeze_kdj_entry_long"] = squeeze_kdj_features["EntryFlag"].reindex(price_df.index).astype(float)
+
     return out
 
 
@@ -234,6 +245,12 @@ def _rank_equity_candidates(rows: list, signal_weights: dict, top_n: int) -> lis
         percentile_score(df["trust_streak"], higher_is_better=True)
         if df["trust_streak"].notna().any() else 0.0
     )
+    # 用.get()而不是[]：這一輪新增的欄位，既有測試手動組出來的rows不一定會有這欄，
+    # 缺席時整欄退化成中性分數0.0(跟其他CHIP/FUNDAMENTAL_DEPENDENT_SIGNALS一致的處理方式)。
+    if "squeeze_kdj_entry_long" in df.columns and df["squeeze_kdj_entry_long"].notna().any():
+        df["score_squeeze_kdj"] = percentile_score(df["squeeze_kdj_entry_long"], higher_is_better=True)
+    else:
+        df["score_squeeze_kdj"] = 0.0
 
     total_weight = sum(signal_weights.get(name, 0.0) for name in EQUITY_SIGNAL_NAMES)
     if total_weight <= 0:
@@ -289,6 +306,9 @@ def scan_equity_candidates(indicators_by_code: dict, as_of_date, regime: str, ex
             "eps_growth_pct": row["eps_growth_pct"], "gross_margin_pct": row["gross_margin_pct"],
             "roe_pct": row["roe_pct"],
             "foreign_streak": row["foreign_streak"], "trust_streak": row["trust_streak"],
+            # 用.get()而不是[]：這一輪新增的欄位，既有測試手動組出來的indicators DataFrame
+            # 不一定會有這欄，缺席時當作「沒有訊號」(0.0)處理，不影響其他欄位/測試。
+            "squeeze_kdj_entry_long": row.get("squeeze_kdj_entry_long", 0.0),
         })
 
     return _rank_equity_candidates(rows, signal_weights, top_n)

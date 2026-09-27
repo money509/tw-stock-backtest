@@ -147,9 +147,13 @@ from momentum_breakout_engine import (
     run_momentum_breakout_backtest, BREAKOUT_SIGNAL_NAMES, CHIP_DEPENDENT_SIGNALS,
     precompute_all_breakout_indicators,
 )
-from mean_reversion_engine import summarize_mr, precompute_regime_series
+from mean_reversion_engine import summarize_mr, precompute_regime_series, COMMISSION_PER_LOT_PER_LEG
 from robustness_analysis import (
     bootstrap_resample_pnl, summarize_bootstrap, pnl_excluding_top_n_trades, bootstrap_p_value,
+)
+from taifex_universe import get_contract_multiplier
+from squeeze_kdj_signal import (
+    compute_squeeze_kdj_features, simulate_variant_a_trades, simulate_variant_b_trades,
 )
 
 RESULTS_DIR = os.path.join(os.path.dirname(__file__), "results_breakout")
@@ -177,6 +181,7 @@ SIGNAL_LABELS = {
     "score_institutional_net_10d": "主力買賣超(10日)",
     "score_macd_divergence": "MACD背離(近似)",
     "score_volume_spike": "成交量急增(5日窗口)",
+    "score_squeeze_kdj": "布林+Keltner擠壓+KDJ(僅多方)",
 }
 
 HOLD_DAYS_OPTIONS = [("短線5天", 5), ("中期15天", 15)]
@@ -694,6 +699,63 @@ def select_winning_exit_style(exit_style_df, min_trades=MIN_TRADES_FOR_EXIT_STYL
     if bool(best_row.get("breakeven_after_profit", False)):
         extra["breakeven_after_profit"] = True
     return best_row["exit_style"], int(best_row["max_hold_days"]), extra
+
+
+def _cost_squeeze_kdj_trades(raw_trades: list, code: str, lots: int = 2) -> list:
+    """把squeeze_kdj_signal.py算出來的原始交易(entry_price/exit_price/hold_days)，
+    套上股票期貨的合約乘數+手續費，轉成summarize_mr()看得懂的trades格式(只做多方，
+    這裡沒有side欄位判斷，固定當long算)。"""
+    out = []
+    for t in raw_trades:
+        e_price, exit_price = t["entry_price"], t["exit_price"]
+        mult = get_contract_multiplier(code, e_price)
+        price_pnl = (exit_price - e_price) * mult * lots
+        commission = COMMISSION_PER_LOT_PER_LEG * lots * 2
+        pnl_ntd = price_pnl - commission
+        return_pct = pnl_ntd / (e_price * mult * lots) if e_price > 0 else 0.0
+        out.append({
+            "code": code, "side": "long", "entry_date": t["entry_date"], "exit_date": t["exit_date"],
+            "e_price": e_price, "exit_price": exit_price, "exit_reason": t["exit_reason"],
+            "lots": lots, "pnl_ntd": pnl_ntd, "return_pct": return_pct, "hold_days": t["hold_days"],
+        })
+    return out
+
+
+def run_squeeze_kdj_exit_style_comparison(price_data: dict, universe: dict, starting_capital: float,
+                                           lots: int = 2) -> pd.DataFrame:
+    """
+    「布林+Keltner擠壓+KDJ」訊號隔離比較：同一套進場規則，變體A(原規則：前一根K棒低點
+    停損 + K衝高後跌破80停利) vs 變體B(沿用這支引擎既有的ATR停損/停利框架，
+    atr_stop_mult=1.0/atr_target_mult=2.0，跟main()非移動停利模式的預設值一致)。
+
+    這裡刻意不透過scan_momentum_breakout_candidates()/run_momentum_breakout_backtest()
+    的完整候選排名+資金管理流程，而是對universe裡每一檔股票各自獨立模擬(見
+    squeeze_kdj_signal.simulate_variant_a_trades/simulate_variant_b_trades)，因為
+    這裡要回答的問題單純是「同一個進場訊號，兩種出場方式誰比較好」，不需要跟其他
+    訊號比排名、也不需要模擬「資金只夠買前top_n名」的排擠效應——那些跟「這個出場方式
+    好不好」是兩個不同的問題，混在一起反而讓比較結果變得不乾淨。
+    """
+    variant_a_trades, variant_b_trades = [], []
+    for code in universe:
+        df = price_data.get(code)
+        if df is None or len(df) < 60:
+            continue
+        features = compute_squeeze_kdj_features(df)
+        raw_a = simulate_variant_a_trades(df, features)
+        # atr_period=14跟momentum_breakout_engine.precompute_breakout_indicators()裡
+        # ATR欄位用的期數一致(compute_atr_correct()預設period=14)，才算真的「沿用」
+        # 這支引擎既有的ATR框架，不是另外發明一個不同期數的ATR。
+        raw_b = simulate_variant_b_trades(df, features, atr_period=14, atr_stop_mult=1.0, atr_target_mult=2.0)
+        variant_a_trades.extend(_cost_squeeze_kdj_trades(raw_a, code, lots=lots))
+        variant_b_trades.extend(_cost_squeeze_kdj_trades(raw_b, code, lots=lots))
+
+    stats_a = summarize_mr(variant_a_trades, starting_capital)
+    stats_b = summarize_mr(variant_b_trades, starting_capital)
+    rows = [
+        {"variant": "變體A(原規則：前K棒低點停損+K跌破80停利)", **stats_a},
+        {"variant": "變體B(沿用ATR框架：停損1.0x ATR/停利2.0x ATR)", **stats_b},
+    ]
+    return pd.DataFrame(rows)
 
 
 def evaluate_combo(label, price_data, indicators_by_code, regime_series, is_calendar, oos_calendar,
@@ -1267,6 +1329,15 @@ def main():
                 execution_kwargs, chip_data, args.refresh,
             )
 
+    print(f"\n[新增階段] 布林+Keltner擠壓+KDJ訊號：變體A(原規則) vs 變體B(沿用ATR框架) ...")
+    squeeze_kdj_exit_df = run_squeeze_kdj_exit_style_comparison(price_data, universe, args.starting_capital)
+    squeeze_kdj_exit_df.to_csv(os.path.join(RESULTS_DIR, "squeeze_kdj_exit_comparison.csv"),
+                                index=False, encoding="utf-8-sig")
+    for _, r in squeeze_kdj_exit_df.iterrows():
+        print(f"  [{r['variant']}] {r['trade_count']}筆, PF={_fmt_pf(r['profit_factor'])}, "
+              f"勝率={r['win_rate']:.1f}%, 平均持有{r['avg_hold_days']:.1f}天, "
+              f"總損益={r['total_pnl_ntd']:,.0f}")
+
     walkforward_df = None
     if args.walkforward_folds > 0:
         print(f"\n[走勢前進(Walk-Forward)分折驗證] 切成{args.walkforward_folds + 1}個等長區塊，"
@@ -1531,6 +1602,18 @@ def main():
                     f"{r['total_pnl_ntd']:>14,.0f}{r['avg_hold_days']:>10.1f}"
                 )
 
+    summary_lines.append(f"\n--- 布林+Keltner擠壓+KDJ訊號：變體A(原規則) vs 變體B(沿用ATR框架) ---")
+    summary_lines.append("  (這個比較跟上面各階段獨立，直接用全部下載期間的資料，"
+                          "不分IS/OOS，只做多方，見squeeze_kdj_signal.py模組docstring)")
+    header_sk = f"{'出場變體':<46}{'交易數':>8}{'PF':>8}{'勝率%':>8}{'平均持有天':>10}{'總損益NT$':>14}"
+    summary_lines.append(header_sk)
+    summary_lines.append("-" * len(header_sk))
+    for _, r in squeeze_kdj_exit_df.iterrows():
+        summary_lines.append(
+            f"{r['variant']:<46}{r['trade_count']:>8}{_fmt_pf(r['profit_factor']):>8}"
+            f"{r['win_rate']:>8.1f}{r['avg_hold_days']:>10.1f}{r['total_pnl_ntd']:>14,.0f}"
+        )
+
     summary_lines.append(
         "\n判讀方式：先看單一訊號拆解，PF明顯>1且交易筆數夠多的訊號才代表真的有預測力；"
         "「最佳組合」是程式依這個結果自動選出來的，不是隨便挑的——如果標示「探索性選擇」，"
@@ -1567,6 +1650,18 @@ def main():
         "成本價，不要漲了後面下跌還賠錢」這個原則：一旦浮動獲利轉正，停損就移到成本價，"
         "不管有沒有開移動停利都會生效。這幾個都是使用者盤感提出、還沒被驗證過的新假設，"
         "程式會照實測出來的PF/總損益排名，不會因為背後的邏輯聽起來合理就預設會贏。"
+        "\n\n新增的「布林+Keltner擠壓+KDJ」訊號是把一支加密貨幣1小時K線教學影片描述的"
+        "TTM squeeze概念翻譯成台股日線：布林通道縮進Keltner通道內代表盤整蓄積(擠壓)，"
+        "擠壓附近跌破布林下軌且KDJ的K<20視為「武裝」，之後收紅且K回升穿越20視為關鍵K棒，"
+        "訊號觸發。這個訊號本身已經以「變體B(沿用ATR框架)」的形式併入上面的單一訊號拆解，"
+        "跟其他既有訊號放在同一套消融測試裡公平比較；額外新增的這張表則是把這個訊號單獨"
+        "抽出來，比較它自己的兩種出場方式哪個更好——「變體A(原規則)」用前一根K棒的低點"
+        "當固定停損、K衝高到80以上後跌破80才停利，是原始描述裡完整的規則；「變體B」則是"
+        "拿掉原本的停損/停利邏輯，改用這支引擎既有的ATR停損/停利框架，方便跟其他訊號的"
+        "出場方式一致比較。由於這是把1小時圖的概念套到日線，擠壓回看窗口(10天)、武裝"
+        "過期天數(15天)這些參數都是合理但未經實測調整的預設值，不是先驗保證有效，這張"
+        "表本身的交易筆數如果偏少，代表這個設定在目前的股票池/期間裡本來就不常觸發，"
+        "PF數字的可信度要打折扣看待。"
     )
 
     summary_text = "\n".join(summary_lines)
