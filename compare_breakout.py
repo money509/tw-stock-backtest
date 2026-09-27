@@ -499,6 +499,21 @@ FIXED_WALKFORWARD_COMBO_VARIANTS = [
         "label": "固定候選E(出場改為單純10天強制出場，不含延遲啟動/跳空上限，其餘不變)",
         "exit_kwargs": {"max_hold_days_override": 10},
     },
+    {
+        **FIXED_WALKFORWARD_COMBO,
+        "label": "固定候選G(訊號只用K棒實體比例，不跟MACD等權重平均，其餘不變)",
+        "signal_weights": {"score_candle_body": 1.0},
+    },
+    {
+        **FIXED_WALKFORWARD_COMBO,
+        # 拆解魚身整合版(天數上限+延遲啟動+跳空上限)：候選E已經測過「全拿掉只留天數上限」，
+        # 這裡改成「只拿掉跳空上限，保留延遲啟動」，用來隔離是延遲啟動還是跳空上限在起作用。
+        "label": "固定候選H(出場只留延遲啟動，拿掉跳空上限，其餘不變)",
+        "exit_kwargs": {
+            "max_hold_days_override": 10, "trailing_activation_days": 2,
+            "trailing_activation_profit_atr": 1.5,
+        },
+    },
 ]
 
 
