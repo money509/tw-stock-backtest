@@ -168,6 +168,134 @@ def _try_scrape_download_link():
     return dl_resp.content, "ok"
 
 
+DAILY_ZIP_URL_TEMPLATE = TAIFEX_BASE + "/file/taifex/Dailydownload/DailydownloadCSV/Daily_{y:04d}_{m:02d}_{d:02d}.zip"
+DAILY_ZIP_CACHE_DIR = os.path.join(os.path.dirname(__file__), "taifex_intraday_cache", "daily_zips")
+
+# commodity_id對ProductCode欄位的別名猜測：使用者/呼叫端習慣傳"TXF"，但TAIFEX逐筆
+# 成交檔案裡商品代號欄位實際內容可能是"TX"(不含F)。exact match優先，match不到才
+# 退而求其次試這個別名表，兩種都試過還是找不到就誠實回報，不要猜更多。
+COMMODITY_ALIASES = {"TXF": ["TX"], "TX": ["TXF"]}
+
+
+def _try_direct_daily_zip(date_obj, commodity_id: str):
+    """策略0(這一輪新增，根據多篇獨立的公開爬蟲文章/repo交叉確認過的真實下載機制，
+    不是用猜的——見taifex_intraday_loader.py所在commit訊息)：TAIFEX把每個交易日的
+    全商品逐筆成交資料包成固定命名的zip檔，直接用日期組URL就能下載，不需要猜表單
+    欄位、也不用掃描頁面找連結：
+        https://www.taifex.com.tw/file/taifex/Dailydownload/DailydownloadCSV/Daily_YYYY_MM_DD.zip
+    這個策略一次只服務「一個交易日」，呼叫端(fetch_multi_day_ticks)負責往回疊代
+    多個交易日湊出「近30個交易日」的資料，不像策略1/2是對「前30天」這個頁面整包要。
+
+    回傳(ticks_df_or_None, reason)：
+      reason == "ok"                 成功，ticks_df已經過parse_tick_csv()解析、
+                                      且已經用commodity_id(或COMMODITY_ALIASES裡的
+                                      別名)篩選過ProductCode
+      reason == "http_404"           這天沒有這個檔案(非交易日/假日，正常情況，
+                                      呼叫端不該當成錯誤看待，應該跳過繼續試前一天)
+      reason == "http_<code>"        其他HTTP錯誤
+      reason == "<parse_tick_csv的reason>"  下載成功但解析失敗，原因沿用
+                                      parse_tick_csv()的reason定義
+      reason == "commodity_not_found_in_day" 解析成功，但這天的資料裡找不到
+                                      commodity_id(含別名)對應的ProductCode
+    連線本身失敗(逾時/連線錯誤)時丟出FetchFailed，由呼叫端決定要不要重試這天。
+    """
+    url = DAILY_ZIP_URL_TEMPLATE.format(y=date_obj.year, m=date_obj.month, d=date_obj.day)
+    try:
+        resp = requests.get(url, headers=HEADERS, timeout=HARD_TIMEOUT_SECONDS)
+    except Exception as e:
+        raise FetchFailed(str(e))
+    if resp.status_code == 404:
+        return None, "http_404"
+    if resp.status_code != 200:
+        return None, f"http_{resp.status_code}"
+
+    ticks, parse_reason = parse_tick_csv(resp.content)
+    if parse_reason != "ok":
+        return None, parse_reason
+
+    candidates = [commodity_id] + COMMODITY_ALIASES.get(commodity_id, [])
+    product_stripped = ticks["ProductCode"].str.strip()
+    matched = None
+    for cand in candidates:
+        hit = ticks[product_stripped == cand]
+        if not hit.empty:
+            matched = hit
+            break
+    if matched is None:
+        return None, "commodity_not_found_in_day"
+    return matched.copy(), "ok"
+
+
+def fetch_multi_day_ticks(commodity_id: str = "TXF", target_trading_days: int = 32,
+                           max_lookback_calendar_days: int = 50, cache_dir=None, refresh: bool = False):
+    """
+    往回疊代日曆日(跳過週六週日)，對每個交易日呼叫_try_direct_daily_zip()，直到湊滿
+    target_trading_days個「真的有資料」的交易日，或超過max_lookback_calendar_days
+    (多留一點緩衝給國定假日)。每天的原始zip內容快取在DAILY_ZIP_CACHE_DIR/下，檔名
+    是日期(過去的交易日資料永遠不會變，不像舊版「前30天」快取每天都要重抓)。
+
+    回傳(ticks_df_or_None, diagnostics: dict)。diagnostics包含：
+      "reason"                    "ok"或明確失敗原因
+      "n_trading_days_found"      成功湊到幾個交易日
+      "n_calendar_days_scanned"   實際掃了幾個日曆日(含假日/週末)
+      "day_failures"              dict，日期字串->失敗reason，只記錄「有掃但沒抓到」
+                                   的日子(http_404是正常的非交易日，不算失敗、不記錄)
+    """
+    cache_dir = cache_dir or DAILY_ZIP_CACHE_DIR
+    os.makedirs(cache_dir, exist_ok=True)
+
+    all_ticks = []
+    day_failures = {}
+    n_found = 0
+    n_scanned = 0
+    today = datetime.date.today()
+
+    for offset in range(1, max_lookback_calendar_days + 1):
+        if n_found >= target_trading_days:
+            break
+        date_obj = today - datetime.timedelta(days=offset)
+        if date_obj.weekday() >= 5:  # 週六=5, 週日=6
+            continue
+        n_scanned += 1
+
+        cache_path = os.path.join(cache_dir, f"{date_obj.isoformat()}_{commodity_id}.csv")
+        if not refresh and os.path.exists(cache_path):
+            cached = pd.read_csv(cache_path, parse_dates=["Timestamp"])
+            if not cached.empty:
+                all_ticks.append(cached)
+                n_found += 1
+            continue
+
+        try:
+            day_ticks, reason = run_with_hard_timeout(
+                _try_direct_daily_zip, args=(date_obj, commodity_id), timeout=THREAD_HARD_TIMEOUT_SECONDS)
+        except (FetchFailed, HardTimeout) as e:
+            day_failures[date_obj.isoformat()] = f"connection_error:{e}"
+            continue
+
+        if reason == "http_404":
+            continue  # 正常的非交易日，不記錄成失敗
+        if reason != "ok":
+            day_failures[date_obj.isoformat()] = reason
+            continue
+
+        day_ticks.to_csv(cache_path, index=False)
+        all_ticks.append(day_ticks)
+        n_found += 1
+
+    if not all_ticks:
+        return None, {
+            "reason": "no_trading_days_found", "n_trading_days_found": 0,
+            "n_calendar_days_scanned": n_scanned, "day_failures": day_failures,
+        }
+
+    combined = pd.concat(all_ticks, ignore_index=True)
+    return combined, {
+        "reason": "ok", "n_trading_days_found": n_found,
+        "n_calendar_days_scanned": n_scanned, "day_failures": day_failures,
+    }
+
+
 def fetch_raw_tick_data(commodity_id: str = "TXF"):
     """
     嘗試抓取「前30個交易日期貨每筆成交資料」的原始內容(見模組docstring策略1/2)。
@@ -404,10 +532,35 @@ def load_tx_bars(commodity_id: str = "TXF", refresh: bool = False, bar_minutes: 
     (見squeeze_kdj_tx_hourly_preview.py)。
     """
     os.makedirs(TAIFEX_INTRADAY_CACHE_DIR, exist_ok=True)
+
+    # 策略0(直接組每日zip URL，見fetch_multi_day_ticks docstring)優先，這是經過
+    # 交叉確認過的真實下載機制，不是猜測；策略1/2(POST猜測/掃描下載連結，對應
+    # 舊版「前30天」整包頁面)留著當保底，萬一TAIFEX哪天改了每日zip的命名規則或
+    # 路徑，還有退路可以試。
+    ticks, multi_day_diag = fetch_multi_day_ticks(commodity_id, refresh=refresh)
+    used_cache = False  # fetch_multi_day_ticks內部逐日快取，這裡的used_cache欄位
+                         # 保留給舊策略用，策略0成功時不透過這個欄位表達快取狀態，
+                         # 完整快取細節看multi_day_diag本身。
+    if ticks is not None and multi_day_diag["reason"] == "ok":
+        front_ticks, front_month = select_front_month(ticks)
+        if front_ticks.empty:
+            return None, {"reason": "no_front_month_ticks", "used_cache": used_cache,
+                           "strategy": "direct_daily_zip", "multi_day_diag": multi_day_diag}
+        bars, n_dropped = aggregate_ticks_to_bars(front_ticks, bar_minutes=bar_minutes)
+        if bars.empty:
+            return None, {"reason": "no_day_session_bars", "used_cache": used_cache,
+                           "front_month": front_month, "n_night_session_dropped": n_dropped,
+                           "strategy": "direct_daily_zip", "multi_day_diag": multi_day_diag}
+        return bars, {
+            "reason": "ok", "used_cache": used_cache, "front_month": front_month,
+            "n_ticks": int(len(front_ticks)), "n_night_session_dropped": n_dropped,
+            "strategy": "direct_daily_zip", "multi_day_diag": multi_day_diag,
+        }
+
+    # 策略0完全沒湊到任何一天的資料，退回舊版策略1/2(整包「前30天」頁面猜測)。
     today_str = datetime.date.today().isoformat()
     cache_path = os.path.join(TAIFEX_INTRADAY_CACHE_DIR, f"raw_{commodity_id}_{today_str}.bin")
 
-    used_cache = False
     if not refresh and os.path.exists(cache_path):
         with open(cache_path, "rb") as f:
             content = f.read()
@@ -419,14 +572,17 @@ def load_tx_bars(commodity_id: str = "TXF", refresh: bool = False, bar_minutes: 
             with open(cache_path, "wb") as f:
                 f.write(content)
         elif not success:
-            return None, {"reason": "network_failed_after_retries", "used_cache": False}
+            return None, {"reason": "network_failed_after_retries", "used_cache": False,
+                           "strategy": "legacy_fallback", "multi_day_diag": multi_day_diag}
 
     if not content or fetch_reason != "ok":
-        return None, {"reason": fetch_reason, "used_cache": used_cache}
+        return None, {"reason": fetch_reason, "used_cache": used_cache,
+                       "strategy": "legacy_fallback", "multi_day_diag": multi_day_diag}
 
     ticks, parse_reason = parse_tick_csv(content)
     if parse_reason != "ok":
-        return None, {"reason": parse_reason, "used_cache": used_cache}
+        return None, {"reason": parse_reason, "used_cache": used_cache,
+                       "strategy": "legacy_fallback", "multi_day_diag": multi_day_diag}
 
     front_ticks, front_month = select_front_month(ticks)
     if front_ticks.empty:

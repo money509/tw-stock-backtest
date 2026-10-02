@@ -1,5 +1,7 @@
 """taifex_intraday_loader.py 的單元測試：全部用合成tick資料/合成CSV bytes，不打網路。"""
+import datetime
 import io
+from unittest import mock
 
 import pandas as pd
 import pytest
@@ -7,6 +9,7 @@ import pytest
 from taifex_intraday_loader import (
     parse_tick_csv, select_front_month, aggregate_ticks_to_hourly, aggregate_ticks_to_bars,
     DAY_SESSION_START, DAY_SESSION_END,
+    _try_direct_daily_zip, fetch_multi_day_ticks, FetchFailed,
 )
 
 
@@ -241,3 +244,112 @@ class TestLoadTxBarsGeneralization:
         result, diag = mod.load_tx_15min_bars()
         assert captured["bar_minutes"] == 15
         assert result == "sentinel_bars"
+
+
+def _make_daily_zip_bytes(product_code="TX", n=5, date_str="20260115"):
+    rows = []
+    for i in range(n):
+        rows.append({"商品代號": product_code, "到期月份(週別)": "202601",
+                      "成交日期": date_str, "成交時間": f"08450{i}",
+                      "成交價格": str(18000 + i), "成交數量(B or S)": "1"})
+    import zipfile
+    csv_bytes = pd.DataFrame(rows).to_csv(index=False).encode("utf-8")
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("Daily.csv", csv_bytes)
+    return buf.getvalue()
+
+
+class TestTryDirectDailyZip:
+    def test_success_filters_by_exact_commodity_match(self):
+        content = _make_daily_zip_bytes(product_code="TX", n=5)
+        resp = mock.Mock(status_code=200, content=content)
+        with mock.patch("taifex_intraday_loader.requests.get", return_value=resp):
+            ticks, reason = _try_direct_daily_zip(datetime.date(2026, 1, 15), "TX")
+        assert reason == "ok"
+        assert len(ticks) == 5
+        assert (ticks["ProductCode"].str.strip() == "TX").all()
+
+    def test_commodity_alias_fallback_txf_matches_tx_rows(self):
+        # 商品代號欄位實際是"TX"，呼叫端傳的是"TXF"，應該透過COMMODITY_ALIASES退而求其次試到。
+        content = _make_daily_zip_bytes(product_code="TX", n=3)
+        resp = mock.Mock(status_code=200, content=content)
+        with mock.patch("taifex_intraday_loader.requests.get", return_value=resp):
+            ticks, reason = _try_direct_daily_zip(datetime.date(2026, 1, 15), "TXF")
+        assert reason == "ok"
+        assert len(ticks) == 3
+
+    def test_404_returns_reason_not_exception(self):
+        resp = mock.Mock(status_code=404, content=b"")
+        with mock.patch("taifex_intraday_loader.requests.get", return_value=resp):
+            ticks, reason = _try_direct_daily_zip(datetime.date(2026, 1, 17), "TX")
+        assert ticks is None
+        assert reason == "http_404"
+
+    def test_commodity_not_present_that_day(self):
+        content = _make_daily_zip_bytes(product_code="MTX", n=3)
+        resp = mock.Mock(status_code=200, content=content)
+        with mock.patch("taifex_intraday_loader.requests.get", return_value=resp):
+            ticks, reason = _try_direct_daily_zip(datetime.date(2026, 1, 15), "TX")
+        assert ticks is None
+        assert reason == "commodity_not_found_in_day"
+
+    def test_connection_error_raises_fetch_failed(self):
+        with mock.patch("taifex_intraday_loader.requests.get", side_effect=Exception("逾時")):
+            with pytest.raises(FetchFailed):
+                _try_direct_daily_zip(datetime.date(2026, 1, 15), "TX")
+
+
+class TestFetchMultiDayTicks:
+    def test_stops_once_target_trading_days_reached(self, tmp_path):
+        def fake_direct_zip_df(date_obj, commodity_id):
+            rows = [{"ProductCode": "TX", "ContractMonth": "202601",
+                     "Price": 18000.0, "Volume": 1.0,
+                     "Timestamp": pd.Timestamp(date_obj)}]
+            return pd.DataFrame(rows), "ok"
+
+        with mock.patch("taifex_intraday_loader._try_direct_daily_zip", side_effect=fake_direct_zip_df):
+            ticks, diag = fetch_multi_day_ticks(
+                "TX", target_trading_days=3, max_lookback_calendar_days=30,
+                cache_dir=str(tmp_path))
+
+        assert diag["reason"] == "ok"
+        assert diag["n_trading_days_found"] == 3
+        assert len(ticks) == 3
+
+    def test_per_day_cache_avoids_refetch(self, tmp_path):
+        def fake_direct_zip_df(date_obj, commodity_id):
+            rows = [{"ProductCode": "TX", "ContractMonth": "202601",
+                     "Price": 18000.0, "Volume": 1.0,
+                     "Timestamp": pd.Timestamp(date_obj)}]
+            return pd.DataFrame(rows), "ok"
+
+        with mock.patch("taifex_intraday_loader._try_direct_daily_zip", side_effect=fake_direct_zip_df):
+            fetch_multi_day_ticks("TX", target_trading_days=2, max_lookback_calendar_days=30,
+                                   cache_dir=str(tmp_path))
+
+        with mock.patch("taifex_intraday_loader._try_direct_daily_zip") as mock_fn:
+            ticks2, diag2 = fetch_multi_day_ticks(
+                "TX", target_trading_days=2, max_lookback_calendar_days=30,
+                cache_dir=str(tmp_path), refresh=False)
+        mock_fn.assert_not_called()
+        assert diag2["n_trading_days_found"] == 2
+
+    def test_all_days_failing_returns_none_with_diagnostics(self, tmp_path):
+        with mock.patch("taifex_intraday_loader._try_direct_daily_zip",
+                         return_value=(None, "missing_columns:price")):
+            ticks, diag = fetch_multi_day_ticks(
+                "TX", target_trading_days=3, max_lookback_calendar_days=5,
+                cache_dir=str(tmp_path))
+        assert ticks is None
+        assert diag["reason"] == "no_trading_days_found"
+        assert len(diag["day_failures"]) > 0
+
+    def test_http_404_not_counted_as_failure(self, tmp_path):
+        with mock.patch("taifex_intraday_loader._try_direct_daily_zip",
+                         return_value=(None, "http_404")):
+            ticks, diag = fetch_multi_day_ticks(
+                "TX", target_trading_days=3, max_lookback_calendar_days=5,
+                cache_dir=str(tmp_path))
+        assert ticks is None
+        assert diag["day_failures"] == {}

@@ -133,11 +133,18 @@ def check_file_signature(local_path):
 
 def _gdown_download(file_id, output_path):
     """實際呼叫gdown下載單一檔案(可能觸發Google Drive「檔案過大、無法掃描病毒」的
-    確認頁，gdown的fuzzy=True會處理這個確認token流程，不用自己手刻)。
+    確認頁，gdown會自動處理這個確認token流程，不用自己手刻)。
     回傳gdown回報的輸出路徑；下載失敗時gdown可能回傳None或直接丟例外，兩種情況
-    呼叫端(_download_with_retry)都當作失敗處理。"""
+    呼叫端(_download_with_retry)都當作失敗處理。
+
+    ⚠️修正記錄：原本多傳了fuzzy=True，這個參數是給「直接丟整個分享網址、讓gdown
+    自己從網址裡猜file id」用的；這裡我們已經自己從網址解析出file_id、用id=直接
+    指定，不需要fuzzy模式。而且目前requirements.txt裝的是較新版gdown(6.x)，
+    這個版本的download()根本沒有fuzzy這個參數了(舊版才有)，傳了會直接丟
+    TypeError: unexpected keyword argument，這是第一次在GitHub Actions
+    真實環境跑才發現的，拿掉fuzzy就是正確用法。"""
     import gdown
-    return gdown.download(id=file_id, output=output_path, quiet=False, fuzzy=True)
+    return gdown.download(id=file_id, output=output_path, quiet=False)
 
 
 def _download_with_retry(file_id, tmp_path):
