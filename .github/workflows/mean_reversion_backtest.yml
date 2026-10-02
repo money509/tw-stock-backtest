@@ -1,4 +1,4 @@
-name: Run Equity Swing Backtest
+name: Run Short Reversal Backtest
 
 on:
   workflow_dispatch:
@@ -14,64 +14,32 @@ on:
       starting_capital:
         description: '模擬帳戶起始資金(新台幣)'
         required: false
-        default: '1000000'
+        default: '200000'
       max_stocks:
-        description: '限制掃描股票數量，0代表全部320檔(第一次測試建議先設50，跑比較快)'
+        description: '限制掃描股票數量，0代表全部249檔(第一次測試建議先設50，跑比較快)'
         required: false
         default: '50'
-      min_hold_weeks:
-        description: '最短持有週數'
-        required: false
-        default: '2'
-      max_hold_weeks:
-        description: '最長持有週數(到期強制出場)'
-        required: false
-        default: '8'
-      atr_stop_mult:
-        description: 'ATR停損倍數(週級別持有，預設比短線引擎寬，避免正常波動洗出場)'
-        required: false
-        default: '2.0'
-      max_concurrent_positions:
-        description: '最多同時持有幾檔(資金平分成這麼多槽位)'
+      top_n:
+        description: '多方/空方各自取前幾名候選(預設5，同時最多可能有2倍這個數字的部位)'
         required: false
         default: '5'
-      risk_pct_per_trade:
-        description: '改用風險預算式股數計算的比例，例如0.02代表每筆風險2%帳戶權益，留空代表用槽位現金平分'
+      atr_stop_mult:
+        description: 'ATR保護性停損倍數(安全網，不是主要出場依據，主要出場依據是固定持有天數)'
         required: false
-        default: ''
+        default: '2.0'
       slippage_pct:
         description: '進場/停損出場的滑價假設，例如0.002代表0.2%，留空或0代表不模擬滑價'
         required: false
         default: '0'
-      with_revenue:
-        description: '是否下載月營收資料(YoY/MoM訊號)。⚠️revenue_data_loader.py的URL格式未經真實驗證'
+      max_concurrent_positions:
+        description: '同時最多持有的部位數，留空代表2倍top_n(多空雙向各top_n名都進場)'
         required: false
-        default: 'true'
-      with_valuation:
-        description: '是否下載每日PE/PB/殖利率資料'
-        required: false
-        default: 'true'
-      with_chip:
-        description: '是否下載三大法人籌碼資料(外資/投信連續買超訊號)'
-        required: false
-        default: 'true'
-      with_financial_statements:
-        description: '是否下載季度財報資料(EPS成長率/毛利率/ROE訊號)。⚠️financial_statement_loader.py明確未經驗證，逐股查詢會跑比較久，失敗不會中斷流程'
-        required: false
-        default: 'false'
-      fixed_combo_walkforward_folds:
-        description: '固定規則walk-forward驗證的區塊數，0代表不啟用(預設)，建議值4'
-        required: false
-        default: '0'
-      refresh_cache:
-        description: '強制重新下載(忽略快取)。⚠️快取會用github actions cache跨次執行保留，如果之前抓過的日期/月份被誤判成「確認無資料」，即使程式碼後來修好bug了，沒開這個還是會沿用之前錯的空快取、不會重抓——loader程式碼有更新(例如修過bug)後第一次重跑，務必開true，之後正常跑可以關掉'
-        required: false
-        default: 'false'
+        default: ''
 
 jobs:
   backtest:
     runs-on: ubuntu-latest
-    timeout-minutes: 300
+    timeout-minutes: 180
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -89,56 +57,37 @@ jobs:
       - name: Restore price data cache
         uses: actions/cache@v4
         with:
-          path: |
-            data_cache
-            revenue_cache
-            valuation_cache
-            financial_cache
-            chip_cache
-          key: equity-swing-data-cache-${{ github.run_id }}
+          path: data_cache
+          key: price-data-cache-${{ github.run_id }}
           restore-keys: |
-            equity-swing-data-cache-
+            price-data-cache-
 
-      - name: Run equity swing backtest
+      - name: Run short reversal backtest
         timeout-minutes: 150
         run: |
           ARGS="--starting-capital ${{ github.event.inputs.starting_capital }} --max-stocks ${{ github.event.inputs.max_stocks }}"
-          ARGS="$ARGS --min-hold-weeks ${{ github.event.inputs.min_hold_weeks }} --max-hold-weeks ${{ github.event.inputs.max_hold_weeks }}"
-          ARGS="$ARGS --atr-stop-mult ${{ github.event.inputs.atr_stop_mult }} --max-concurrent-positions ${{ github.event.inputs.max_concurrent_positions }}"
           if [ -n "${{ github.event.inputs.start_date }}" ]; then
             ARGS="$ARGS --start ${{ github.event.inputs.start_date }}"
           fi
           if [ -n "${{ github.event.inputs.end_date }}" ]; then
             ARGS="$ARGS --end ${{ github.event.inputs.end_date }}"
           fi
-          if [ -n "${{ github.event.inputs.risk_pct_per_trade }}" ]; then
-            ARGS="$ARGS --risk-pct-per-trade ${{ github.event.inputs.risk_pct_per_trade }}"
+          if [ -n "${{ github.event.inputs.top_n }}" ]; then
+            ARGS="$ARGS --top-n ${{ github.event.inputs.top_n }}"
+          fi
+          if [ -n "${{ github.event.inputs.atr_stop_mult }}" ]; then
+            ARGS="$ARGS --atr-stop-mult ${{ github.event.inputs.atr_stop_mult }}"
           fi
           if [ -n "${{ github.event.inputs.slippage_pct }}" ] && [ "${{ github.event.inputs.slippage_pct }}" != "0" ]; then
             ARGS="$ARGS --slippage-pct ${{ github.event.inputs.slippage_pct }}"
           fi
-          if [ "${{ github.event.inputs.with_revenue }}" = "true" ]; then
-            ARGS="$ARGS --with-revenue"
+          if [ -n "${{ github.event.inputs.max_concurrent_positions }}" ]; then
+            ARGS="$ARGS --max-concurrent-positions ${{ github.event.inputs.max_concurrent_positions }}"
           fi
-          if [ "${{ github.event.inputs.with_valuation }}" = "true" ]; then
-            ARGS="$ARGS --with-valuation"
-          fi
-          if [ "${{ github.event.inputs.with_chip }}" = "true" ]; then
-            ARGS="$ARGS --with-chip"
-          fi
-          if [ "${{ github.event.inputs.with_financial_statements }}" = "true" ]; then
-            ARGS="$ARGS --with-financial-statements"
-          fi
-          if [ -n "${{ github.event.inputs.fixed_combo_walkforward_folds }}" ] && [ "${{ github.event.inputs.fixed_combo_walkforward_folds }}" != "0" ]; then
-            ARGS="$ARGS --fixed-combo-walkforward-folds ${{ github.event.inputs.fixed_combo_walkforward_folds }}"
-          fi
-          if [ "${{ github.event.inputs.refresh_cache }}" = "true" ]; then
-            ARGS="$ARGS --refresh"
-          fi
-          python compare_equity_swing.py $ARGS
+          python compare_short_reversal.py $ARGS
 
       - name: Upload results
         uses: actions/upload-artifact@v4
         with:
-          name: equity-swing-results
-          path: results_equity_swing/
+          name: short-reversal-results
+          path: results_short_reversal/
