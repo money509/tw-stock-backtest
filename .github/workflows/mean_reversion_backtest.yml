@@ -1,4 +1,4 @@
-name: Run Revenue Drift Backtest
+name: Run Momentum Breakout Backtest
 
 on:
   workflow_dispatch:
@@ -16,38 +16,58 @@ on:
         required: false
         default: '200000'
       max_stocks:
-        description: '限制掃描股票數量，0代表全部249檔(第一次測試建議先設50，跑比較快)'
+        description: '限制掃描股票數量，0代表全部320檔(第一次測試建議先設50，跑比較快)'
         required: false
         default: '50'
-      top_n:
-        description: '多方/空方各自取前幾名候選(預設5，同時最多可能有2倍這個數字的部位)'
+      with_chip_confirm:
+        description: '是否額外測試外資連續買超確認訊號(需要多下載三大法人資料，會跑比較久)'
         required: false
-        default: '5'
+        default: 'false'
+      clean_ex_dividend:
+        description: '是否排除除權息當天的股票(避免機械性跳空污染訊號，需要多下載除權息資料，會跑久一點)'
+        required: false
+        default: 'false'
+      use_trailing_stop:
+        description: '出場是否改用移動停利(不設固定天數/固定停利目標價，讓獲利奔跑)，取代原本短線5天/中期15天比較'
+        required: false
+        default: 'false'
       atr_stop_mult:
-        description: 'ATR保護性停損倍數(安全網，不是主要出場依據，主要出場依據是固定持有天數)'
+        description: '初始停損的ATR倍數(移動停利模式下只用在對照組，最佳組合的倍數會由ATR敏感度網格自動搜出)'
         required: false
-        default: '2.0'
+        default: '1.0'
+      trailing_atr_mult:
+        description: '移動停利的ATR倍數，留空代表跟初始停損用同一個值(同樣只用在對照組)'
+        required: false
+        default: ''
       slippage_pct:
         description: '進場/停損出場的滑價假設，例如0.002代表0.2%，留空或0代表不模擬滑價'
         required: false
         default: '0'
       max_concurrent_positions:
-        description: '同時最多持有的部位數，留空代表2倍top_n(多空雙向各top_n名都進場)'
+        description: '最佳組合最終驗證時允許同時持有的最大部位數，預設1(一次一個部位)，>1代表多部位並行'
+        required: false
+        default: '1'
+      risk_pct_per_trade:
+        description: '最佳組合改用風險預算式部位大小的比例，例如0.02代表每筆風險2%帳戶權益，留空代表維持固定2口'
         required: false
         default: ''
-      trailing_months:
-        description: '算「月營收意外」用的過去幾個月平均視窗，預設6個月'
-        required: false
-        default: '6'
-      refresh_revenue_cache:
-        description: '強制重新抓月營收資料，忽略revenue_cache快取(true)。⚠️第一次執行如果回報「確認無資料」(0筆)，之後cache@v4會把這個「沒資料」的結果原封不動快取下來，之後每次重跑都會直接讀到同一批空結果，不會自動重試——如果上一次結果是0筆事件，這次務必設true，否則改完程式碼也看不到效果'
+      multi_period_test:
+        description: '是否額外把最佳組合套到2022年修正段/2021下半年盤整段這兩個跟近期多頭不同市況的期間驗證(會多跑久一點)'
         required: false
         default: 'false'
+      walkforward_folds:
+        description: '走勢前進(Walk-Forward)分折驗證的折數，0代表不啟用(預設)。設3之類的數字會額外把歷史切成N+1個等長區塊，每折重新選一次訊號/門檻/出場配置並在自己的測試窗口驗證，用來檢查選出的組合跨時間是否穩定(會多跑久一點，且是全新階段、實際耗時還沒校準過，建議先從小數字開始試)'
+        required: false
+        default: '0'
+      fixed_combo_walkforward_folds:
+        description: '固定規則walk-forward驗證的區塊數，0代表不啟用(預設)。設6之類的數字會把同一組已經連續兩輪被自動選中的固定規則(不重新挑選任何訊號/門檻/ATR倍數/出場配置)，原封不動套到N個獨立、不重疊的歷史區塊各跑一次，檢查這組已定案的規則本身跨時間是否穩定。因為規則固定、不用每折重跑整套選擇流程，成本比walkforward_folds低很多，建議值6'
+        required: false
+        default: '0'
 
 jobs:
   backtest:
     runs-on: ubuntu-latest
-    timeout-minutes: 180
+    timeout-minutes: 300
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -70,15 +90,7 @@ jobs:
           restore-keys: |
             price-data-cache-
 
-      - name: Restore revenue data cache
-        uses: actions/cache@v4
-        with:
-          path: revenue_cache
-          key: revenue-data-cache-${{ github.run_id }}
-          restore-keys: |
-            revenue-data-cache-
-
-      - name: Run revenue drift backtest
+      - name: Run momentum breakout backtest
         timeout-minutes: 150
         run: |
           ARGS="--starting-capital ${{ github.event.inputs.starting_capital }} --max-stocks ${{ github.event.inputs.max_stocks }}"
@@ -88,11 +100,20 @@ jobs:
           if [ -n "${{ github.event.inputs.end_date }}" ]; then
             ARGS="$ARGS --end ${{ github.event.inputs.end_date }}"
           fi
-          if [ -n "${{ github.event.inputs.top_n }}" ]; then
-            ARGS="$ARGS --top-n ${{ github.event.inputs.top_n }}"
+          if [ "${{ github.event.inputs.with_chip_confirm }}" = "true" ]; then
+            ARGS="$ARGS --with-chip-confirm"
+          fi
+          if [ "${{ github.event.inputs.clean_ex_dividend }}" = "true" ]; then
+            ARGS="$ARGS --clean-ex-dividend"
+          fi
+          if [ "${{ github.event.inputs.use_trailing_stop }}" = "true" ]; then
+            ARGS="$ARGS --use-trailing-stop"
           fi
           if [ -n "${{ github.event.inputs.atr_stop_mult }}" ]; then
             ARGS="$ARGS --atr-stop-mult ${{ github.event.inputs.atr_stop_mult }}"
+          fi
+          if [ -n "${{ github.event.inputs.trailing_atr_mult }}" ]; then
+            ARGS="$ARGS --trailing-atr-mult ${{ github.event.inputs.trailing_atr_mult }}"
           fi
           if [ -n "${{ github.event.inputs.slippage_pct }}" ] && [ "${{ github.event.inputs.slippage_pct }}" != "0" ]; then
             ARGS="$ARGS --slippage-pct ${{ github.event.inputs.slippage_pct }}"
@@ -100,16 +121,22 @@ jobs:
           if [ -n "${{ github.event.inputs.max_concurrent_positions }}" ]; then
             ARGS="$ARGS --max-concurrent-positions ${{ github.event.inputs.max_concurrent_positions }}"
           fi
-          if [ -n "${{ github.event.inputs.trailing_months }}" ]; then
-            ARGS="$ARGS --trailing-months ${{ github.event.inputs.trailing_months }}"
+          if [ -n "${{ github.event.inputs.risk_pct_per_trade }}" ]; then
+            ARGS="$ARGS --risk-pct-per-trade ${{ github.event.inputs.risk_pct_per_trade }}"
           fi
-          if [ "${{ github.event.inputs.refresh_revenue_cache }}" = "true" ]; then
-            ARGS="$ARGS --refresh"
+          if [ "${{ github.event.inputs.multi_period_test }}" = "true" ]; then
+            ARGS="$ARGS --multi-period-test"
           fi
-          python compare_revenue_drift.py $ARGS
+          if [ -n "${{ github.event.inputs.walkforward_folds }}" ] && [ "${{ github.event.inputs.walkforward_folds }}" != "0" ]; then
+            ARGS="$ARGS --walkforward-folds ${{ github.event.inputs.walkforward_folds }}"
+          fi
+          if [ -n "${{ github.event.inputs.fixed_combo_walkforward_folds }}" ] && [ "${{ github.event.inputs.fixed_combo_walkforward_folds }}" != "0" ]; then
+            ARGS="$ARGS --fixed-combo-walkforward-folds ${{ github.event.inputs.fixed_combo_walkforward_folds }}"
+          fi
+          python compare_breakout.py $ARGS
 
       - name: Upload results
         uses: actions/upload-artifact@v4
         with:
-          name: revenue-drift-results
-          path: results_revenue_drift/
+          name: momentum-breakout-results
+          path: results_breakout/
