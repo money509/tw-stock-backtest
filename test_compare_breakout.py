@@ -331,3 +331,163 @@ class TestSimpleComboCliModeSkipsFullPipeline:
         assert "[階段0]" not in summary_text
         assert "ATR倍數敏感度網格" not in summary_text
         assert "單一訊號拆解" not in summary_text
+
+
+class TestRunSimpleComboComparisonAcceptsCustomSignalWeights:
+    """run_simple_combo_comparison()新增的signal_weights參數：不傳時維持舊版行為(用
+    SIMPLE_COMBO_SIGNAL_WEIGHTS)，傳了就改用傳進來的組合——這是--combo-search模式重用這個
+    函式的關鍵(見compare_breakout.py run_combo_search_mode())。"""
+
+    def test_defaults_to_simple_combo_signal_weights_when_not_given(self):
+        price_data, indicators_by_code, regime_series, master_calendar = _build_synthetic_universe()
+        is_calendar = master_calendar[: int(len(master_calendar) * 0.7)]
+        df_default = cb.run_simple_combo_comparison(
+            price_data, indicators_by_code, regime_series, is_calendar,
+            starting_capital=1_000_000, hold_days=cb.TRAILING_STOP_MAX_HOLD_DAYS,
+            atr_stop_mult=1.0, trailing_atr_mult=1.0, extra_kwargs={},
+        )
+        df_explicit = cb.run_simple_combo_comparison(
+            price_data, indicators_by_code, regime_series, is_calendar,
+            starting_capital=1_000_000, hold_days=cb.TRAILING_STOP_MAX_HOLD_DAYS,
+            atr_stop_mult=1.0, trailing_atr_mult=1.0, extra_kwargs={},
+            signal_weights=cb.SIMPLE_COMBO_SIGNAL_WEIGHTS,
+        )
+        pd.testing.assert_frame_equal(df_default, df_explicit)
+
+    def test_custom_signal_weights_is_forwarded_to_backtest_engine(self, monkeypatch):
+        # 直接檢查傳進run_momentum_breakout_backtest()的signal_weights關鍵字參數，確認
+        # 自訂的組合真的有被餵進去、不是被忽略掉(用實際回測結果來比較不可靠：換一組訊號
+        # 權重不保證在任何合成資料集上都會產生不同的交易，見上面default-vs-explicit測試
+        # 踩到的巧合案例)。
+        price_data, indicators_by_code, regime_series, master_calendar = _build_synthetic_universe()
+        is_calendar = master_calendar[: int(len(master_calendar) * 0.7)]
+        custom_weights = {"score_rsi_cross": 1.0, "score_volume_ratio": 1.0, "score_foreign_ratio": 1.0}
+
+        seen_signal_weights = []
+        real_backtest = cb.run_momentum_breakout_backtest
+
+        def _spy(*args, **kwargs):
+            seen_signal_weights.append(kwargs.get("signal_weights"))
+            return real_backtest(*args, **kwargs)
+        monkeypatch.setattr(cb, "run_momentum_breakout_backtest", _spy)
+
+        cb.run_simple_combo_comparison(
+            price_data, indicators_by_code, regime_series, is_calendar,
+            starting_capital=1_000_000, hold_days=cb.TRAILING_STOP_MAX_HOLD_DAYS,
+            atr_stop_mult=1.0, trailing_atr_mult=1.0, extra_kwargs={},
+            signal_weights=custom_weights,
+        )
+        assert len(seen_signal_weights) == 3
+        assert all(w == custom_weights for w in seen_signal_weights)
+
+
+class TestComboSearchCliModeSkipsFullPipeline:
+    """--combo-search這個CLI旗標只該做「一次」資料驅動選擇：單一訊號拆解(run_signal_ablation)
+    +挑組合(select_winning_signals)。main()完整流程的其餘階段(突破窗口比較、突破風格比較、
+    訊號組合自動vs手動比較、結構門檻變體比較、ATR敏感度網格、出場配置比較，以及walk-forward/
+    固定規則walk-forward/擠壓KDJ/跨週期驗證這些main()尾段的額外階段)全部跳過，改成走
+    run_combo_search_mode()，報告方式比照--simple-combo模式(三組累加門檻比較+最終
+    IS/OOS/bootstrap驗證)，另外多寫出單一訊號拆解的排名CSV。"""
+
+    def _build_fake_price_data(self, n=260, seed=13):
+        np.random.seed(seed)
+        idx = pd.date_range("2019-01-01", periods=n, freq="B")
+
+        def _df(closes):
+            closes = pd.Series(closes, index=idx, dtype=float)
+            return pd.DataFrame({
+                "Open": closes, "High": closes * 1.01, "Low": closes * 0.99, "Close": closes,
+                "Volume": pd.Series(1500.0, index=idx),
+            }, index=idx)
+
+        index_trend = np.linspace(0, 30, n) + np.random.normal(0, 1.2, n)
+        stock_trend = np.linspace(0, -15, n) + np.random.normal(0, 1.2, n)
+        return {
+            "2330": _df(np.maximum(100 + index_trend, 1.0)),
+            "1101": _df(np.maximum(100 + stock_trend, 1.0)),
+        }
+
+    def _patch_heavy_stages_to_explode(self, monkeypatch):
+        # 刻意不包含run_signal_ablation：--combo-search模式「唯一」該呼叫的搜尋階段。
+        heavy_stage_names = [
+            "run_breakout_window_comparison", "run_breakout_style_comparison",
+            "run_signal_combo_comparison", "run_gate_comparison",
+            "run_atr_sensitivity_grid", "run_exit_style_comparison",
+            "run_walkforward_validation", "run_fixed_combo_walkforward",
+            "run_squeeze_kdj_exit_style_comparison", "run_multi_period_validation",
+        ]
+
+        def _boom(name):
+            def _inner(*args, **kwargs):
+                raise AssertionError(f"--combo-search模式不該呼叫完整流程的階段函式：{name}")
+            return _inner
+
+        for name in heavy_stage_names:
+            monkeypatch.setattr(cb, name, _boom(name))
+
+    def test_combo_search_runs_ablation_select_signals_and_skips_full_pipeline(self, monkeypatch, tmp_path):
+        import data_loader
+        import chip_data_loader
+
+        fake_price_data = self._build_fake_price_data()
+        monkeypatch.setattr(cb, "load_price_data", lambda *a, **k: fake_price_data)
+
+        def _boom(*args, **kwargs):
+            raise AssertionError("--combo-search模式不該呼叫任何資料下載函式")
+        monkeypatch.setattr(data_loader, "load_price_data", _boom)
+        monkeypatch.setattr(chip_data_loader, "load_chip_data", _boom)
+
+        self._patch_heavy_stages_to_explode(monkeypatch)
+        monkeypatch.setattr(cb, "RESULTS_DIR", str(tmp_path))
+
+        ablation_calls = []
+        real_run_signal_ablation = cb.run_signal_ablation
+
+        def _spy_ablation(*args, **kwargs):
+            ablation_calls.append(1)
+            return real_run_signal_ablation(*args, **kwargs)
+        monkeypatch.setattr(cb, "run_signal_ablation", _spy_ablation)
+
+        select_calls = []
+        real_select_winning_signals = cb.select_winning_signals
+
+        def _spy_select(*args, **kwargs):
+            select_calls.append(1)
+            return real_select_winning_signals(*args, **kwargs)
+        monkeypatch.setattr(cb, "select_winning_signals", _spy_select)
+
+        argv = [
+            "compare_breakout.py", "--combo-search", "--max-stocks", "3",
+            "--starting-capital", "1000000", "--atr-stop-mult", "1.0",
+        ]
+        monkeypatch.setattr(sys, "argv", argv)
+
+        cb.main()
+
+        assert ablation_calls, "run_signal_ablation應該被呼叫過(這是--combo-search模式唯一的選擇步驟)"
+        assert select_calls, "select_winning_signals應該被呼叫過"
+
+        ablation_csv = os.path.join(str(tmp_path), "combo_search_ablation.csv")
+        variants_csv = os.path.join(str(tmp_path), "combo_search_variants.csv")
+        oos_csv = os.path.join(str(tmp_path), "trades_OOS_combo_search.csv")
+        summary_path = os.path.join(str(tmp_path), "summary.txt")
+        assert os.path.exists(ablation_csv)
+        assert os.path.exists(variants_csv)
+        assert os.path.exists(oos_csv)
+        assert os.path.exists(summary_path)
+
+        variants_df = pd.read_csv(variants_csv)
+        assert len(variants_df) == 3
+        assert set(variants_df["variant"]) == {label for label, _ in cb.SIMPLE_COMBO_VARIANTS}
+
+        summary_text = open(summary_path, encoding="utf-8").read()
+        assert "--combo-search模式" in summary_text
+        for label, _ in cb.SIMPLE_COMBO_VARIANTS:
+            assert label in summary_text
+        assert "最終驗證" in summary_text
+        assert "樣本外(OOS)" in summary_text
+        assert "單一訊號拆解" in summary_text
+        # 完整流程才會出現的區塊標題，--combo-search模式不該印出來
+        assert "[階段0]" not in summary_text
+        assert "ATR倍數敏感度網格" not in summary_text
+        assert "訊號組合比較" not in summary_text
