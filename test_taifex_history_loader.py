@@ -355,29 +355,32 @@ class TestValidateTxHistoryAccuracyComparisonMath:
 
 class TestFetchOfficialDailyOhlcMocked:
     def test_taifex_endpoint_success_short_circuits_fallback(self):
-        csv_bytes = (
-            "交易日期,開盤價,最高價,最低價,收盤價\n"
-            "20210104,18000,18050,17950,18010\n"
-            "20210105,18010,18060,17960,18020\n"
-        ).encode("utf-8")
-        resp = mock.Mock(status_code=200, content=csv_bytes, headers={"Content-Type": "text/csv"})
+        # futDailyMarketReport一次查一天，回傳HTML表格(不是CSV)，這裡用
+        # pd.DataFrame.to_html()組一個跟真實回應同樣形狀的HTML表格。
+        html_table = pd.DataFrame({
+            "契約": ["TXF"], "到期月份(週別)": ["202101"],
+            "開盤價": [18000], "最高價": [18050], "最低價": [17950], "收盤價": [18010],
+        }).to_html(index=False)
+        resp = mock.Mock(status_code=200, content=html_table.encode("utf-8"))
         with mock.patch("validate_tx_history_accuracy.requests.post", return_value=resp):
             with mock.patch("validate_tx_history_accuracy.requests.get") as mock_get:
                 df, reason, diag = vtha.fetch_official_daily_ohlc(
-                    datetime.date(2021, 1, 4), datetime.date(2021, 1, 5))
+                    [datetime.date(2021, 1, 4), datetime.date(2021, 1, 5)])
         assert reason == "ok"
-        assert len(df) == 2
-        mock_get.assert_not_called()
+        assert len(df) == 2  # 兩個查詢日期各自用fallback_date當Date，不會互相覆蓋
+        assert diag["n_dates_ok"] == 2
+        mock_get.assert_not_called()  # TAIFEX兩天都成功，不需要用到data.gov.tw保底
 
     def test_both_sources_fail_returns_none_with_reason(self):
-        html_resp = mock.Mock(status_code=200, content=b"<html>not data</html>",
-                               headers={"Content-Type": "text/html"})
+        # 回傳的HTML解析不出任何像樣的表格(沒有table元素)，模擬TAIFEX端點
+        # 回應格式跟預期不符的情況。
+        bad_resp = mock.Mock(status_code=200, content=b"<html><body>no table here</body></html>")
         get_fail_resp = mock.Mock(status_code=500, content=b"", headers={})
-        with mock.patch("validate_tx_history_accuracy.requests.post", return_value=html_resp):
+        with mock.patch("validate_tx_history_accuracy.requests.post", return_value=bad_resp):
             with mock.patch("validate_tx_history_accuracy.requests.get", return_value=get_fail_resp):
                 with mock.patch("validate_tx_history_accuracy.MAX_RETRIES", 0):
                     df, reason, diag = vtha.fetch_official_daily_ohlc(
-                        datetime.date(2021, 1, 4), datetime.date(2021, 1, 5))
+                        [datetime.date(2021, 1, 4), datetime.date(2021, 1, 5)])
         assert df is None
         assert reason is not None
 
@@ -385,16 +388,42 @@ class TestFetchOfficialDailyOhlcMocked:
         # 這一輪新增：diag裡要同時留著TAIFEX端點跟data.gov.tw備援各自的失敗原因，
         # 不是只留最後一個(上一次真實跑就是只看到最後一個原因，看不出TAIFEX
         # 端點本身是怎麼死的，這是直接的動機)。
-        html_resp = mock.Mock(status_code=200, content=b"<html>not data</html>",
-                               headers={"Content-Type": "text/html"})
+        bad_resp = mock.Mock(status_code=200, content=b"<html><body>no table here</body></html>")
         get_fail_resp = mock.Mock(status_code=500, content=b"", headers={})
-        with mock.patch("validate_tx_history_accuracy.requests.post", return_value=html_resp):
+        with mock.patch("validate_tx_history_accuracy.requests.post", return_value=bad_resp):
             with mock.patch("validate_tx_history_accuracy.requests.get", return_value=get_fail_resp):
                 with mock.patch("validate_tx_history_accuracy.MAX_RETRIES", 0):
                     df, reason, diag = vtha.fetch_official_daily_ohlc(
-                        datetime.date(2021, 1, 4), datetime.date(2021, 1, 5))
-        assert diag["taifex_reason"] == "taifex_daily_returned_html_not_data"
+                        [datetime.date(2021, 1, 4), datetime.date(2021, 1, 5)])
+        assert diag["taifex_reason"] == "taifex_daily_no_table_parsed"
+        assert diag["n_dates_ok"] == 0
+        assert diag["n_dates_failed"] == 2
         assert diag["data_gov_reason"] == "data_gov_api_http_500"
+
+    def test_some_dates_ok_some_fail_returns_partial_results(self):
+        # 某幾天查得到、某幾天查不到，不該整組放棄——回傳查得到的那幾天就好，
+        # 跟taifex_history_loader.py「單一period失敗不連累其他period」同樣精神。
+        good_html = pd.DataFrame({
+            "契約": ["TXF"], "開盤價": [18000], "最高價": [18050],
+            "最低價": [17950], "收盤價": [18010],
+        }).to_html(index=False)
+
+        call_dates = []
+
+        def fake_post(url, data=None, headers=None, timeout=None):
+            call_dates.append(data["queryDate"])
+            if data["queryDate"] == "2021/01/04":
+                return mock.Mock(status_code=200, content=good_html.encode("utf-8"))
+            return mock.Mock(status_code=200, content=b"<html><body>no table</body></html>")
+
+        with mock.patch("validate_tx_history_accuracy.requests.post", side_effect=fake_post):
+            with mock.patch("validate_tx_history_accuracy.MAX_RETRIES", 0):
+                df, reason, diag = vtha.fetch_official_daily_ohlc(
+                    [datetime.date(2021, 1, 4), datetime.date(2021, 1, 5)])
+        assert reason == "ok"
+        assert diag["n_dates_ok"] == 1
+        assert diag["n_dates_failed"] == 1
+        assert "2021-01-05" in diag["date_failures"]
 
 
 class TestRawContentPreview:

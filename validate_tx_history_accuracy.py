@@ -8,18 +8,15 @@ Google Drive歷史資料)去跑任何回測之前，**先確認拿證交所給�
 備援)，混在loader模組裡會讓loader背負不該背的「還要懂怎麼抓官方資料」的責任。
 
 ⚠️⚠️ 跟repo其他所有loader一樣的誠實聲明：這個sandbox連taifex.com.tw/data.gov.tw
-都連不到(proxy allowlist擋掉)，下面對TAIFEX「期貨每日交易行情下載」
-(dlFutDailyMarketView)頁面的欄位名稱/查詢方式**全部是根據其他TAIFEX「資料下載」
-頁面常見模式的推斷**，沒有機會實際看過這個頁面的表單欄位長什麼樣子——**第一次
-在GitHub Actions真實環境執行，才是這個假設第一次被真正驗證**，失敗時會印出
-明確的診斷(包含實際送出的查詢參數)，方便事後比對真實回應來源修正欄位名稱，
+都連不到(proxy allowlist擋掉)。第一版對dlFutDailyMarketView(那其實是人看的
+導覽/下載頁，不是查詢端點)送POST、猜firstDate/lastDate範圍查詢，第一次真實跑
+失敗(回傳的是網頁本身)。這一版改用futDailyMarketReport，是交叉確認多篇獨立
+公開爬蟲文章/repo的寫法得出的(跟taifex_intraday_loader.py改用daily zip URL
+時同樣的交叉確認方式)：一次只能查**一天**(queryDate)，不支援起訖範圍查詢，
+所以fetch_official_daily_ohlc()改成對sample_dates逐日查詢，不是查一個區間。
+即使這版欄位名稱來源更可靠，仍然是**第一次在GitHub Actions真實環境用這組
+參數打過**，失敗時一樣會印出明確診斷(包含實際送出的查詢參數)方便之後修正，
 不是crash也不是假裝成功。
-
-跟dlFutPrevious30DaysSalesData(taifex_intraday_loader.py用的那個、只有滾動30天
-窗口)不同，dlFutDailyMarketView預期是「每日收盤/結算行情」報表，照TAIFEX其他
-「資料下載」分類頁面的慣例，這類日報表通常支援帶起訖日期查詢(不像前者只能拿
-「查詢當下」往回算30天的窗口)——但這同樣是根據命名與頁面歸類的推斷，不是已經
-看過真實查詢表單欄位名稱後的結論。
 
 驗證範圍(使用者沒有要求比對全部20多年歷史，這裡刻意只抽樣，見下方)：
 1. 預設只驗證**2011_2020跟2021_2023**兩段(DEFAULT_PERIODS)，不含1998_2000/
@@ -74,7 +71,7 @@ DEFAULT_N_SAMPLE_DATES = 30
 DEFAULT_TOLERANCE_PCT = 0.1  # 百分比(0.1代表0.1%)
 
 TAIFEX_BASE = "https://www.taifex.com.tw"
-DAILY_VIEW_PATH = "/cht/3/dlFutDailyMarketView"
+FUT_DAILY_MARKET_REPORT_PATH = "/cht/3/futDailyMarketReport"
 DATA_GOV_DATASET_ID = "11319"
 DATA_GOV_API = f"https://data.gov.tw/api/v2/rest/dataset/{DATA_GOV_DATASET_ID}"
 
@@ -152,29 +149,57 @@ def aggregate_minute_bars_to_daily(bars: pd.DataFrame):
     return daily
 
 
-def _parse_official_table(raw_bytes):
+def _parse_official_table(raw_bytes, fallback_date=None):
     """把官方端點回傳的原始內容(猜測是CSV/HTML表格)解析成統一欄位
     (Date/Open/High/Low/Close)的DataFrame，回傳(df_or_None, reason)。跟
     taifex_intraday_loader.py的parse_tick_csv()同樣的「動態比對欄位名稱」精神。
-    """
+
+    fallback_date：單日查詢(futDailyMarketReport一次只能查一天，見
+    _try_taifex_daily_endpoint docstring)時，表格裡常見的設計是日期只出現在
+    查詢條件/頁面標題，表格本身欄位只有契約/開高低收，沒有重複列出日期欄——
+    這種情況找不到date_col時，不要直接回報no_date_col，改用呼叫端已經知道
+    的查詢日期(因為就是查這一天)當作Date欄，比死板要求表格裡一定要有日期欄
+    更貼近單日查詢這個使用情境的實際資料形狀。"""
+    # futDailyMarketReport確認回傳的是HTML表格，不是CSV(見_try_taifex_daily_endpoint
+    # docstring)，所以內容看起來像HTML時優先走HTML解析，不要先試CSV——pd.read_csv()
+    # 對HTML內容不一定會丟例外(可能把整個<table...>那行當成怪異的單欄位header硬解
+    # 出一張「看起來像表格但其實不是」的1欄DataFrame)，導致真正的HTML表格解析
+    # 永遠執行不到。data.gov.tw備援才真的可能是CSV，所以CSV優先順序留給那個情境。
+    looks_like_html = raw_bytes.lstrip()[:1] == b"<"
     df = None
-    for encoding in ("utf-8", "big5", "cp950"):
-        try:
-            import io
-            df = pd.read_csv(io.BytesIO(raw_bytes), encoding=encoding, dtype=str)
-            if df is not None and not df.empty:
-                break
-        except Exception:
-            df = None
-    if df is None or df.empty:
-        try:
-            import io
-            tables = pd.read_html(io.BytesIO(raw_bytes))
-            df = next((t for t in tables if t.shape[1] >= 4), None)
-            if df is not None:
-                df = df.astype(str)
-        except Exception:
-            df = None
+
+    def _try_csv():
+        for encoding in ("utf-8", "big5", "cp950"):
+            try:
+                import io
+                candidate = pd.read_csv(io.BytesIO(raw_bytes), encoding=encoding, dtype=str)
+                if candidate is not None and not candidate.empty and candidate.shape[1] > 1:
+                    return candidate
+            except Exception:
+                continue
+        return None
+
+    def _try_html():
+        import io
+        for encoding in ("utf-8", "big5", "cp950"):
+            try:
+                tables = pd.read_html(io.BytesIO(raw_bytes), encoding=encoding)
+                found = next((t for t in tables if t.shape[1] >= 4), None)
+                if found is not None:
+                    return found.astype(str)
+            except Exception:
+                continue
+        return None
+
+    if looks_like_html:
+        df = _try_html()
+        if df is None or df.empty:
+            df = _try_csv()
+    else:
+        df = _try_csv()
+        if df is None or df.empty:
+            df = _try_html()
+
     if df is None or df.empty:
         return None, "no_table_parsed"
 
@@ -186,14 +211,19 @@ def _parse_official_table(raw_bytes):
     product_col = _find_col(df.columns, PRODUCT_COL_CANDS)
     month_col = _find_col(df.columns, CONTRACT_MONTH_COL_CANDS)
 
-    missing = [name for name, col in [
-        ("date", date_col), ("close", close_col)] if col is None]
-    if missing:
-        print(f"[validate_tx_history_accuracy] 官方日線解析：缺少必要欄位{missing}，"
+    if date_col is None and fallback_date is None:
+        print(f"[validate_tx_history_accuracy] 官方日線解析：缺少必要欄位['date']，"
               f"目前解析出的欄位名稱={list(df.columns)}(供之後修正欄位名稱candidates用)")
-        return None, "missing_columns:" + ",".join(missing)
+        return None, "missing_columns:date"
+    if close_col is None:
+        print(f"[validate_tx_history_accuracy] 官方日線解析：缺少必要欄位['close']，"
+              f"目前解析出的欄位名稱={list(df.columns)}(供之後修正欄位名稱candidates用)")
+        return None, "missing_columns:close"
 
-    out = pd.DataFrame({"_date_raw": df[date_col].astype(str).str.strip()})
+    if date_col is not None:
+        out = pd.DataFrame({"_date_raw": df[date_col].astype(str).str.strip()})
+    else:
+        out = pd.DataFrame({"_date_raw": [fallback_date.strftime("%Y%m%d")] * len(df)})
     out["Close"] = pd.to_numeric(df[close_col], errors="coerce")
     out["Open"] = pd.to_numeric(df[open_col], errors="coerce") if open_col else float("nan")
     out["High"] = pd.to_numeric(df[high_col], errors="coerce") if high_col else float("nan")
@@ -221,21 +251,29 @@ def _parse_official_table(raw_bytes):
     return out[["Open", "High", "Low", "Close"]], "ok"
 
 
-def _try_taifex_daily_endpoint(start_date, end_date, commodity_id="TXF"):
-    """嘗試TAIFEX「期貨每日交易行情下載」(猜測端點，見模組docstring)。跟
-    taifex_intraday_loader.py的_try_post_guess()同樣精神：對同一頁面路徑送POST，
-    帶起訖日期跟商品代號欄位——**欄位名稱是猜測，沒有實測驗證過**，失敗時會印出
-    實際送出的欄位，方便事後對照真實回應修正。回傳(content_bytes_or_None, reason)。
+def _try_taifex_daily_endpoint(date_obj, commodity_id="TXF"):
+    """嘗試TAIFEX「期貨每日交易行情查詢」。
+
+    ⚠️這一輪改用真正查過的端點，不是第一版的猜測：第一次真實跑失敗
+    (taifex_daily_returned_html_not_data)之後，查了多篇獨立的公開爬蟲文章/
+    repo(交叉確認方式跟taifex_intraday_loader.py改用daily zip URL時一樣)，
+    確認真正的端點是futDailyMarketReport(不是FUT_DAILY_VIEW_PATH / dlFut開頭
+    那個下載頁路徑，那個是人看的導覽頁、不是資料查詢端點)，而且**一次只能查
+    一天**(不支援起訖日期範圍查詢，這點第一版猜錯了)，欄位是：
+        queryType='2', marketCode='0', commodity_id=<商品代號>,
+        queryDate='YYYY/MM/DD'
+    回傳表格是HTML(class通常是table_f)，不是直接下載CSV。
+
+    即使這版欄位名稱是交叉確認過的，還是**第一次在GitHub Actions真實環境
+    用這組參數打過**，仍然可能因為TAIFEX網站改版等原因失敗，失敗時一樣會
+    印出實際送出的查詢參數方便之後對照修正。回傳(content_bytes_or_None, reason)。
     """
-    url = TAIFEX_BASE + DAILY_VIEW_PATH
+    url = TAIFEX_BASE + FUT_DAILY_MARKET_REPORT_PATH
     payload = {
-        "firstDate": start_date.strftime("%Y/%m/%d"),
-        "lastDate": end_date.strftime("%Y/%m/%d"),
-        "queryStartDate": start_date.strftime("%Y/%m/%d"),
-        "queryEndDate": end_date.strftime("%Y/%m/%d"),
-        "commodity_id": commodity_id,
         "queryType": "2",
-        "download": "csv",
+        "marketCode": "0",
+        "commodity_id": commodity_id,
+        "queryDate": date_obj.strftime("%Y/%m/%d"),
     }
     try:
         resp = requests.post(url, data=payload, headers=HEADERS, timeout=HARD_TIMEOUT_SECONDS)
@@ -243,14 +281,8 @@ def _try_taifex_daily_endpoint(start_date, end_date, commodity_id="TXF"):
         raise FetchFailed(str(e))
     if resp.status_code != 200:
         print(f"[validate_tx_history_accuracy] TAIFEX日線端點：HTTP {resp.status_code}，"
-              f"送出的查詢參數={payload}(欄位名稱是猜測，供之後對照真實表單修正)")
+              f"送出的查詢參數={payload}")
         return None, f"taifex_daily_http_{resp.status_code}"
-    content_type = resp.headers.get("Content-Type", "")
-    text_head = resp.content[:200].decode("utf-8", errors="ignore").lstrip().lower()
-    if "text/html" in content_type or text_head.startswith("<!doctype") or text_head.startswith("<html"):
-        print(f"[validate_tx_history_accuracy] TAIFEX日線端點：回傳的是網頁本身不是資料，"
-              f"代表猜測的欄位名稱/POST方式錯了。送出的查詢參數={payload}")
-        return None, "taifex_daily_returned_html_not_data"
     return resp.content, "ok"
 
 
@@ -288,63 +320,86 @@ def _try_data_gov_fallback(start_date, end_date, commodity_id="TXF"):
     return dl_resp.content, "ok"
 
 
-def fetch_official_daily_ohlc(start_date, end_date, commodity_id="TXF"):
-    """
-    整合入口：依序嘗試TAIFEX官方端點(主要) -> data.gov.tw開放資料(備援)，兩者都是
-    防禦性(data, reason)寫法。回傳(df_or_None, reason, diag)，df的index是date
-    物件，欄位Open/High/Low/Close：
-      reason == "ok"
-      reason == "taifex_daily_..."  TAIFEX端點失敗的具體原因
-      reason == "data_gov_..."      備援也失敗的具體原因(兩者都失敗時，reason是
-                                     備援的原因，因為它是最後執行的)
-    diag是{"taifex_reason": ..., "data_gov_reason": ...}，**兩個來源各自的失敗
-    原因都保留**，不是只留最後一個——這一輪新增，原因：上一次真實跑只回報最後
-    一個reason(data_gov_no_csv_resource)，完全看不出「主要的TAIFEX端點」本身
-    是怎麼失敗的(HTTP錯誤？回傳HTML？欄位解析不出來？)，報告裡缺這段資訊，
-    下次要修的話還是得去翻console log，這裡把兩段都存進diag，連同報告一起印出來。
-    連線層級失敗(兩個來源都是)時重試MAX_RETRIES次，重試後仍失敗才真正放棄。
-    """
-    diag = {"taifex_reason": None, "data_gov_reason": None}
+def _fetch_taifex_single_date(date_obj, commodity_id):
+    """對單一日期查TAIFEX futDailyMarketReport，回傳(df_or_None, reason)。
+    連線層級失敗時重試MAX_RETRIES次。"""
     for attempt in range(MAX_RETRIES + 1):
-        last_reason = None
         try:
             content, reason = run_with_hard_timeout(
-                _try_taifex_daily_endpoint, args=(start_date, end_date, commodity_id),
+                _try_taifex_daily_endpoint, args=(date_obj, commodity_id),
                 timeout=HARD_TIMEOUT_SECONDS + 10)
             if reason == "ok":
-                df, parse_reason = _parse_official_table(content)
+                df, parse_reason = _parse_official_table(content, fallback_date=date_obj)
                 if parse_reason == "ok":
-                    diag["taifex_reason"] = "ok"
-                    return df, "ok", diag
-                last_reason = "taifex_daily_" + parse_reason
-            else:
-                last_reason = reason
+                    return df, "ok"
+                return None, "taifex_daily_" + parse_reason
+            return None, reason
         except (FetchFailed, HardTimeout):
-            last_reason = "taifex_daily_connection_error"
-        diag["taifex_reason"] = last_reason
+            if attempt < MAX_RETRIES:
+                import time
+                time.sleep(RETRY_BACKOFF_SECONDS)
+                continue
+            return None, "taifex_daily_connection_error"
+    return None, "taifex_daily_connection_error"
 
-        try:
-            content, reason = run_with_hard_timeout(
-                _try_data_gov_fallback, args=(start_date, end_date, commodity_id),
-                timeout=HARD_TIMEOUT_SECONDS + 10)
-            if reason == "ok":
-                df, parse_reason = _parse_official_table(content)
-                if parse_reason == "ok":
-                    diag["data_gov_reason"] = "ok"
-                    return df, "ok", diag
-                last_reason = "data_gov_" + parse_reason
-            else:
-                last_reason = reason
-        except (FetchFailed, HardTimeout):
-            last_reason = "data_gov_connection_error"
-        diag["data_gov_reason"] = last_reason
 
-        if attempt < MAX_RETRIES:
-            import time
-            time.sleep(RETRY_BACKOFF_SECONDS)
-            continue
-        return None, last_reason, diag
-    return None, "unknown_failure", diag
+def fetch_official_daily_ohlc(dates, commodity_id="TXF"):
+    """
+    整合入口：對傳入的每個日期(sample_dates，不是整個起訖範圍——
+    futDailyMarketReport一次只能查一天，見_try_taifex_daily_endpoint docstring，
+    所以這裡改成逐日查詢，只查真正要拿來比對的那幾十天，不是整個區間裡每一天)
+    依序嘗試TAIFEX官方端點，某幾天失敗不影響其他天(跟taifex_history_loader.py
+    單一period失敗不連累其他period同樣精神)。TAIFEX完全查不到任何一天時，
+    退回data.gov.tw開放資料整批下載當保底，試著從裡面篩出需要的日期。
+
+    回傳(df_or_None, reason, diag)，df的index是date物件，欄位Open/High/Low/Close：
+      reason == "ok"：至少成功查到一天
+      reason == "taifex_daily_..."/"data_gov_..."：兩者都完全沒拿到任何一天時的原因
+    diag = {"taifex_reason": ..., "data_gov_reason": ..., "n_dates_ok": int,
+            "n_dates_failed": int, "date_failures": {date_str: reason}}
+    """
+    diag = {"taifex_reason": None, "data_gov_reason": None,
+            "n_dates_ok": 0, "n_dates_failed": 0, "date_failures": {}}
+    dfs = []
+    for date_obj in dates:
+        df, reason = _fetch_taifex_single_date(date_obj, commodity_id)
+        if df is not None and reason == "ok":
+            dfs.append(df)
+            diag["n_dates_ok"] += 1
+        else:
+            diag["n_dates_failed"] += 1
+            diag["date_failures"][date_obj.isoformat()] = reason
+
+    if dfs:
+        diag["taifex_reason"] = "ok"
+        combined = pd.concat(dfs)
+        combined = combined[~combined.index.duplicated(keep="first")]
+        return combined, "ok", diag
+
+    # TAIFEX一天都沒查到，記下代表性的失敗原因(最常見的那個)，再試data.gov.tw保底。
+    if diag["date_failures"]:
+        reasons = list(diag["date_failures"].values())
+        diag["taifex_reason"] = max(set(reasons), key=reasons.count)
+    else:
+        diag["taifex_reason"] = "no_dates_to_query"
+
+    start_date, end_date = min(dates), max(dates)
+    try:
+        content, reason = run_with_hard_timeout(
+            _try_data_gov_fallback, args=(start_date, end_date, commodity_id),
+            timeout=HARD_TIMEOUT_SECONDS + 10)
+        if reason == "ok":
+            df, parse_reason = _parse_official_table(content)
+            if parse_reason == "ok":
+                diag["data_gov_reason"] = "ok"
+                return df, "ok", diag
+            diag["data_gov_reason"] = "data_gov_" + parse_reason
+        else:
+            diag["data_gov_reason"] = reason
+    except (FetchFailed, HardTimeout):
+        diag["data_gov_reason"] = "data_gov_connection_error"
+
+    return None, diag["data_gov_reason"], diag
 
 
 def compare_daily_ohlc(community_daily, official_daily, tolerance_pct=DEFAULT_TOLERANCE_PCT):
@@ -500,15 +555,16 @@ def main():
         _write_report()
         sys.exit(0)
 
-    start_date, end_date = sample_dates[0], sample_dates[-1]
     official_daily, fetch_reason, fetch_diag = fetch_official_daily_ohlc(
-        start_date, end_date, args.commodity_id)
+        sample_dates, args.commodity_id)
 
     if official_daily is None:
         lines += [
             "",
             f"官方日線資料抓取失敗(reason={fetch_reason})，驗證沒有執行。",
-            f"兩個來源個別的失敗原因 — TAIFEX官方端點：{fetch_diag.get('taifex_reason')}；"
+            f"兩個來源個別的失敗原因 — TAIFEX官方端點：{fetch_diag.get('taifex_reason')}"
+            f"(逐日查詢：成功{fetch_diag.get('n_dates_ok')}天/失敗{fetch_diag.get('n_dates_failed')}天，"
+            f"各天失敗原因={fetch_diag.get('date_failures')})；"
             f"data.gov.tw備援：{fetch_diag.get('data_gov_reason')}",
             "這不代表社群資料不準，只代表這次沒有機會比對——TAIFEX官方端點的查詢欄位",
             "名稱是猜測(見模組docstring)，第一次在GitHub Actions真實環境執行，才是",
