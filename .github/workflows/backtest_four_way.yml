@@ -1,27 +1,39 @@
-name: Run Strategy Backtest (Score & Sizing)
+name: TX History Data Validation (社群1分鐘K棒 vs TAIFEX官方日線)
 
 on:
   workflow_dispatch:
     inputs:
-      start_date:
-        description: '回測起始日期 (YYYY-MM-DD)'
+      period_1998_2000:
+        description: '是否下載1998.07.22~2000.12.31這段'
         required: false
-        default: '2023-01-01'
-      end_date:
-        description: '回測結束日期，留空代表跑到今天'
+        default: 'false'
+      period_2001_2010:
+        description: '是否下載2001.01.01~2010.12.31這段'
         required: false
-        default: ''
-      risk_per_trade:
-        description: '風險動態調整口數模式：每筆交易願意承受的風險金額(新台幣)'
+        default: 'false'
+      period_2011_2020:
+        description: '是否下載2011.01.01~2020.12.31這段(預設驗證的其中一段)'
         required: false
-        default: '20000'
-      starting_capital:
-        description: '模擬帳戶起始資金(新台幣)'
+        default: 'true'
+      period_2021_2023:
+        description: '是否下載2021.01.01~2023.12.31這段(預設驗證的其中一段)'
         required: false
-        default: '1000000'
+        default: 'true'
+      n_sample_dates:
+        description: '抽樣比對幾個交易日(平均分散，不是逐日全面稽核)'
+        required: false
+        default: '30'
+      tolerance_pct:
+        description: '收盤價誤差容忍範圍(百分比，例如0.1代表0.1%)'
+        required: false
+        default: '0.1'
+      refresh_cache:
+        description: '強制重新下載(忽略快取)。⚠️快取會用github actions cache跨次執行保留，loader程式碼有更新(例如修過bug)後第一次重跑，務必開true，之後正常跑可以關掉'
+        required: false
+        default: 'false'
 
 jobs:
-  backtest:
+  validate:
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
@@ -38,16 +50,53 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Run four-way backtest
-        run: |
-          ARGS="--start ${{ github.event.inputs.start_date }} --risk-per-trade ${{ github.event.inputs.risk_per_trade }} --starting-capital ${{ github.event.inputs.starting_capital }}"
-          if [ -n "${{ github.event.inputs.end_date }}" ]; then
-            ARGS="$ARGS --end ${{ github.event.inputs.end_date }}"
-          fi
-          python compare_four_way.py $ARGS
+      - name: Restore history data cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            taifex_history_cache
+          key: tx-history-data-cache-${{ github.run_id }}
+          restore-keys: |
+            tx-history-data-cache-
 
-      - name: Upload results
+      - name: 跑單元測試（先確認loader/比對邏輯沒有壞掉，再花時間跑真實下載）
+        run: |
+          python3 -m pytest test_taifex_history_loader.py -v
+
+      - name: Build period list from checkboxes
+        id: periods
+        run: |
+          PERIODS=""
+          if [ "${{ github.event.inputs.period_1998_2000 }}" = "true" ]; then
+            PERIODS="$PERIODS 1998_2000"
+          fi
+          if [ "${{ github.event.inputs.period_2001_2010 }}" = "true" ]; then
+            PERIODS="$PERIODS 2001_2010"
+          fi
+          if [ "${{ github.event.inputs.period_2011_2020 }}" = "true" ]; then
+            PERIODS="$PERIODS 2011_2020"
+          fi
+          if [ "${{ github.event.inputs.period_2021_2023 }}" = "true" ]; then
+            PERIODS="$PERIODS 2021_2023"
+          fi
+          if [ -z "$PERIODS" ]; then
+            PERIODS="2011_2020 2021_2023"
+          fi
+          echo "periods=$PERIODS" >> "$GITHUB_OUTPUT"
+
+      - name: Run TX history accuracy validation (社群1分鐘K棒 vs TAIFEX官方日線，抽樣比對)
+        timeout-minutes: 45
+        run: |
+          ARGS="--periods ${{ steps.periods.outputs.periods }}"
+          ARGS="$ARGS --n-sample-dates ${{ github.event.inputs.n_sample_dates }}"
+          ARGS="$ARGS --tolerance-pct ${{ github.event.inputs.tolerance_pct }}"
+          if [ "${{ github.event.inputs.refresh_cache }}" = "true" ]; then
+            ARGS="$ARGS --refresh-cache"
+          fi
+          python validate_tx_history_accuracy.py $ARGS
+
+      - name: Upload validation report
         uses: actions/upload-artifact@v4
         with:
-          name: backtest-four-way-results
-          path: results_four_way/
+          name: tx-history-validation-report
+          path: results_tx_history_validation/
