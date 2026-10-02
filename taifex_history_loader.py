@@ -362,7 +362,11 @@ def _col_matches_date(series):
 
 
 def _col_matches_time(series):
-    s = series.astype(str).str.strip()
+    # 這一輪修正：crazyindicator.pixnet.net的7z檔案裡時間欄是"08:46:00"這種
+    # 帶冒號的格式(見第一次真實跑的raw_preview診斷)，原本只接受純數字字串
+    # (HHMMSS)，冒號沒被strip掉，完全比對不上，回報no_time_col——這裡比照
+    # _col_matches_date()對日期欄"/"的處理方式，一樣先把冒號拿掉再判斷。
+    s = series.astype(str).str.strip().str.replace(":", "", regex=False)
     digits = s.str.match(r"^\d{3,6}$")
     if digits.mean() < 0.8:
         return False
@@ -471,7 +475,9 @@ def parse_history_file(local_path):
         return None, "no_price_col"
 
     date_s = df[detected["date"]].astype(str).str.strip().str.replace(r"[/-]", "", regex=True)
-    time_s = df[detected["time"]].astype(str).str.strip().str.zfill(6)
+    # 時間欄可能是"08:46:00"(帶冒號)或"084600"(純數字)兩種格式，先把冒號拿掉
+    # 再zfill，兩種輸入都能統一處理(見_col_matches_time()同樣的修正理由)。
+    time_s = df[detected["time"]].astype(str).str.strip().str.replace(":", "", regex=False).str.zfill(6)
     timestamp = pd.to_datetime(date_s + time_s, format="%Y%m%d%H%M%S", errors="coerce")
 
     volume_col = detected["volume"]

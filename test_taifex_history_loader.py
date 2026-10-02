@@ -478,3 +478,41 @@ class TestSevenZipSupport:
             extracted, names = thl._extract_first_member(archive_bytes)
         assert extracted is None
         assert names == []
+
+
+class TestColonSeparatedTimeFormat:
+    """第一次真實跑crazyindicator.pixnet.net的7z檔案才發現的真實格式：
+    Date欄"2011/01/03"(帶斜線，_col_matches_date()本來就有處理)，
+    Time欄"08:46:00"(帶冒號，原本沒處理，回報no_time_col)。這裡用跟
+    raw_preview診斷裡看到的完全一樣的欄位格式做回歸測試。"""
+
+    def test_colon_separated_time_is_recognized(self):
+        series = pd.Series(["08:46:00", "08:47:00", "13:44:59", "00:00:01"])
+        assert bool(thl._col_matches_time(series)) is True
+
+    def test_plain_digit_time_still_recognized(self):
+        series = pd.Series(["084600", "084700", "134459"])
+        assert bool(thl._col_matches_time(series)) is True
+
+    def test_real_world_crazyindicator_csv_format_parses_end_to_end(self):
+        # 跟validation_report.txt附的raw_preview診斷裡實際看到的欄位/格式
+        # 完全一致：Date,Time,Open,High,Low,Close,Volume，Date帶斜線、
+        # Time帶冒號、沒有商品代號/到期月份欄(整份資料預設都是台指期)。
+        csv_text = (
+            "Date,Time,Open,High,Low,Close,Volume\r\n"
+            "2011/01/03,08:46:00,9000,9008,8995,9006,1340\r\n"
+            "2011/01/03,08:47:00,9004,9006,9002,9003,336\r\n"
+            "2011/01/03,08:48:00,9003,9009,9003,9009,514\r\n"
+            "2011/01/03,08:49:00,9009,9010,9005,9008,465\r\n"
+            "2011/01/03,08:50:00,9008,9015,9008,9015,672\r\n"
+        )
+        archive_bytes = _make_7z_bytes(csv_text.encode("utf-8"),
+                                        member_name="TXF20110101_20201231(CrazyIndicator.pixnet.net).csv")
+        path = _write_tmp(archive_bytes)
+        df, reason = thl.parse_history_file(path)
+        assert reason == "ok"
+        assert df.attrs["source_level"] == "bar"
+        assert len(df) == 5
+        assert df.index[0] == pd.Timestamp("2011-01-03 08:46:00")
+        assert df["Open"].iloc[0] == 9000
+        assert df["Close"].iloc[0] == 9006
