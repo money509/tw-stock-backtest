@@ -63,6 +63,10 @@ on:
         description: '固定規則walk-forward驗證的區塊數，0代表不啟用(預設)。設6之類的數字會把同一組已經連續兩輪被自動選中的固定規則(不重新挑選任何訊號/門檻/ATR倍數/出場配置)，原封不動套到N個獨立、不重疊的歷史區塊各跑一次，檢查這組已定案的規則本身跨時間是否穩定。因為規則固定、不用每折重跑整套選擇流程，成本比walkforward_folds低很多，建議值6'
         required: false
         default: '0'
+      simple_combo:
+        description: '簡化模式(--simple-combo)：開啟後完全跳過上面突破窗口比較/突破風格比較/訊號自動搜尋/門檻網格/ATR網格/出場配置網格這整套6階段樣本內(IS)自動選擇流程，改成只測固定訊號組合(MACD柱狀圖+K棒實體比例)搭配三組累加門檻(無門檻→+趨勢強度ADX→+趨勢強度+大盤氛圍regime濾網)，出場固定用移動停利。開這個選項的理由：一次完整流程的真實執行結果顯示，連續6輪都在同一份樣本內(IS)資料上挑贏家，疊加起來的多重比較(multiple comparisons)問題嚴重到讓選出的「最佳組合」樣本內PF=1.41、但樣本外(OOS)PF只有0.48、bootstrap正報酬比例只有5.2%——這個簡化模式刻意固定訊號組合、不自動搜尋任何東西，只比較「加不加這兩道門檻」，用來避開同一種overfitting風險。開啟後，上面max_stocks/starting_capital/atr_stop_mult/trailing_atr_mult/start_date/end_date仍然有效，其餘跟訊號/門檻/突破窗口/出場配置自動搜尋相關的選項會被忽略(對應的階段整個不會執行)'
+        required: false
+        default: 'false'
 
 jobs:
   backtest:
@@ -132,6 +136,9 @@ jobs:
           fi
           if [ -n "${{ github.event.inputs.fixed_combo_walkforward_folds }}" ] && [ "${{ github.event.inputs.fixed_combo_walkforward_folds }}" != "0" ]; then
             ARGS="$ARGS --fixed-combo-walkforward-folds ${{ github.event.inputs.fixed_combo_walkforward_folds }}"
+          fi
+          if [ "${{ github.event.inputs.simple_combo }}" = "true" ]; then
+            ARGS="$ARGS --simple-combo"
           fi
           python compare_breakout.py $ARGS
 
