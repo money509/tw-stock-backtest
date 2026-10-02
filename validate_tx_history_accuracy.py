@@ -320,6 +320,34 @@ def _try_data_gov_fallback(start_date, end_date, commodity_id="TXF"):
     return dl_resp.content, "ok"
 
 
+def _build_response_diagnostic(content):
+    """這一輪新增：上一次真實跑看到的只是回應的前500 bytes，剛好全部落在
+    <head>裡面(meta標籤之類)，完全看不出後面的<body>裡到底有沒有結果表格——
+    看不出是(a)整頁回的是查詢表單本身(代表POST參數/流程錯了，例如這個頁面
+    可能是ASP.NET WebForms、需要先GET拿__VIEWSTATE等隱藏欄位才能正確送出
+    POST)，還是(b)表格其實在，只是pd.read_html()的欄位判斷邏輯不符
+    (shape[1]>=4這個門檻，或欄位名稱候選詞對不上)，還是(c)結果由JavaScript
+    動態載入、原始HTML裡根本没有<table>。這三種情況要修的地方完全不同，
+    所以這裡明確回報"content裡到底有沒有<table>標籤"，並且在有的情況下，
+    把*那個標籤附近*的內容摘出來(而不是永遠只看開頭的500 bytes)，才看得到
+    真正該看的部分。回傳一段人看得懂的多行診斷字串。"""
+    text_lower = content.lower()
+    has_table_tag = b"<table" in text_lower
+    has_viewstate = b"__viewstate" in text_lower
+    table_idx = text_lower.find(b"<table")
+
+    lines = [
+        f"回應內容長度：{len(content)} bytes；是否含有<table>標籤：{has_table_tag}；"
+        f"是否像ASP.NET WebForms(含__VIEWSTATE隱藏欄位)：{has_viewstate}",
+    ]
+    if has_table_tag:
+        snippet = content[table_idx:table_idx + 500]
+        lines.append(f"<table>標籤附近內容：{snippet!r}")
+    else:
+        lines.append(f"開頭500 bytes(供參考，但整份內容裡沒有<table>標籤)：{content[:500]!r}")
+    return "\n".join(lines)
+
+
 def _fetch_taifex_single_date(date_obj, commodity_id):
     """對單一日期查TAIFEX futDailyMarketReport，回傳(df_or_None, reason,
     content_preview_or_None)。連線層級失敗時重試MAX_RETRIES次。
@@ -339,7 +367,7 @@ def _fetch_taifex_single_date(date_obj, commodity_id):
                 df, parse_reason = _parse_official_table(content, fallback_date=date_obj)
                 if parse_reason == "ok":
                     return df, "ok", None
-                preview = repr(content[:500])
+                preview = _build_response_diagnostic(content)
                 return None, "taifex_daily_" + parse_reason, preview
             return None, reason, None
         except (FetchFailed, HardTimeout):

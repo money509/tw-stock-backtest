@@ -590,3 +590,25 @@ class TestOfficialDailyFetchContentPreview:
                         [datetime.date(2021, 1, 4)])
         assert df is None
         assert diag["sample_content_preview"] is None
+
+    def test_build_response_diagnostic_finds_table_tag_and_shows_its_vicinity(self):
+        # 上一次真實跑只看到<head>裡的內容，完全看不出<body>有沒有表格——
+        # 這裡確認診斷字串會明確指出有沒有<table>，並且摘出它附近的內容，
+        # 不是永遠只看開頭500 bytes(那樣table在後面就永遠看不到)。
+        content = (b"<html><head>" + b"x" * 1000 + b"</head><body><table class='table_f'>"
+                   b"<tr><td>real data here</td></tr></table></body></html>")
+        diagnostic = vtha._build_response_diagnostic(content)
+        assert "True" in diagnostic.split("\n")[0]  # 第一行講has_table_tag
+        assert "real data here" in diagnostic
+
+    def test_build_response_diagnostic_reports_no_table_tag(self):
+        content = b"<html><body>just a form page, no results</body></html>"
+        diagnostic = vtha._build_response_diagnostic(content)
+        assert "False" in diagnostic.split("\n")[0]
+        assert "just a form page" in diagnostic
+
+    def test_build_response_diagnostic_flags_viewstate(self):
+        content = b'<html><body><input name="__VIEWSTATE" value="abc"></body></html>'
+        diagnostic = vtha._build_response_diagnostic(content)
+        assert "ASP.NET WebForms" in diagnostic
+        assert diagnostic.split("\n")[0].count("True") == 1  # 有__VIEWSTATE，沒有<table>
