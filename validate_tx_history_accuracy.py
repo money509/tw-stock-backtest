@@ -291,14 +291,20 @@ def _try_data_gov_fallback(start_date, end_date, commodity_id="TXF"):
 def fetch_official_daily_ohlc(start_date, end_date, commodity_id="TXF"):
     """
     整合入口：依序嘗試TAIFEX官方端點(主要) -> data.gov.tw開放資料(備援)，兩者都是
-    防禦性(data, reason)寫法。回傳(df_or_None, reason)，df的index是date物件，
-    欄位Open/High/Low/Close：
+    防禦性(data, reason)寫法。回傳(df_or_None, reason, diag)，df的index是date
+    物件，欄位Open/High/Low/Close：
       reason == "ok"
       reason == "taifex_daily_..."  TAIFEX端點失敗的具體原因
       reason == "data_gov_..."      備援也失敗的具體原因(兩者都失敗時，reason是
                                      備援的原因，因為它是最後執行的)
+    diag是{"taifex_reason": ..., "data_gov_reason": ...}，**兩個來源各自的失敗
+    原因都保留**，不是只留最後一個——這一輪新增，原因：上一次真實跑只回報最後
+    一個reason(data_gov_no_csv_resource)，完全看不出「主要的TAIFEX端點」本身
+    是怎麼失敗的(HTTP錯誤？回傳HTML？欄位解析不出來？)，報告裡缺這段資訊，
+    下次要修的話還是得去翻console log，這裡把兩段都存進diag，連同報告一起印出來。
     連線層級失敗(兩個來源都是)時重試MAX_RETRIES次，重試後仍失敗才真正放棄。
     """
+    diag = {"taifex_reason": None, "data_gov_reason": None}
     for attempt in range(MAX_RETRIES + 1):
         last_reason = None
         try:
@@ -308,12 +314,14 @@ def fetch_official_daily_ohlc(start_date, end_date, commodity_id="TXF"):
             if reason == "ok":
                 df, parse_reason = _parse_official_table(content)
                 if parse_reason == "ok":
-                    return df, "ok"
+                    diag["taifex_reason"] = "ok"
+                    return df, "ok", diag
                 last_reason = "taifex_daily_" + parse_reason
             else:
                 last_reason = reason
         except (FetchFailed, HardTimeout):
             last_reason = "taifex_daily_connection_error"
+        diag["taifex_reason"] = last_reason
 
         try:
             content, reason = run_with_hard_timeout(
@@ -322,19 +330,21 @@ def fetch_official_daily_ohlc(start_date, end_date, commodity_id="TXF"):
             if reason == "ok":
                 df, parse_reason = _parse_official_table(content)
                 if parse_reason == "ok":
-                    return df, "ok"
+                    diag["data_gov_reason"] = "ok"
+                    return df, "ok", diag
                 last_reason = "data_gov_" + parse_reason
             else:
                 last_reason = reason
         except (FetchFailed, HardTimeout):
             last_reason = "data_gov_connection_error"
+        diag["data_gov_reason"] = last_reason
 
         if attempt < MAX_RETRIES:
             import time
             time.sleep(RETRY_BACKOFF_SECONDS)
             continue
-        return None, last_reason
-    return None, "unknown_failure"
+        return None, last_reason, diag
+    return None, "unknown_failure", diag
 
 
 def compare_daily_ohlc(community_daily, official_daily, tolerance_pct=DEFAULT_TOLERANCE_PCT):
@@ -491,12 +501,15 @@ def main():
         sys.exit(0)
 
     start_date, end_date = sample_dates[0], sample_dates[-1]
-    official_daily, fetch_reason = fetch_official_daily_ohlc(start_date, end_date, args.commodity_id)
+    official_daily, fetch_reason, fetch_diag = fetch_official_daily_ohlc(
+        start_date, end_date, args.commodity_id)
 
     if official_daily is None:
         lines += [
             "",
             f"官方日線資料抓取失敗(reason={fetch_reason})，驗證沒有執行。",
+            f"兩個來源個別的失敗原因 — TAIFEX官方端點：{fetch_diag.get('taifex_reason')}；"
+            f"data.gov.tw備援：{fetch_diag.get('data_gov_reason')}",
             "這不代表社群資料不準，只代表這次沒有機會比對——TAIFEX官方端點的查詢欄位",
             "名稱是猜測(見模組docstring)，第一次在GitHub Actions真實環境執行，才是",
             "這個假設第一次被真正驗證；如果欄位名稱猜錯了，上面的console log會印出",

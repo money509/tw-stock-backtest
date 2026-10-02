@@ -363,7 +363,7 @@ class TestFetchOfficialDailyOhlcMocked:
         resp = mock.Mock(status_code=200, content=csv_bytes, headers={"Content-Type": "text/csv"})
         with mock.patch("validate_tx_history_accuracy.requests.post", return_value=resp):
             with mock.patch("validate_tx_history_accuracy.requests.get") as mock_get:
-                df, reason = vtha.fetch_official_daily_ohlc(
+                df, reason, diag = vtha.fetch_official_daily_ohlc(
                     datetime.date(2021, 1, 4), datetime.date(2021, 1, 5))
         assert reason == "ok"
         assert len(df) == 2
@@ -376,10 +376,25 @@ class TestFetchOfficialDailyOhlcMocked:
         with mock.patch("validate_tx_history_accuracy.requests.post", return_value=html_resp):
             with mock.patch("validate_tx_history_accuracy.requests.get", return_value=get_fail_resp):
                 with mock.patch("validate_tx_history_accuracy.MAX_RETRIES", 0):
-                    df, reason = vtha.fetch_official_daily_ohlc(
+                    df, reason, diag = vtha.fetch_official_daily_ohlc(
                         datetime.date(2021, 1, 4), datetime.date(2021, 1, 5))
         assert df is None
         assert reason is not None
+
+    def test_both_sources_fail_diag_keeps_both_individual_reasons(self):
+        # 這一輪新增：diag裡要同時留著TAIFEX端點跟data.gov.tw備援各自的失敗原因，
+        # 不是只留最後一個(上一次真實跑就是只看到最後一個原因，看不出TAIFEX
+        # 端點本身是怎麼死的，這是直接的動機)。
+        html_resp = mock.Mock(status_code=200, content=b"<html>not data</html>",
+                               headers={"Content-Type": "text/html"})
+        get_fail_resp = mock.Mock(status_code=500, content=b"", headers={})
+        with mock.patch("validate_tx_history_accuracy.requests.post", return_value=html_resp):
+            with mock.patch("validate_tx_history_accuracy.requests.get", return_value=get_fail_resp):
+                with mock.patch("validate_tx_history_accuracy.MAX_RETRIES", 0):
+                    df, reason, diag = vtha.fetch_official_daily_ohlc(
+                        datetime.date(2021, 1, 4), datetime.date(2021, 1, 5))
+        assert diag["taifex_reason"] == "taifex_daily_returned_html_not_data"
+        assert diag["data_gov_reason"] == "data_gov_api_http_500"
 
 
 class TestRawContentPreview:
