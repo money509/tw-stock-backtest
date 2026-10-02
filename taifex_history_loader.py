@@ -131,6 +131,71 @@ def check_file_signature(local_path):
     return True, "ok"
 
 
+SEVEN_ZIP_MAGIC = b"7z\xbc\xaf\x27\x1c"
+
+
+def _is_archive(raw_bytes):
+    """判斷開頭是不是看得懂的壓縮格式(zip或7z)。這一輪新增7z偵測——第一次真實
+    跑crazyindicator.pixnet.net的Google Drive檔案時才發現它們實際是7z格式
+    (檔頭b'7z\\xbc\\xaf\\x27\\x1c')，不是zip、更不是純CSV，原本只認zip(PK開頭)
+    的邏輯會直接把7z的二進位內容拿去當文字sniff、當然什麼都猜不出來。"""
+    return raw_bytes[:2] == b"PK" or raw_bytes[:6] == SEVEN_ZIP_MAGIC
+
+
+def _extract_first_member(raw_bytes):
+    """從zip或7z的原始bytes裡取出「第一個成員」的內容，回傳(content_bytes_or_None,
+    member_names_list)。zip用標準庫zipfile；7z需要額外套件py7zr(已加進
+    requirements.txt)，py7zr沒裝的話明確回傳None(而不是整支程式崩潰)，呼叫端會
+    把這個狀況當成unrecognized_format處理、並在診斷log裡講清楚是缺套件不是格式
+    辨識不出來。"""
+    if raw_bytes[:2] == b"PK":
+        try:
+            zf = zipfile.ZipFile(io.BytesIO(raw_bytes))
+            members = [n for n in zf.namelist() if not n.endswith("/")]
+            if not members:
+                return None, []
+            return zf.read(members[0]), members
+        except Exception:
+            return None, []
+
+    if raw_bytes[:6] == SEVEN_ZIP_MAGIC:
+        try:
+            import py7zr
+        except ImportError:
+            print("[taifex_history_loader] 偵測到7z格式，但py7zr套件沒裝("
+                  "requirements.txt應該已經列了，檢查pip install有沒有確實執行)，"
+                  "無法解壓縮")
+            return None, []
+        try:
+            import tempfile as _tempfile
+            with _tempfile.TemporaryDirectory() as tmpdir:
+                with py7zr.SevenZipFile(io.BytesIO(raw_bytes), mode="r") as szf:
+                    names = szf.getnames()
+                    if not names:
+                        return None, []
+                    szf.extractall(path=tmpdir)
+                first_path = os.path.join(tmpdir, names[0])
+                if not os.path.exists(first_path):
+                    # 7z內部可能有資料夾結構，getnames()第一個不一定是檔案本身，
+                    # 退而求其次找解壓出來的第一個實際檔案。
+                    found = None
+                    for root, _dirs, files in os.walk(tmpdir):
+                        if files:
+                            found = os.path.join(root, files[0])
+                            break
+                    if found is None:
+                        return None, names
+                    with open(found, "rb") as f:
+                        return f.read(), names
+                with open(first_path, "rb") as f:
+                    return f.read(), names
+        except Exception as e:
+            print(f"[taifex_history_loader] 7z解壓縮失敗：{e}")
+            return None, []
+
+    return None, []
+
+
 def _raw_content_preview(local_path, n_bytes=300):
     """解析失敗時用的診斷小工具：安全地預覽檔案前n_bytes個位元組，不會因為編碼
     猜錯而拋例外(repr()逃脫看不懂的字元)。如果是zip，改預覽zip內第一個成員的
@@ -144,19 +209,21 @@ def _raw_content_preview(local_path, n_bytes=300):
     except Exception as e:
         return f"(讀取檔案失敗，連預覽都做不到：{e})"
 
-    if head[:2] == b"PK":
+    if _is_archive(head):
         try:
             with open(local_path, "rb") as f:
                 full = f.read()
-            zf = zipfile.ZipFile(io.BytesIO(full))
-            names = zf.namelist()
+            extracted, names = _extract_first_member(full)
+            archive_kind = "7z" if head[:6] == SEVEN_ZIP_MAGIC else "zip"
             if not names:
-                return "(zip檔案，但裡面完全沒有任何成員)"
-            member_head = zf.read(names[0])[:n_bytes]
-            return (f"zip內成員清單：{names[:10]}" + (" ...(只列前10個)" if len(names) > 10 else "")
-                    + f"\n第一個成員({names[0]})前{n_bytes} bytes：\n{member_head!r}")
+                return f"({archive_kind}檔案，但裡面完全沒有任何成員，或解壓縮失敗——見console log)"
+            name_list_str = (f"{archive_kind}內成員清單：{names[:10]}"
+                              + (" ...(只列前10個)" if len(names) > 10 else ""))
+            if extracted is None:
+                return name_list_str + "\n(第一個成員解壓縮失敗，看不到實際內容——見console log)"
+            return name_list_str + f"\n第一個成員({names[0]})前{n_bytes} bytes：\n{extracted[:n_bytes]!r}"
         except Exception as e:
-            return f"(是zip檔但解壓檢視失敗：{e})；原始檔頭：{head[:50]!r}"
+            return f"(是壓縮檔但解壓檢視失敗：{e})；原始檔頭：{head[:50]!r}"
 
     return repr(head[:n_bytes])
 
@@ -385,15 +452,11 @@ def parse_history_file(local_path):
     if not is_safe:
         return None, sig_reason
 
-    if raw_bytes[:2] == b"PK":  # zip檔案，取第一個成員內容來sniff(見模組docstring)
-        try:
-            zf = zipfile.ZipFile(io.BytesIO(raw_bytes))
-            members = [n for n in zf.namelist() if not n.endswith("/")]
-            if not members:
-                return None, "unrecognized_format"
-            raw_bytes = zf.read(members[0])
-        except Exception:
+    if _is_archive(raw_bytes):
+        extracted, _names = _extract_first_member(raw_bytes)
+        if extracted is None:
             return None, "unrecognized_format"
+        raw_bytes = extracted
 
     df = _sniff_table(raw_bytes)
     if df is None:

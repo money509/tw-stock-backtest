@@ -420,3 +420,61 @@ class TestRawContentPreview:
         period_diag = diagnostics["periods"]["2011_2020"]
         assert "raw_preview" in period_diag
         assert "prose" in period_diag["raw_preview"]
+
+
+def _make_7z_bytes(csv_bytes, member_name="data.csv"):
+    """用py7zr實際打包一個7z檔案(不是mock，因為第一次真實跑才發現
+    crazyindicator.pixnet.net的Google Drive檔案實際是7z格式，這裡用真正的
+    py7zr往返測試，確保_extract_first_member()真的能解開7z、不是只是語法上
+    看起來對。"""
+    import py7zr
+    with tempfile.TemporaryDirectory() as src_dir:
+        src_path = os.path.join(src_dir, member_name)
+        with open(src_path, "wb") as f:
+            f.write(csv_bytes)
+        fd, archive_path = tempfile.mkstemp(suffix=".7z")
+        os.close(fd)
+        os.remove(archive_path)  # py7zr要自己建立檔案
+        with py7zr.SevenZipFile(archive_path, mode="w") as szf:
+            szf.write(src_path, arcname=member_name)
+    with open(archive_path, "rb") as f:
+        return f.read()
+
+
+class TestSevenZipSupport:
+    def test_is_archive_detects_7z_magic(self):
+        assert thl._is_archive(b"7z\xbc\xaf\x27\x1c\x00\x04" + b"\x00" * 20) is True
+        assert thl._is_archive(b"PK\x03\x04" + b"\x00" * 20) is True
+        assert thl._is_archive(b"not an archive at all") is False
+
+    def test_extract_first_member_from_real_7z(self):
+        csv_bytes = _make_tick_csv_bytes(10)
+        archive_bytes = _make_7z_bytes(csv_bytes, member_name="data.csv")
+        extracted, names = thl._extract_first_member(archive_bytes)
+        assert names == ["data.csv"]
+        assert extracted == csv_bytes
+
+    def test_parse_history_file_handles_7z_wrapped_csv(self):
+        csv_bytes = _make_ohlc_csv_bytes(40)
+        archive_bytes = _make_7z_bytes(csv_bytes, member_name="history.csv")
+        path = _write_tmp(archive_bytes)
+        df, reason = thl.parse_history_file(path)
+        assert reason == "ok"
+        assert df.attrs["source_level"] == "bar"
+        assert len(df) == 40
+
+    def test_raw_content_preview_lists_7z_member_names(self):
+        csv_bytes = _make_tick_csv_bytes(5)
+        archive_bytes = _make_7z_bytes(csv_bytes, member_name="weird_7z_member.csv")
+        path = _write_tmp(archive_bytes)
+        preview = thl._raw_content_preview(path)
+        assert "weird_7z_member.csv" in preview
+        assert "date" in preview  # csv header內容應該出現在預覽裡
+
+    def test_extract_first_member_missing_py7zr_returns_none_gracefully(self):
+        csv_bytes = _make_tick_csv_bytes(5)
+        archive_bytes = _make_7z_bytes(csv_bytes)
+        with mock.patch.dict("sys.modules", {"py7zr": None}):
+            extracted, names = thl._extract_first_member(archive_bytes)
+        assert extracted is None
+        assert names == []
