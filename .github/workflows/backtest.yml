@@ -1,21 +1,25 @@
-name: Run Strategy Backtest
+name: 台指期1小時K棒 擠壓+KDJ 預覽(小樣本，不是驗證)
 
 on:
   workflow_dispatch:
     inputs:
-      start_date:
-        description: '回測起始日期 (YYYY-MM-DD)'
+      variant:
+        description: '要跑哪個出場變體：a(原規則)/b(ATR框架)/both(兩個都跑，預設)'
         required: false
-        default: '2023-01-01'
-      end_date:
-        description: '回測結束日期，留空代表跑到今天'
+        default: 'both'
+      contract:
+        description: '契約規格：big(大台指，NT$200/點，預設)/mini(小台指，NT$50/點)'
         required: false
-        default: ''
+        default: 'big'
+      refresh_cache:
+        description: '是否忽略今天已有的快取、重新向TAIFEX下載(true/false)'
+        required: false
+        default: 'false'
 
 jobs:
-  backtest:
+  preview:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 30
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -30,16 +34,16 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Run backtest
+      - name: Run TX hourly squeeze+KDJ preview (30-day free window only, not a validation)
         run: |
-          if [ -z "${{ github.event.inputs.end_date }}" ]; then
-            python compare.py --start "${{ github.event.inputs.start_date }}"
-          else
-            python compare.py --start "${{ github.event.inputs.start_date }}" --end "${{ github.event.inputs.end_date }}"
+          ARGS="--variant ${{ github.event.inputs.variant }} --contract ${{ github.event.inputs.contract }}"
+          if [ "${{ github.event.inputs.refresh_cache }}" = "true" ]; then
+            ARGS="$ARGS --refresh-cache"
           fi
+          python squeeze_kdj_tx_hourly_preview.py $ARGS
 
-      - name: Upload results
+      - name: Upload results (preview only, small sample)
         uses: actions/upload-artifact@v4
         with:
-          name: backtest-results
-          path: results/
+          name: tx-hourly-squeeze-kdj-preview
+          path: results_tx_hourly_preview/
