@@ -456,6 +456,14 @@ class TestComboSearchCliModeSkipsFullPipeline:
             return real_select_winning_signals(*args, **kwargs)
         monkeypatch.setattr(cb, "select_winning_signals", _spy_select)
 
+        evaluate_combo_calls = []
+        real_evaluate_combo = cb.evaluate_combo
+
+        def _spy_evaluate_combo(*args, **kwargs):
+            evaluate_combo_calls.append(args[0])  # label是第一個positional參數
+            return real_evaluate_combo(*args, **kwargs)
+        monkeypatch.setattr(cb, "evaluate_combo", _spy_evaluate_combo)
+
         argv = [
             "compare_breakout.py", "--combo-search", "--max-stocks", "3",
             "--starting-capital", "1000000", "--atr-stop-mult", "1.0",
@@ -466,19 +474,27 @@ class TestComboSearchCliModeSkipsFullPipeline:
 
         assert ablation_calls, "run_signal_ablation應該被呼叫過(這是--combo-search模式唯一的選擇步驟)"
         assert select_calls, "select_winning_signals應該被呼叫過"
+        # 兩個候選(篩選後混搭、全部混搭不篩選)都該各自跑過一次完整IS/OOS+bootstrap驗證
+        assert len(evaluate_combo_calls) == 2, \
+            f"combo-search模式應該對兩個候選各呼叫一次evaluate_combo，實際呼叫了{len(evaluate_combo_calls)}次"
 
         ablation_csv = os.path.join(str(tmp_path), "combo_search_ablation.csv")
-        variants_csv = os.path.join(str(tmp_path), "combo_search_variants.csv")
-        oos_csv = os.path.join(str(tmp_path), "trades_OOS_combo_search.csv")
+        variants_csv_filtered = os.path.join(str(tmp_path), "combo_search_variants.csv")
+        variants_csv_all = os.path.join(str(tmp_path), "combo_search_variants_allsignals.csv")
+        oos_csv_filtered = os.path.join(str(tmp_path), "trades_OOS_combo_search_filtered.csv")
+        oos_csv_all = os.path.join(str(tmp_path), "trades_OOS_combo_search_allsignals.csv")
         summary_path = os.path.join(str(tmp_path), "summary.txt")
         assert os.path.exists(ablation_csv)
-        assert os.path.exists(variants_csv)
-        assert os.path.exists(oos_csv)
+        assert os.path.exists(variants_csv_filtered)
+        assert os.path.exists(variants_csv_all)
+        assert os.path.exists(oos_csv_filtered)
+        assert os.path.exists(oos_csv_all)
         assert os.path.exists(summary_path)
 
-        variants_df = pd.read_csv(variants_csv)
-        assert len(variants_df) == 3
-        assert set(variants_df["variant"]) == {label for label, _ in cb.SIMPLE_COMBO_VARIANTS}
+        for variants_csv in (variants_csv_filtered, variants_csv_all):
+            variants_df = pd.read_csv(variants_csv)
+            assert len(variants_df) == 3
+            assert set(variants_df["variant"]) == {label for label, _ in cb.SIMPLE_COMBO_VARIANTS}
 
         summary_text = open(summary_path, encoding="utf-8").read()
         assert "--combo-search模式" in summary_text
@@ -487,7 +503,59 @@ class TestComboSearchCliModeSkipsFullPipeline:
         assert "最終驗證" in summary_text
         assert "樣本外(OOS)" in summary_text
         assert "單一訊號拆解" in summary_text
+        assert "候選1" in summary_text and "候選2" in summary_text
+        assert "全部混搭" in summary_text
         # 完整流程才會出現的區塊標題，--combo-search模式不該印出來
         assert "[階段0]" not in summary_text
         assert "ATR倍數敏感度網格" not in summary_text
-        assert "訊號組合比較" not in summary_text
+
+    def test_combo_search_all_signals_candidate_includes_chip_signals_when_with_chip_confirm(
+        self, monkeypatch, tmp_path,
+    ):
+        """候選2(全部混搭)的權重要是run_signal_ablation()實際回傳的signal_names_used，
+        --with-chip-confirm開啟時這份名單本來就含籌碼訊號(has_chip=args.with_chip_confirm
+        已經正確傳進run_signal_ablation，見run_combo_search_mode)，這裡直接檢查送進
+        run_simple_combo_comparison/evaluate_combo的signal_weights有沒有真的包含籌碼訊號，
+        不是空口保證has_chip有被正確threading。"""
+        import data_loader
+        import chip_data_loader
+
+        fake_price_data = self._build_fake_price_data()
+        monkeypatch.setattr(cb, "load_price_data", lambda *a, **k: fake_price_data)
+        # --with-chip-confirm模式下main()會嘗試下載籌碼資料，這裡直接餵空dict讓流程
+        # 當成「沒有籌碼資料」繼續走(precompute_all_breakout_indicators對應處理)，
+        # 不實際發網路請求。
+        monkeypatch.setattr(chip_data_loader, "load_chip_data", lambda *a, **k: {})
+
+        def _boom(*args, **kwargs):
+            raise AssertionError("--combo-search模式不該呼叫任何資料下載函式")
+        monkeypatch.setattr(data_loader, "load_price_data", _boom)
+
+        self._patch_heavy_stages_to_explode(monkeypatch)
+        monkeypatch.setattr(cb, "RESULTS_DIR", str(tmp_path))
+
+        seen_weights = []
+        real_run_simple_combo_comparison = cb.run_simple_combo_comparison
+
+        def _spy_comparison(*args, **kwargs):
+            seen_weights.append(kwargs.get("signal_weights"))
+            return real_run_simple_combo_comparison(*args, **kwargs)
+        monkeypatch.setattr(cb, "run_simple_combo_comparison", _spy_comparison)
+
+        argv = [
+            "compare_breakout.py", "--combo-search", "--with-chip-confirm", "--max-stocks", "3",
+            "--starting-capital", "1000000", "--atr-stop-mult", "1.0",
+        ]
+        monkeypatch.setattr(sys, "argv", argv)
+
+        cb.main()
+
+        assert len(seen_weights) == 2, "兩個候選各應呼叫一次run_simple_combo_comparison"
+        # 候選2(全部混搭)永遠包含所有測過的訊號，數量上一定 >= 候選1(可能被篩選掉大部分訊號)，
+        # 用集合大小+是否包含任一籌碼訊號名稱來確認"全部混搭"候選真的有把籌碼訊號混進去。
+        all_signals_weights = max(seen_weights, key=lambda w: len(w))
+        chip_names_present = set(all_signals_weights) & mbe.CHIP_DEPENDENT_SIGNALS
+        assert chip_names_present, (
+            f"--with-chip-confirm開啟時，候選2(全部混搭)的訊號權重應該包含籌碼相關訊號，"
+            f"實際權重名單：{list(all_signals_weights)}"
+        )
