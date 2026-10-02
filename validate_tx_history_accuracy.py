@@ -321,8 +321,15 @@ def _try_data_gov_fallback(start_date, end_date, commodity_id="TXF"):
 
 
 def _fetch_taifex_single_date(date_obj, commodity_id):
-    """對單一日期查TAIFEX futDailyMarketReport，回傳(df_or_None, reason)。
-    連線層級失敗時重試MAX_RETRIES次。"""
+    """對單一日期查TAIFEX futDailyMarketReport，回傳(df_or_None, reason,
+    content_preview_or_None)。連線層級失敗時重試MAX_RETRIES次。
+
+    content_preview：HTTP本身成功、但_parse_official_table()解析失敗時，附上
+    實際回應內容前500字(安全repr，不會因編碼問題再炸一次)——跟
+    taifex_history_loader.py的_raw_content_preview()同樣的「解析失敗時留下
+    診斷線索，不要只留一個reason字串」精神。只有解析失敗(HTTP本身成功)才有
+    這個值，HTTP層級失敗(逾時/非200)時是None，因為那種情況看內容預覽沒意義。
+    """
     for attempt in range(MAX_RETRIES + 1):
         try:
             content, reason = run_with_hard_timeout(
@@ -331,16 +338,17 @@ def _fetch_taifex_single_date(date_obj, commodity_id):
             if reason == "ok":
                 df, parse_reason = _parse_official_table(content, fallback_date=date_obj)
                 if parse_reason == "ok":
-                    return df, "ok"
-                return None, "taifex_daily_" + parse_reason
-            return None, reason
+                    return df, "ok", None
+                preview = repr(content[:500])
+                return None, "taifex_daily_" + parse_reason, preview
+            return None, reason, None
         except (FetchFailed, HardTimeout):
             if attempt < MAX_RETRIES:
                 import time
                 time.sleep(RETRY_BACKOFF_SECONDS)
                 continue
-            return None, "taifex_daily_connection_error"
-    return None, "taifex_daily_connection_error"
+            return None, "taifex_daily_connection_error", None
+    return None, "taifex_daily_connection_error", None
 
 
 def fetch_official_daily_ohlc(dates, commodity_id="TXF"):
@@ -359,16 +367,20 @@ def fetch_official_daily_ohlc(dates, commodity_id="TXF"):
             "n_dates_failed": int, "date_failures": {date_str: reason}}
     """
     diag = {"taifex_reason": None, "data_gov_reason": None,
-            "n_dates_ok": 0, "n_dates_failed": 0, "date_failures": {}}
+            "n_dates_ok": 0, "n_dates_failed": 0, "date_failures": {},
+            "sample_content_preview": None}
     dfs = []
     for date_obj in dates:
-        df, reason = _fetch_taifex_single_date(date_obj, commodity_id)
+        df, reason, preview = _fetch_taifex_single_date(date_obj, commodity_id)
         if df is not None and reason == "ok":
             dfs.append(df)
             diag["n_dates_ok"] += 1
         else:
             diag["n_dates_failed"] += 1
             diag["date_failures"][date_obj.isoformat()] = reason
+            if preview is not None and diag["sample_content_preview"] is None:
+                # 只留第一筆預覽就好，30天大概率是同一種格式問題，不需要30份一樣的預覽。
+                diag["sample_content_preview"] = preview
 
     if dfs:
         diag["taifex_reason"] = "ok"
@@ -571,6 +583,13 @@ def main():
             "這個假設第一次被真正驗證；如果欄位名稱猜錯了，上面的console log會印出",
             "實際送出的查詢參數，方便之後對照真實回應修正。",
         ]
+        if fetch_diag.get("sample_content_preview"):
+            lines += [
+                "",
+                "--- TAIFEX端點實際回應內容預覽(解析失敗時的診斷用，取其中一天的回應"
+                "前500字，方便下次直接對照修正_parse_official_table的欄位解析邏輯) ---",
+                fetch_diag["sample_content_preview"],
+            ]
         _flush_new_lines()
         _write_report()
         print(f"官方日線資料抓取失敗(reason={fetch_reason})，驗證沒有執行。", file=sys.stderr, flush=True)

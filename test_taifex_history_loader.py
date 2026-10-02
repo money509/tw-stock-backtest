@@ -560,3 +560,33 @@ class TestColonSeparatedTimeFormat:
         assert df.index[0] == pd.Timestamp("2011-01-03 08:46:00")
         assert df["Open"].iloc[0] == 9000
         assert df["Close"].iloc[0] == 9006
+
+
+class TestOfficialDailyFetchContentPreview:
+    def test_parse_failure_captures_content_preview(self):
+        # 這一輪新增：HTTP本身成功但解析失敗時，應該留下實際回應內容的預覽，
+        # 不是只留一個"taifex_daily_no_table_parsed"字串——上一次真實跑30天
+        # 全部是這個reason，完全看不出TAIFEX真正回了什麼內容。
+        bad_resp = mock.Mock(status_code=200,
+                              content=b"<html><body>weird unexpected content</body></html>")
+        get_fail_resp = mock.Mock(status_code=500, content=b"", headers={})
+        with mock.patch("validate_tx_history_accuracy.requests.post", return_value=bad_resp):
+            with mock.patch("validate_tx_history_accuracy.requests.get", return_value=get_fail_resp):
+                with mock.patch("validate_tx_history_accuracy.MAX_RETRIES", 0):
+                    df, reason, diag = vtha.fetch_official_daily_ohlc(
+                        [datetime.date(2021, 1, 4)])
+        assert df is None
+        assert diag["sample_content_preview"] is not None
+        assert "weird unexpected content" in diag["sample_content_preview"]
+
+    def test_connection_failure_has_no_content_preview(self):
+        # HTTP層級失敗(逾時/連線錯誤)時沒有回應內容可以預覽，不該假造一個。
+        with mock.patch("validate_tx_history_accuracy.requests.post",
+                         side_effect=Exception("逾時")):
+            with mock.patch("validate_tx_history_accuracy.requests.get",
+                             side_effect=Exception("逾時")):
+                with mock.patch("validate_tx_history_accuracy.MAX_RETRIES", 0):
+                    df, reason, diag = vtha.fetch_official_daily_ohlc(
+                        [datetime.date(2021, 1, 4)])
+        assert df is None
+        assert diag["sample_content_preview"] is None
