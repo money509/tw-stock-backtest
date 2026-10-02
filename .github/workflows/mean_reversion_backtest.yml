@@ -1,4 +1,4 @@
-name: Run Short Reversal Backtest
+name: Run Revenue Drift Backtest
 
 on:
   workflow_dispatch:
@@ -35,6 +35,10 @@ on:
         description: '同時最多持有的部位數，留空代表2倍top_n(多空雙向各top_n名都進場)'
         required: false
         default: ''
+      trailing_months:
+        description: '算「月營收意外」用的過去幾個月平均視窗，預設6個月'
+        required: false
+        default: '6'
 
 jobs:
   backtest:
@@ -62,7 +66,15 @@ jobs:
           restore-keys: |
             price-data-cache-
 
-      - name: Run short reversal backtest
+      - name: Restore revenue data cache
+        uses: actions/cache@v4
+        with:
+          path: revenue_cache
+          key: revenue-data-cache-${{ github.run_id }}
+          restore-keys: |
+            revenue-data-cache-
+
+      - name: Run revenue drift backtest
         timeout-minutes: 150
         run: |
           ARGS="--starting-capital ${{ github.event.inputs.starting_capital }} --max-stocks ${{ github.event.inputs.max_stocks }}"
@@ -84,10 +96,13 @@ jobs:
           if [ -n "${{ github.event.inputs.max_concurrent_positions }}" ]; then
             ARGS="$ARGS --max-concurrent-positions ${{ github.event.inputs.max_concurrent_positions }}"
           fi
-          python compare_short_reversal.py $ARGS
+          if [ -n "${{ github.event.inputs.trailing_months }}" ]; then
+            ARGS="$ARGS --trailing-months ${{ github.event.inputs.trailing_months }}"
+          fi
+          python compare_revenue_drift.py $ARGS
 
       - name: Upload results
         uses: actions/upload-artifact@v4
         with:
-          name: short-reversal-results
-          path: results_short_reversal/
+          name: revenue-drift-results
+          path: results_revenue_drift/
