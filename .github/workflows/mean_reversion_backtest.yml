@@ -39,6 +39,10 @@ on:
         description: '算「月營收意外」用的過去幾個月平均視窗，預設6個月'
         required: false
         default: '6'
+      refresh_revenue_cache:
+        description: '強制重新抓月營收資料，忽略revenue_cache快取(true)。⚠️第一次執行如果回報「確認無資料」(0筆)，之後cache@v4會把這個「沒資料」的結果原封不動快取下來，之後每次重跑都會直接讀到同一批空結果，不會自動重試——如果上一次結果是0筆事件，這次務必設true，否則改完程式碼也看不到效果'
+        required: false
+        default: 'false'
 
 jobs:
   backtest:
@@ -98,6 +102,9 @@ jobs:
           fi
           if [ -n "${{ github.event.inputs.trailing_months }}" ]; then
             ARGS="$ARGS --trailing-months ${{ github.event.inputs.trailing_months }}"
+          fi
+          if [ "${{ github.event.inputs.refresh_revenue_cache }}" = "true" ]; then
+            ARGS="$ARGS --refresh"
           fi
           python compare_revenue_drift.py $ARGS
 
