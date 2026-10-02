@@ -195,6 +195,10 @@ class TestScanMomentumBreakoutCandidates:
             "0001": {"Close": 110.0, "MA20": 100.0, "RollingHigh": 105.0, "MA60": 120.0},  # 站上均線突破，但在季線下
             "0002": {"Close": 110.0, "MA20": 100.0, "RollingHigh": 105.0, "MA60": 90.0},   # 也在季線上
         }
+        specs = {
+            "0001": {"Close": 110.0, "MA20": 100.0, "RollingHigh": 105.0, "MA60": 120.0},  # 站上均線突破，但在季線下
+            "0002": {"Close": 110.0, "MA20": 100.0, "RollingHigh": 105.0, "MA60": 90.0},   # 也在季線上
+        }
         indicators_by_code, as_of_date = self._build_indicators(specs)
         result = mbe.scan_momentum_breakout_candidates(
             indicators_by_code, as_of_date, regime="neutral", excluded_codes=set(), allow_short=False,
@@ -1303,3 +1307,115 @@ class TestNewSignalScoresInScan:
             # 兩者分數應該相同(都預設0.0)，total_score也應相同
             scores = {c["code"]: c["score"] for c in result}
             assert scores["0001"] == pytest.approx(scores["0002"])
+
+
+class TestRegimeGateDirectionAndToggle:
+    """驗證大盤氛圍regime gate的「順勢」方向，以及--simple-combo模式需要用到的
+    use_regime_gate開關。
+
+    方向說明(容易搞混，所以特別寫一個對照測試)：這支引擎的regime gate公式本身跟
+    mean_reversion_engine/short_reversal_engine完全一樣——regime=='bull'時濾掉空方
+    候選、regime=='bear'時濾掉多方候選(見scan_momentum_breakout_candidates()
+    docstring)。short_reversal_engine.py的TestRegimeGate(test_short_reversal_engine.py)
+    斷言的也是同一個方向(bear擋多方、bull擋空方)，不是公式相反——會讓人誤會「方向相反」
+    的地方是：這支引擎的候選訊號定義本身就是順勢(站上均線+創新高才算多方候選、跌破
+    均線+破底才算空方候選)，所以regime gate是「再加一層同方向的確認」；
+    short_reversal_engine的候選訊號定義是逆勢(短線急漲急跌後的反轉)，同一個gate公式
+    在那裡的作用是「避免逆勢訊號硬是對抗更大的趨勢」。公式相同，用在哪種策略上的
+    效果不同，這裡用多方/空方分別在bull/bear/neutral三種regime下的放行結果，直接
+    驗證「只在大盤偏多時放行多方、只在大盤偏空時放行空方」這個順勢方向沒有寫反。
+    """
+
+    DEFAULT_COLS = TestScanWithNewGateParams.DEFAULT_COLS
+
+    def _build_indicators(self, code_specs, as_of_pos=65):
+        n = as_of_pos + 5
+        idx = pd.date_range("2024-01-01", periods=n, freq="B")
+        indicators_by_code = {}
+        for code, spec in code_specs.items():
+            df = pd.DataFrame({col: val for col, val in self.DEFAULT_COLS.items()}, index=idx)
+            for col, val in spec.items():
+                df.loc[idx[as_of_pos - 1], col] = val
+            indicators_by_code[code] = df
+        return indicators_by_code, idx[as_of_pos]
+
+    def test_long_candidate_blocked_in_bear_allowed_in_bull(self):
+        specs = {"0001": {"Close": 110.0, "MA20": 100.0, "RollingHigh": 105.0}}
+        indicators_by_code, as_of_date = self._build_indicators(specs)
+        result_bull = mbe.scan_momentum_breakout_candidates(
+            indicators_by_code, as_of_date, regime="bull", excluded_codes=set(), allow_short=False,
+        )
+        result_bear = mbe.scan_momentum_breakout_candidates(
+            indicators_by_code, as_of_date, regime="bear", excluded_codes=set(), allow_short=False,
+        )
+        assert {c["code"] for c in result_bull} == {"0001"}
+        assert result_bear == []
+
+    def test_short_candidate_blocked_in_bull_allowed_in_bear(self):
+        specs = {"0001": {"Close": 90.0, "MA20": 100.0, "RollingLow": 95.0}}
+        indicators_by_code, as_of_date = self._build_indicators(specs)
+        result_bull = mbe.scan_momentum_breakout_candidates(
+            indicators_by_code, as_of_date, regime="bull", excluded_codes=set(), allow_short=True,
+        )
+        result_bear = mbe.scan_momentum_breakout_candidates(
+            indicators_by_code, as_of_date, regime="bear", excluded_codes=set(), allow_short=True,
+        )
+        shorts_bull = [c for c in result_bull if c["side"] == "short"]
+        shorts_bear = [c for c in result_bear if c["side"] == "short"]
+        assert shorts_bull == []
+        assert {c["code"] for c in shorts_bear} == {"0001"}
+
+    def test_neutral_regime_allows_both_sides(self):
+        specs = {
+            "0001": {"Close": 110.0, "MA20": 100.0, "RollingHigh": 105.0},
+            "0002": {"Close": 90.0, "MA20": 100.0, "RollingLow": 95.0},
+        }
+        indicators_by_code, as_of_date = self._build_indicators(specs)
+        result = mbe.scan_momentum_breakout_candidates(
+            indicators_by_code, as_of_date, regime="neutral", excluded_codes=set(), allow_short=True,
+        )
+        sides_by_code = {c["code"]: c["side"] for c in result}
+        assert sides_by_code == {"0001": "long", "0002": "short"}
+
+    def test_use_regime_gate_false_lets_backtest_level_short_trade_through_bull_regime(self):
+        # use_regime_gate=False是compare_breakout.py --simple-combo模式變體1/2(不測regime)
+        # 需要的開關，驗證「關掉」之後regime一律視為'neutral'，不會再擋掉本來因為大盤
+        # 偏多而被濾掉的空方候選；use_regime_gate預設True(維持舊版「一律套用regime」行為)。
+        n = 300
+        idx = pd.date_range("2024-01-01", periods=n, freq="B")
+        index_code = "1101"
+        # 指數本身持續走強多頭，約120天(MA120)暖身後regime應該穩定變成'bull'
+        index_closes = np.linspace(100, 300, n)
+        down_closes = np.linspace(200, 50, n)  # 持續破底的下跌股，只看空方候選的方向性
+        price_data = {
+            index_code: make_price_df(list(index_closes), start="2024-01-01"),
+            "1102": make_price_df(list(down_closes), start="2024-01-01"),
+        }
+        universe = {index_code: {}, "1102": {}}
+        indicators_by_code = mbe.precompute_all_breakout_indicators(price_data, universe, index_code=index_code)
+        regime_series = precompute_regime_series(price_data[index_code])
+
+        common_kwargs = dict(
+            price_data=price_data, indicators_by_code=indicators_by_code, regime_series=regime_series,
+            master_calendar=price_data[index_code].index, max_hold_days=10, starting_capital=1_000_000,
+            allow_short=True, lots=2, top_n=2,
+            # max_concurrent_positions=2：指數本身(1101)的多方候選每天都在、會一直贏得
+            # 唯一的部位名額，蓋掉1102的空方候選，兩個名額才能同時觀察到兩邊的方向性
+            max_concurrent_positions=2,
+        )
+        trades_gate_on = mbe.run_momentum_breakout_backtest(use_regime_gate=True, **common_kwargs)
+        trades_gate_off = mbe.run_momentum_breakout_backtest(use_regime_gate=False, **common_kwargs)
+
+        shorts_on_1102 = [t for t in trades_gate_on if t["code"] == "1102" and t["side"] == "short"]
+        shorts_off_1102 = [t for t in trades_gate_off if t["code"] == "1102" and t["side"] == "short"]
+        # 指數大約120天(MA120暖身)後regime才會穩定轉成'bull'(見上面的docstring)，
+        # 暖身期間本來就是'neutral'(兩邊都放行)，所以gate開著時並非完全0筆空單，
+        # 而是「regime穩定轉成bull之後就不該再有新的空單進場」——用進場日期切一個
+        # 暖身過後夠久的分界點(第150個交易日，約2024-08初)驗證這一點；gate關掉後
+        # 因為一律視為'neutral'，分界點之後仍然持續有1102的空單進場。
+        cutoff_date = idx[150]
+        late_shorts_on = [t for t in shorts_on_1102 if t["entry_date"] > cutoff_date]
+        late_shorts_off = [t for t in shorts_off_1102 if t["entry_date"] > cutoff_date]
+        assert late_shorts_on == []
+        assert len(late_shorts_off) >= 1
+        assert len(shorts_off_1102) > len(shorts_on_1102)

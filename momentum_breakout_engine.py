@@ -795,11 +795,25 @@ def run_momentum_breakout_backtest(price_data: dict, indicators_by_code: dict, r
                                     require_hard_breakout: bool = True,
                                     use_ma5_base: bool = False,
                                     require_ma_pattern: bool = False,
-                                    breakeven_after_profit: bool = False):
+                                    breakeven_after_profit: bool = False,
+                                    use_regime_gate: bool = True):
     """
     完整 day-by-day walk-forward 模擬。出場判定/強制平倉/停損冷卻期，重用
     mean_reversion_engine._process_mr_day()，跟均值回歸引擎共用同一套出場機制，
     差別只在進場端(scan_momentum_breakout_candidates / try_enter_breakout)。
+
+    use_regime_gate：預設True，維持舊版行為——每天一律用compute_regime(regime_series, date)
+    算出當下大盤氛圍('bull'/'bear'/'neutral')，傳進scan_momentum_breakout_candidates()的
+    regime參數(regime=='bull'時只放行多方、regime=='bear'時只放行空方，順勢精神，跟
+    mean_reversion_engine/short_reversal_engine的regime gate是同一個方向：大盤明確偏多時
+    不開空單、大盤明確偏空時不開多單，三支引擎的gate公式其實完全一樣，差別只在於
+    「配上什麼樣的進場訊號」——這支引擎本身的多空訊號定義就是順勢(站上均線+創新高)，
+    regime gate只是再加一層同方向的確認；short_reversal_engine的訊號定義是逆勢(短線
+    超漲超跌反轉)，regime gate在那裡的作用是「避免逆勢訊號硬是對抗更大的趨勢」，用途
+    不同但公式相同)。設False時，每天一律用regime='neutral'(等同沒有這層濾網，多空都
+    正常放行，只剩下min_adx等其他門檻在把關)——跟short_reversal_engine.
+    run_short_reversal_backtest()的use_regime_gate是同一個呼叫慣例，用來跟「不開這層
+    濾網」的基準版本直接比較(見compare_breakout.py的--simple-combo模式)。
 
     use_trailing_stop=True 時，建議 max_hold_days 給一個很大的值(例如250個交易日，
     約一年)當工程上的安全上限，不是真正的出場依據——出場交給移動停利本身，讓真正
@@ -861,7 +875,7 @@ def run_momentum_breakout_backtest(price_data: dict, indicators_by_code: dict, r
 
         slots_available = max_concurrent_positions - len(open_positions)
         if slots_available > 0 and not is_near_settlement(date, days_before=2):
-            regime = compute_regime(regime_series, date)
+            regime = compute_regime(regime_series, date) if use_regime_gate else "neutral"
             used_margin = sum(p["margin_used"] for p in open_positions)
             equity = starting_capital + sum(t["pnl_ntd"] for t in trades)
 

@@ -262,6 +262,58 @@ EXIT_STYLE_VARIANTS = [
     ("3天出場+保本停損", {"max_hold_days_override": 3, "breakeven_after_profit": True}),
 ]
 
+# --simple-combo模式(刻意跟上面6階段自動搜尋分開)：固定用這個使用者已經確認過的訊號組合
+# (MACD柱狀圖+K棒實體比例，跟FIXED_WALKFORWARD_COMBO是同一組)，只比較「加不加這兩個門檻」
+# 這一個問題本身，不讓訊號/突破窗口/突破風格/出場配置也變成「挑出來的」——見main()裡
+# --simple-combo分支的docstring說明，這是為了回應一次真實GitHub Actions執行結果：
+# 完整6階段流程選出的「最佳組合」IS PF=1.41、OOS PF=0.48、bootstrap正報酬比例只有5.2%，
+# 嚴重的IS/OOS表現落差，幾乎可以確定是連續6輪都在同一份IS資料上挑贏家、疊加起來的
+# multiple-comparisons(多重比較)問題，不是這個訊號組合本身沒用。
+SIMPLE_COMBO_SIGNAL_WEIGHTS = {"score_macd": 1.0, "score_candle_body": 1.0}
+
+# 三個「累加」門檻變體：每一個都只比前一個多加一道濾網，方便看出「這道濾網到底有沒有用」，
+# 不是互相獨立的平行選項。use_regime_gate是momentum_breakout_engine.py這次新增的開關——
+# 這支引擎的大盤氛圍regime濾網(只在大盤偏多時放行多方候選、只在大盤偏空時放行空方候選，
+# 順勢方向)過去是寫死套用、沒有開關，--simple-combo模式需要「不開regime」當基準
+# (變體1/2)才能跟「加regime」的變體3比較，所以在引擎那邊補上這個開關，預設True維持
+# 舊版(完整6階段流程/main()其餘所有呼叫)的行為不變，見momentum_breakout_engine.
+# run_momentum_breakout_backtest()的use_regime_gate docstring。
+SIMPLE_COMBO_VARIANTS = [
+    ("變體1(基本門檻，無ADX無大盤氛圍regime)", {"use_regime_gate": False}),
+    ("變體2(+趨勢強度ADX>=25)", {"min_adx": 25.0, "use_regime_gate": False}),
+    ("變體3(+趨勢強度ADX>=25+大盤氛圍regime濾網)", {"min_adx": 25.0, "use_regime_gate": True}),
+]
+
+
+def run_simple_combo_comparison(price_data, indicators_by_code, regime_series, is_calendar,
+                                 starting_capital, hold_days, atr_stop_mult, trailing_atr_mult,
+                                 extra_kwargs=None):
+    """--simple-combo模式的核心比較：固定SIMPLE_COMBO_SIGNAL_WEIGHTS，突破窗口/突破風格
+    維持引擎預設(20日、硬門檻，使用者沒有要求重新測這兩個維度，重測會重新引入同一種
+    多重比較風險)，只在IS內跑SIMPLE_COMBO_VARIANTS這三組累加門檻，印出IS PF/勝率/
+    交易數/總損益讓使用者直接看「加這道濾網有沒有讓結果變好」，不自動挑贏家、不往下一
+    階段傳遞「選出來的」設定——三個變體都跑完就結束，呼叫端(main())自己決定要把哪一個
+    (預設變體3，使用者要求的「最終要測的那組」)拿去跑IS/OOS+bootstrap。"""
+    extra_kwargs = extra_kwargs or {}
+    rows = []
+    for label, gate_kwargs in SIMPLE_COMBO_VARIANTS:
+        trades = run_momentum_breakout_backtest(
+            price_data=price_data, indicators_by_code=indicators_by_code, regime_series=regime_series,
+            master_calendar=is_calendar, max_hold_days=hold_days, starting_capital=starting_capital,
+            allow_short=True, lots=2, atr_stop_mult=atr_stop_mult, trailing_atr_mult=trailing_atr_mult,
+            use_trailing_stop=True, signal_weights=SIMPLE_COMBO_SIGNAL_WEIGHTS,
+            **gate_kwargs, **extra_kwargs,
+        )
+        stats = summarize_mr(trades, starting_capital)
+        rows.append({
+            "variant": label, "trade_count": stats["trade_count"], "profit_factor": stats["profit_factor"],
+            "win_rate": stats["win_rate"], "total_pnl_ntd": stats["total_pnl_ntd"],
+        })
+        print(f"  {label} -> {stats['trade_count']}筆, PF={_fmt_pf(stats['profit_factor'])}, "
+              f"勝率={stats['win_rate']:.1f}%, 損益={stats['total_pnl_ntd']:,.0f}", flush=True)
+    return pd.DataFrame(rows)
+
+
 # 跨市場週期驗證用的額外歷史窗口：刻意挑跟近期多頭段落明顯不同的市況，
 # 檢查最終驗證出的組合是不是只吃到牛市紅利。實際PF/bootstrap結果要看下載回來的
 # 真實資料，這裡只是選定「市況應該明顯不同」的日期區間，不對回測結果預設立場。
@@ -1054,6 +1106,122 @@ def run_fixed_combo_walkforward(price_data, indicators_by_code, regime_series, m
     return pd.DataFrame(rows)
 
 
+def run_simple_combo_mode(args, price_data, indicators_by_code, regime_series,
+                           is_calendar, oos_calendar, extra_kwargs, execution_kwargs):
+    """--simple-combo模式的完整流程，跟main()的6階段自動搜尋流程(window→style→訊號自動搜尋→
+    門檻網格→ATR網格→出場配置網格)完全分開、互相獨立：
+
+    1. 固定SIMPLE_COMBO_SIGNAL_WEIGHTS，只在IS內跑SIMPLE_COMBO_VARIANTS三組累加門檻比較
+       (run_simple_combo_comparison)，印出IS PF/勝率/交易數/總損益讓使用者自己判斷「加這道
+       濾網有沒有用」——不自動選贏家，三組都完整列出。
+    2. 直接取SIMPLE_COMBO_VARIANTS的最後一組(變體3，門檻疊到最滿的那組，對應使用者要求
+       「最終要測的那個設定」)，用main()既有的evaluate_combo()重用IS/OOS切分+bootstrap
+       穩健性檢查的邏輯(不重新實作)，產出跟main()最終驗證階段同樣格式的IS/OOS結果。
+
+    突破窗口/突破風格維持引擎預設(20日、硬門檻breakout)，ATR停損/移動停利倍數直接用
+    --atr-stop-mult/--trailing-atr-mult(不給--trailing-atr-mult時，照引擎既有的慣例退回
+    跟--atr-stop-mult同一個值，見momentum_breakout_engine.try_enter_breakout()docstring)，
+    刻意不另外跑ATR敏感度網格——用网格搜出來的數字，等於是又在IS資料上做了一輪挑選，
+    會重新引入這個模式原本要避開的多重比較問題，所以直接用引擎/CLI本來就有的預設值。
+    """
+    print("=" * 100)
+    print("--simple-combo模式：跳過完整6階段IS自動搜尋，只測固定訊號組合 + 3組累加門檻變體")
+    print("(存在理由：完整流程連續6輪在同一份IS資料上挑贏家，疊加起來的多重比較問題曾經讓"
+          "選出的「最佳組合」IS PF=1.41但OOS PF=0.48、bootstrap正報酬比例只有5.2%，"
+          "這裡用固定不挑的組合避開同一個風險)")
+    print("=" * 100)
+
+    hold_days = TRAILING_STOP_MAX_HOLD_DAYS
+    atr_stop_mult = args.atr_stop_mult
+    trailing_atr_mult = args.trailing_atr_mult if args.trailing_atr_mult is not None else atr_stop_mult
+    print(f"固定訊號組合：{SIMPLE_COMBO_SIGNAL_WEIGHTS}　"
+          f"出場：移動停利(初始停損x{atr_stop_mult}, 移動停利x{trailing_atr_mult})　"
+          f"突破窗口/風格：維持引擎預設(20日創新高+硬門檻)\n")
+
+    print("[門檻變體比較] 固定訊號組合 + 三組累加門檻(只在IS內) ...")
+    variant_df = run_simple_combo_comparison(
+        price_data, indicators_by_code, regime_series, is_calendar,
+        args.starting_capital, hold_days, atr_stop_mult, trailing_atr_mult, extra_kwargs=extra_kwargs,
+    )
+    variant_df.to_csv(os.path.join(RESULTS_DIR, "simple_combo_variants.csv"),
+                       index=False, encoding="utf-8-sig")
+
+    final_label, final_gate_kwargs = SIMPLE_COMBO_VARIANTS[-1]
+    print(f"\n[最終驗證] 取{final_label}，跑IS vs OOS + bootstrap穩健性檢查 ...")
+    final_result = evaluate_combo(
+        f"簡化模式最終組合({final_label})", price_data, indicators_by_code, regime_series,
+        is_calendar, oos_calendar, args.starting_capital, hold_days, SIMPLE_COMBO_SIGNAL_WEIGHTS,
+        final_gate_kwargs, atr_stop_mult, trailing_atr_mult, True, extra_kwargs, execution_kwargs,
+    )
+    print(f"  [{final_result['label']}]")
+    print(f"    IS  -> {final_result['IS']['trade_count']}筆, PF={_fmt_pf(final_result['IS']['profit_factor'])}, "
+          f"平均持有{final_result['IS']['avg_hold_days']:.1f}天, 損益={final_result['IS']['total_pnl_ntd']:,.0f}")
+    print(f"    OOS -> {final_result['OOS']['trade_count']}筆, PF={_fmt_pf(final_result['OOS']['profit_factor'])}, "
+          f"平均持有{final_result['OOS']['avg_hold_days']:.1f}天, 損益={final_result['OOS']['total_pnl_ntd']:,.0f}")
+    b = final_result["bootstrap"]
+    print(f"    bootstrap：正報酬比例={b['pct_positive']:.1f}%, p值={b['p_value']:.3f}, "
+          f"拿掉最大3筆後損益={b['pnl_excluding_top3_ntd']:,.0f}")
+    pd.DataFrame(final_result["oos_trades"]).to_csv(
+        os.path.join(RESULTS_DIR, "trades_OOS_simple_combo.csv"), index=False, encoding="utf-8-sig",
+    )
+
+    summary_lines = [
+        "=" * 100,
+        "右側順勢突破策略 --simple-combo模式(固定組合 + 3組累加門檻，跳過完整6階段IS自動搜尋)",
+        f"回測期間：{args.start} ~ {args.end}　起始資金：NT${args.starting_capital:,.0f}",
+        f"訊號組合：{SIMPLE_COMBO_SIGNAL_WEIGHTS}(固定，不自動搜尋)　"
+        f"ATR停損x{atr_stop_mult}/移動停利x{trailing_atr_mult}(沿用--atr-stop-mult/--trailing-atr-mult，"
+        f"不跑ATR敏感度網格)",
+        "=" * 100,
+        "\n存在理由：完整6階段流程(突破窗口→突破風格→訊號自動搜尋→門檻網格→ATR網格→出場配置網格)"
+        "連續在同一份IS資料上挑贏家，一次真實執行結果顯示選出的「最佳組合」IS PF=1.41但"
+        "OOS PF=0.48、bootstrap正報酬比例只有5.2%——嚴重的IS/OOS表現落差，幾乎可以確定是"
+        "疊加6輪IS挑選造成的多重比較(multiple comparisons)問題，不是這個訊號組合本身沒用。"
+        "這個模式刻意固定訊號組合、不自動搜尋突破窗口/突破風格/出場配置，只比較「加不加"
+        "ADX/大盤氛圍regime這兩道門檻」，把需要驗證的自由度降到最低。",
+        "\n--- 門檻變體比較(IS，固定訊號組合，三組累加門檻) ---",
+    ]
+    header_v = f"{'門檻變體':<40}{'交易數':>8}{'PF':>8}{'勝率%':>8}{'總損益NT$':>14}"
+    summary_lines.append(header_v)
+    summary_lines.append("-" * len(header_v))
+    for _, r in variant_df.iterrows():
+        summary_lines.append(
+            f"{r['variant']:<40}{r['trade_count']:>8}{_fmt_pf(r['profit_factor']):>8}"
+            f"{r['win_rate']:>8.1f}{r['total_pnl_ntd']:>14,.0f}"
+        )
+
+    summary_lines.append(f"\n--- 最終驗證：{final_label}，IS vs OOS + bootstrap ---")
+    for split_name in ["IS", "OOS"]:
+        stats = final_result[split_name]
+        split_full = "樣本內(IS)" if split_name == "IS" else "樣本外(OOS) ← 較誠實的參考依據"
+        summary_lines.append(
+            f"  {split_full}: {stats['trade_count']}筆, PF={_fmt_pf(stats['profit_factor'])}, "
+            f"勝率={stats['win_rate']:.1f}%, 平均持有{stats['avg_hold_days']:.1f}天, "
+            f"總損益NT${stats['total_pnl_ntd']:,.0f}, "
+            f"最大回撤NT${stats['max_drawdown_ntd']:,.0f}, 最大連續虧損{stats['max_consecutive_losses']}筆"
+        )
+    summary_lines.append(
+        f"  [穩健性] OOS bootstrap 1000次重抽樣：平均總損益NT${b['mean']:,.0f}，"
+        f"5%~95%區間=[NT${b['p5']:,.0f}, NT${b['p95']:,.0f}]，"
+        f"正報酬比例={b['pct_positive']:.1f}%，p值={b['p_value']:.3f}，"
+        f"拿掉最大3筆交易後總損益NT${b['pnl_excluding_top3_ntd']:,.0f}"
+    )
+    summary_lines.append(
+        "\n判讀方式：先看門檻變體比較裡，PF是不是隨著累加濾網(無→+ADX→+ADX+regime)單調"
+        "變好——如果是，代表這兩道濾網真的有篩掉雜訊；如果中間有一組反而變差，代表那道"
+        "濾網在這份資料裡沒有幫助，不該因為邏輯聽起來合理就預設有效。再看最終驗證的OOS PF"
+        "跟bootstrap正報酬比例/p值，這才是比IS數字誠實的參考依據——IS PF再漂亮，OOS大幅"
+        "滑落都代表這組設定在樣本外站不住腳。"
+    )
+
+    summary_text = "\n".join(summary_lines)
+    print("\n" + summary_text)
+    summary_path = os.path.join(RESULTS_DIR, "summary.txt")
+    with open(summary_path, "w", encoding="utf-8") as f:
+        f.write(summary_text + "\n")
+    print(f"\n已輸出：{summary_path}")
+
+
 def main():
     parser = argparse.ArgumentParser(description="右側順勢突破策略 - 訊號拆解 + 結構門檻 + 最終組合驗證")
     parser.add_argument("--start", default=(datetime.date.today() - datetime.timedelta(days=1095)).isoformat())
@@ -1094,6 +1262,18 @@ def main():
                               f"驗證選出的組合在多折之間是不是穩定，不是只有一次OOS切分。"
                               f"預設建議值{DEFAULT_WALKFORWARD_FOLDS}折(GitHub Actions有~2.5小時的"
                               f"時間預算，這是全新階段、實際耗時還沒有校準過，先保守設小一點)")
+    parser.add_argument("--simple-combo", action="store_true",
+                         help="跳過整套6階段IS自動搜尋(突破窗口比較→突破風格比較→訊號組合自動搜尋→"
+                              "門檻網格→ATR敏感度網格→出場配置網格)，改成只測使用者已經確認過的固定"
+                              "訊號組合(MACD柱狀圖+K棒實體比例) + 三個累加門檻變體(無門檻→+趨勢強度ADX→"
+                              "+趨勢強度+大盤氛圍regime濾網)，出場一律用移動停利(use_trailing_stop=True)。"
+                              "這個模式存在的理由：一次真實GitHub Actions執行結果顯示，完整6階段流程"
+                              "連續在同一份IS資料上挑贏家，疊加起來的多重比較(multiple comparisons)問題"
+                              "嚴重到讓選出的「最佳組合」IS PF=1.41、OOS PF=0.48、bootstrap正報酬比例"
+                              "只有5.2%——用這個固定不挑、只比較三個門檻變體的簡化版本，避開同一種"
+                              "overfitting風險。加這個旗標時，--atr-stop-mult/--trailing-atr-mult/"
+                              "--start/--end/--starting-capital仍然有效，其餘跟訊號/門檻/突破窗口/"
+                              "出場配置自動搜尋相關的旗標會被忽略(因為對應的階段整個不會執行)")
     parser.add_argument("--fixed-combo-walkforward-folds", type=int, default=0,
                          help="測試幾組「固定死不重新挑選」的候選規則(FIXED_WALKFORWARD_COMBO_VARIANTS，"
                               "基準+只改一個維度的變體)跨N個獨立、不重疊歷史區塊的表現，0代表不啟用(預設)。"
@@ -1163,6 +1343,11 @@ def main():
         execution_kwargs["risk_pct_per_trade"] = args.risk_pct_per_trade
     else:
         execution_kwargs["lots"] = 2
+
+    if args.simple_combo:
+        run_simple_combo_mode(args, price_data, indicators_by_code, regime_series,
+                               is_calendar, oos_calendar, extra_kwargs, execution_kwargs)
+        return
 
     if args.use_trailing_stop:
         hold_days_options = TRAILING_STOP_HOLD_DAYS_OPTIONS
