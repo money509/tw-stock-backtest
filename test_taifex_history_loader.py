@@ -380,3 +380,43 @@ class TestFetchOfficialDailyOhlcMocked:
                         datetime.date(2021, 1, 4), datetime.date(2021, 1, 5))
         assert df is None
         assert reason is not None
+
+
+class TestRawContentPreview:
+    def test_plain_text_preview_is_safe_repr(self):
+        path = _write_tmp(b"not a csv at all just words words words\n")
+        preview = thl._raw_content_preview(path)
+        assert "not a csv at all" in preview
+
+    def test_zip_preview_lists_members_and_first_member_head(self):
+        import zipfile
+        csv_bytes = _make_tick_csv_bytes(5)
+        fd, zip_path = tempfile.mkstemp(suffix=".zip")
+        os.close(fd)
+        with zipfile.ZipFile(zip_path, "w") as zf:
+            zf.writestr("weird_name.dat", csv_bytes)
+        preview = thl._raw_content_preview(zip_path)
+        assert "weird_name.dat" in preview
+        assert "date" in preview  # csv header應該出現在預覽內容裡
+
+    def test_unreadable_path_does_not_raise(self):
+        preview = thl._raw_content_preview("/not/a/real/path/at/all")
+        assert "失敗" in preview
+
+    def test_unrecognized_format_diagnostics_include_raw_preview(self, tmp_path):
+        cache_dir = str(tmp_path)
+        os.makedirs(cache_dir, exist_ok=True)
+        bad_path = os.path.join(cache_dir, "bad.raw")
+        with open(bad_path, "wb") as f:
+            f.write(b"totally not tabular data, just prose\nmore prose\n")
+
+        def fake_download(period_key, cache_dir=None, refresh=False):
+            return bad_path, "ok"
+
+        with mock.patch("taifex_history_loader.download_period", side_effect=fake_download):
+            bars, diagnostics = thl.load_tx_history_bars(["2011_2020"], cache_dir=cache_dir)
+
+        assert bars is None
+        period_diag = diagnostics["periods"]["2011_2020"]
+        assert "raw_preview" in period_diag
+        assert "prose" in period_diag["raw_preview"]

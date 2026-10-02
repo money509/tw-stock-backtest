@@ -458,8 +458,15 @@ def main():
         lines += [
             "",
             "社群歷史資料下載/解析全部失敗，驗證沒有執行(不是資料準，是根本沒有資料可以比對)。",
-            f"各period失敗原因：{diag.get('periods')}",
+            f"各period失敗原因：{ {k: {kk: vv for kk, vv in v.items() if kk != 'raw_preview'} for k, v in diag.get('periods', {}).items()} }",
         ]
+        for period_key, period_diag in diag.get("periods", {}).items():
+            if "raw_preview" in period_diag:
+                lines += [
+                    "",
+                    f"--- {period_key} 原始檔案內容預覽(解析失敗時的診斷用，方便下次直接修正解析邏輯) ---",
+                    period_diag["raw_preview"],
+                ]
         _flush_new_lines()
         _write_report()
         print("社群歷史資料下載/解析全部失敗，驗證沒有執行。", file=sys.stderr, flush=True)

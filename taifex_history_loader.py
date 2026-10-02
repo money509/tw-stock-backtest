@@ -131,6 +131,36 @@ def check_file_signature(local_path):
     return True, "ok"
 
 
+def _raw_content_preview(local_path, n_bytes=300):
+    """解析失敗時用的診斷小工具：安全地預覽檔案前n_bytes個位元組，不會因為編碼
+    猜錯而拋例外(repr()逃脫看不懂的字元)。如果是zip，改預覽zip內第一個成員的
+    檔名清單+該成員前n_bytes個位元組的內容，這樣才看得到真正的表格長相，不是
+    只看到zip本身的二進位檔頭(沒有診斷價值)。目的是這次real run第一次遇到
+    unrecognized_format之類的失敗時，報告裡就直接附上足夠線索去修
+    _sniff_table()/_detect_columns()的猜測，不用再往返一次「問使用者要log」。"""
+    try:
+        with open(local_path, "rb") as f:
+            head = f.read(4096)
+    except Exception as e:
+        return f"(讀取檔案失敗，連預覽都做不到：{e})"
+
+    if head[:2] == b"PK":
+        try:
+            with open(local_path, "rb") as f:
+                full = f.read()
+            zf = zipfile.ZipFile(io.BytesIO(full))
+            names = zf.namelist()
+            if not names:
+                return "(zip檔案，但裡面完全沒有任何成員)"
+            member_head = zf.read(names[0])[:n_bytes]
+            return (f"zip內成員清單：{names[:10]}" + (" ...(只列前10個)" if len(names) > 10 else "")
+                    + f"\n第一個成員({names[0]})前{n_bytes} bytes：\n{member_head!r}")
+        except Exception as e:
+            return f"(是zip檔但解壓檢視失敗：{e})；原始檔頭：{head[:50]!r}"
+
+    return repr(head[:n_bytes])
+
+
 def _gdown_download(file_id, output_path):
     """實際呼叫gdown下載單一檔案(可能觸發Google Drive「檔案過大、無法掃描病毒」的
     確認頁，gdown會自動處理這個確認token流程，不用自己手刻)。
@@ -475,9 +505,13 @@ def load_tx_history_bars(period_keys, bar_minutes=15, refresh=False,
 
         parsed, parse_reason = parse_history_file(local_path)
         if parsed is None:
-            print(f"[taifex_history_loader] {period_key}: 解析階段失敗({parse_reason})，跳過這段")
+            preview = _raw_content_preview(local_path)
+            print(f"[taifex_history_loader] {period_key}: 解析階段失敗({parse_reason})，跳過這段\n"
+                  f"[taifex_history_loader] {period_key}: 原始檔案內容預覽(前300 bytes，"
+                  f"方便之後對照修正_sniff_table/_detect_columns的猜測)：\n{preview}")
             diagnostics["periods"][period_key] = {
-                "reason": parse_reason, "n_rows": 0, "source_level": None}
+                "reason": parse_reason, "n_rows": 0, "source_level": None,
+                "raw_preview": preview}
             diagnostics["n_periods_failed"] += 1
             continue
 
