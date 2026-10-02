@@ -1,12 +1,39 @@
-name: Diagnose T86 Endpoint
+name: 台指期15分鐘K棒 右側突破 訊號拆解+自動組合(小樣本，不是驗證)
 
 on:
   workflow_dispatch:
+    inputs:
+      bar_minutes:
+        description: 'K棒週期(分鐘)，預設15(這支腳本的設計目標)'
+        required: false
+        default: '15'
+      contract:
+        description: '契約規格：big(大台指，NT$200/點，預設)/mini(小台指，NT$50/點)'
+        required: false
+        default: 'big'
+      no_short:
+        description: '是否關閉空方、只做多方(true/false)'
+        required: false
+        default: 'false'
+      use_trailing_stop:
+        description: '是否改用ATR移動停利取代固定停利目標價(true/false)'
+        required: false
+        default: 'false'
+      rolling_window_bars:
+        description: 'rolling_percentile_score()自身歷史回看根數，預設60(約3個交易日，見tx_intraday_engine.py說明)'
+        required: false
+        default: '60'
+      refresh_cache:
+        description: '是否忽略今天已有的快取、重新向TAIFEX下載(true/false)'
+        required: false
+        default: 'false'
 
 jobs:
-  diagnose:
+  backtest:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    # 單一商品、~400~450根K棒，沒有像其他引擎那樣跨數百檔股票迴圈，理論上應該跑得很快，
+    # 這裡給的timeout比其他日線回測(動輒數小時)短很多。
+    timeout-minutes: 20
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -19,7 +46,29 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install requests
+          pip install -r requirements.txt
 
-      - name: Run diagnosis
-        run: python diagnose_t86.py
+      - name: 跑單元測試（先確認引擎邏輯沒有壞掉，再花時間跑真實資料）
+        run: |
+          python3 -m pytest test_taifex_intraday_loader.py test_tx_intraday_engine.py \
+            test_squeeze_kdj_signal.py test_squeeze_kdj_tx_hourly_preview.py -v
+
+      - name: Run TX 15-min intraday breakout ablation + auto-combo (30-day free window only, NOT a validation)
+        run: |
+          ARGS="--bar-minutes ${{ github.event.inputs.bar_minutes }} --contract ${{ github.event.inputs.contract }} --rolling-window-bars ${{ github.event.inputs.rolling_window_bars }}"
+          if [ "${{ github.event.inputs.no_short }}" = "true" ]; then
+            ARGS="$ARGS --no-short"
+          fi
+          if [ "${{ github.event.inputs.use_trailing_stop }}" = "true" ]; then
+            ARGS="$ARGS --use-trailing-stop"
+          fi
+          if [ "${{ github.event.inputs.refresh_cache }}" = "true" ]; then
+            ARGS="$ARGS --refresh-cache"
+          fi
+          python compare_tx_intraday.py $ARGS
+
+      - name: Upload results (small sample, ablation + auto-combo only, not a validation)
+        uses: actions/upload-artifact@v4
+        with:
+          name: tx-intraday-15min-breakout-ablation
+          path: results_tx_intraday/
