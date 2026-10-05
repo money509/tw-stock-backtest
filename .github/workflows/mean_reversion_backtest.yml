@@ -79,6 +79,10 @@ on:
         description: '資金/部位受限版squeeze+KDJ驗證(--squeeze-kdj-capital-constrained)：squeeze_kdj_only驗證的是「每個觸發訊號都能無限制同時成交」這個樂觀假設下的訊號品質(變體A/B的OOS PF分別約5.01/3.44)，這個選項回答squeeze_kdj_only刻意沒有回答的問題——拿掉這個樂觀假設、把同一套進場/出場訊號接上這個repo「真正會拿去模擬實戰」的資金/部位管理框架(top_n排名+max_concurrent_positions持倉上限+保證金查表，固定max_concurrent_positions=3/top_n=3)之後，真實帳戶實際能拿到的PF還剩多少(撐住/打折/崩潰，summary.txt會明確對照squeeze_kdj_only的數字講清楚)。同樣跳過突破窗口比較/突破風格比較/訊號自動搜尋/門檻網格/ATR網格/出場配置網格這6階段流程，只是比squeeze_kdj_only多了一層資金管理的現實限制，跑起來比squeeze_kdj_only慢一點(day-by-day逐日競爭有限名額，不是每檔股票獨立一次性模擬)但仍然比完整6階段流程快很多。開啟後，上面max_stocks/starting_capital/start_date/end_date仍然有效，其餘跟訊號/門檻/突破窗口/出場配置自動搜尋相關的選項在這裡不適用；注意這個選項跟squeeze_kdj_only目前是互斥的(main()依序檢查，squeeze_kdj_only若同時開啟會先被處理並直接return，這個選項就不會執行)，兩個都想看的話請分兩次分別執行'
         required: false
         default: 'false'
+      squeeze_kdj_grid:
+        description: 'squeeze+KDJ資金受限版混搭網格搜尋(--squeeze-kdj-grid)：把風控、交易管理、進場方式混在一起找最佳組合——出場方式10種(變體A原規則1種、變體B固定ATR停損1.0/1.5/2.0倍x停利2.0/3.0倍共6種、變體B移動停利1.5/2.0/3.0倍ATR共3種)x最多同時持倉1/3/5檔x部位大小(固定1口/固定2口/每筆風險1%/每筆風險2%)x最長持有10/20/60天x同日多檔排名規則(觸發K棒漲幅/量比)x進場濾網(無/站上60日均線)，一共1440組。方法論是事先定死的：全部組合只在樣本內(IS)跑，用IS的PF選出唯一一個贏家(IS交易筆數至少30筆才有資格，同PF比IS總損益)，只有這個贏家才拿去樣本外(OOS)跑一次+bootstrap 1000次，當作誠實的頭條數字，並直接判定有沒有過專案門檻(bootstrap正報酬比例>80%且p值<0.2)；另外報告IS前10名在OOS的PF、IS PF跟OOS PF的Spearman排名相關(看IS排名到底能不能轉移到OOS，接近0或負代表選出來的「最佳」很可能只是雜訊)、全部1440組OOS PF的分布(只看分布，刻意不印也不該去挑「OOS最好的組合」，那等於拿OOS做選擇)。⚠️一次測1440組有嚴重的多重比較(multiple comparisons)風險，IS贏家的IS數字一定偏樂觀，summary.txt會醒目提醒；而且這段OOS在上一輪squeeze_kdj_capital_constrained已經看過一次，不是完全沒碰過的資料。起始資金不是網格維度(它是你真實帳戶的規模，用上面starting_capital設定)。輸出squeeze_kdj_grid_all_combos.csv(每組一列、中文欄名，含IS/OOS統計跟「名額已滿/保證金上限/風險口數不足1口/濾網擋掉」等診斷計數)+summary.txt。效能：回測已改成預先計算共用，合成資料實測1440組x(IS+OOS)在50檔約5秒、249檔(全部標的)約11秒就跑完，時間主要花在下載資料，max_stocks設0(全部)也遠低於步驟150分鐘上限，不需要另外限制max_stocks。開啟後，上面max_stocks/starting_capital/start_date/end_date仍然有效，其餘跟訊號/門檻/突破窗口/出場配置自動搜尋相關的選項在這裡不適用；跟squeeze_kdj_only/squeeze_kdj_capital_constrained互斥(main()依序檢查，那兩個若同時開啟會先執行並直接return，這個選項就不會執行)'
+        required: false
+        default: 'false'
 
 jobs:
   backtest:
@@ -160,6 +164,9 @@ jobs:
           fi
           if [ "${{ github.event.inputs.squeeze_kdj_capital_constrained }}" = "true" ]; then
             ARGS="$ARGS --squeeze-kdj-capital-constrained"
+          fi
+          if [ "${{ github.event.inputs.squeeze_kdj_grid }}" = "true" ]; then
+            ARGS="$ARGS --squeeze-kdj-grid"
           fi
           python compare_breakout.py $ARGS
 
