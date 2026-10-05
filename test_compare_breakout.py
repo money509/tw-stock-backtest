@@ -561,6 +561,101 @@ class TestComboSearchCliModeSkipsFullPipeline:
         )
 
 
+class TestSqueezeKdjOnlyCliModeSkipsFullPipeline:
+    """--squeeze-kdj-only這個CLI旗標只該呼叫run_squeeze_kdj_exit_style_comparison_is_oos()，
+    main()完整流程的其餘階段(突破窗口比較、突破風格比較、單一訊號拆解、訊號組合比較、
+    結構門檻變體比較、ATR敏感度網格、出場配置比較，以及walk-forward/固定規則walk-forward/
+    跨週期驗證這些main()尾段的額外階段)全部跳過，改成走run_squeeze_kdj_only_mode()，
+    輸出squeeze_kdj_is_oos.csv+summary.txt(只含squeeze+KDJ這一段的IS/OOS/bootstrap，
+    不含完整流程才有的區塊標題)。"""
+
+    def _build_fake_price_data(self, n=260, seed=17):
+        np.random.seed(seed)
+        idx = pd.date_range("2019-01-01", periods=n, freq="B")
+
+        def _df(closes):
+            closes = pd.Series(closes, index=idx, dtype=float)
+            return pd.DataFrame({
+                "Open": closes, "High": closes * 1.01, "Low": closes * 0.99, "Close": closes,
+                "Volume": pd.Series(1500.0, index=idx),
+            }, index=idx)
+
+        index_trend = np.linspace(0, 30, n) + np.random.normal(0, 1.2, n)
+        stock_trend = np.linspace(0, -15, n) + np.random.normal(0, 1.2, n)
+        return {
+            "2330": _df(np.maximum(100 + index_trend, 1.0)),
+            "1101": _df(np.maximum(100 + stock_trend, 1.0)),
+        }
+
+    def _patch_heavy_stages_to_explode(self, monkeypatch):
+        # 刻意不包含run_squeeze_kdj_exit_style_comparison_is_oos：--squeeze-kdj-only
+        # 模式「唯一」該呼叫的驗證階段。
+        heavy_stage_names = [
+            "run_breakout_window_comparison", "run_breakout_style_comparison",
+            "run_signal_ablation", "run_signal_combo_comparison", "run_gate_comparison",
+            "run_atr_sensitivity_grid", "run_exit_style_comparison",
+            "run_walkforward_validation", "run_fixed_combo_walkforward",
+            "run_squeeze_kdj_exit_style_comparison", "run_multi_period_validation",
+        ]
+
+        def _boom(name):
+            def _inner(*args, **kwargs):
+                raise AssertionError(f"--squeeze-kdj-only模式不該呼叫完整流程的階段函式：{name}")
+            return _inner
+
+        for name in heavy_stage_names:
+            monkeypatch.setattr(cb, name, _boom(name))
+
+    def test_squeeze_kdj_only_skips_full_pipeline_and_writes_is_oos_output(self, monkeypatch, tmp_path):
+        import data_loader
+        import chip_data_loader
+
+        fake_price_data = self._build_fake_price_data()
+        monkeypatch.setattr(cb, "load_price_data", lambda *a, **k: fake_price_data)
+
+        def _boom(*args, **kwargs):
+            raise AssertionError("--squeeze-kdj-only模式不該呼叫任何資料下載函式")
+        monkeypatch.setattr(data_loader, "load_price_data", _boom)
+        monkeypatch.setattr(chip_data_loader, "load_chip_data", _boom)
+
+        self._patch_heavy_stages_to_explode(monkeypatch)
+        monkeypatch.setattr(cb, "RESULTS_DIR", str(tmp_path))
+
+        is_oos_calls = []
+        real_is_oos = cb.run_squeeze_kdj_exit_style_comparison_is_oos
+
+        def _spy(*args, **kwargs):
+            is_oos_calls.append(1)
+            return real_is_oos(*args, **kwargs)
+        monkeypatch.setattr(cb, "run_squeeze_kdj_exit_style_comparison_is_oos", _spy)
+
+        argv = [
+            "compare_breakout.py", "--squeeze-kdj-only", "--max-stocks", "3",
+            "--starting-capital", "1000000", "--atr-stop-mult", "1.0",
+        ]
+        monkeypatch.setattr(sys, "argv", argv)
+
+        cb.main()
+
+        assert len(is_oos_calls) == 1
+
+        csv_path = os.path.join(str(tmp_path), "squeeze_kdj_is_oos.csv")
+        summary_path = os.path.join(str(tmp_path), "summary.txt")
+        assert os.path.exists(csv_path)
+        assert os.path.exists(summary_path)
+
+        summary_text = open(summary_path, encoding="utf-8").read()
+        assert "--squeeze-kdj-only模式" in summary_text
+        for label in cb.SQUEEZE_KDJ_VARIANT_LABELS.values():
+            assert label in summary_text
+        assert "樣本外(OOS)" in summary_text
+        assert "bootstrap" in summary_text
+        # 完整流程才會出現的區塊標題，--squeeze-kdj-only模式不該印出來
+        assert "[階段0]" not in summary_text
+        assert "ATR倍數敏感度網格" not in summary_text
+        assert "單一訊號拆解" not in summary_text
+
+
 class TestRunSqueezeKdjExitStyleComparisonIsOos:
     """run_squeeze_kdj_exit_style_comparison_is_oos()：這是補上IS/OOS切分+bootstrap
     穩健性檢查之前，squeeze+KDJ訊號比較唯一還沒套用專案標準驗證方法論的地方(之前只跑

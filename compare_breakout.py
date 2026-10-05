@@ -911,6 +911,88 @@ def _squeeze_kdj_is_oos_results_to_df(results: dict) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+def run_squeeze_kdj_only_mode(args, price_data, universe, is_calendar, oos_calendar):
+    """--squeeze-kdj-only模式：只跑squeeze+KDJ訊號的IS/OOS+bootstrap驗證(見
+    run_squeeze_kdj_exit_style_comparison_is_oos() docstring)，完全跳過突破窗口比較→
+    突破風格比較→訊號自動搜尋→門檻網格→ATR敏感度網格→出場配置網格這整套6階段流程——
+    squeeze+KDJ驗證本來就不依賴這6個階段選出的任何東西(它是獨立對universe逐檔股票
+    模擬，不經過scan_momentum_breakout_candidates()/run_momentum_breakout_backtest()
+    那條路徑)，之前要看這個驗證結果，得先等整套6階段流程跑完才會印出來，這裡讓使用者
+    可以只測這一段、不用等前面不相關的流程，跟--simple-combo/--combo-search的「只測
+    使用者真正想看的那一段」精神一致。
+
+    加這個旗標時，--atr-stop-mult/--trailing-atr-mult/--start/--end/--starting-capital/
+    --max-stocks仍然有效(影響universe大小跟bootstrap用的起始資金)，但squeeze+KDJ訊號
+    本身的進場/出場規則是寫死在squeeze_kdj_signal.py裡的(不吃訊號權重/門檻這些參數)，
+    所以跟訊號/門檻/突破窗口/出場配置自動搜尋相關的旗標在這裡本來就不適用，不是「被忽略」，
+    是這個模式測的東西跟那些旗標控制的維度完全無關。
+    """
+    print("=" * 100)
+    print("--squeeze-kdj-only模式：只跑布林+Keltner擠壓+KDJ訊號的IS/OOS+bootstrap驗證，"
+          "跳過突破窗口/突破風格/訊號自動搜尋/門檻網格/ATR網格/出場配置網格這6個階段")
+    print("(這個驗證本來就不依賴那6個階段選出的任何東西，這裡只是讓使用者不用等前面"
+          "不相關的流程跑完)")
+    print("=" * 100)
+    print(f"\n布林+Keltner擠壓+KDJ訊號：變體A(原規則) vs 變體B(沿用ATR框架) ...")
+    print("  ⚠️ 之前只跑過全樣本、沒有分IS/OOS，之前一次好看的全樣本數字(PF=1.84、"
+          "損益+NT$518萬)完全沒驗證過是不是過擬合——先驗證再談優化，見"
+          "run_squeeze_kdj_exit_style_comparison_is_oos() docstring")
+    squeeze_kdj_results = run_squeeze_kdj_exit_style_comparison_is_oos(
+        price_data, universe, args.starting_capital, is_calendar, oos_calendar,
+    )
+    squeeze_kdj_exit_df = _squeeze_kdj_is_oos_results_to_df(squeeze_kdj_results)
+    squeeze_kdj_exit_df.to_csv(os.path.join(RESULTS_DIR, "squeeze_kdj_is_oos.csv"),
+                                index=False, encoding="utf-8-sig")
+
+    summary_lines = [
+        "=" * 100,
+        "布林+Keltner擠壓+KDJ訊號 --squeeze-kdj-only模式(只驗證這一個訊號，跳過其餘6階段流程)",
+        f"回測期間：{args.start} ~ {args.end}　起始資金：NT${args.starting_capital:,.0f}",
+        "=" * 100,
+        "\n(這個比較跟main()其餘階段獨立，只做多方，見squeeze_kdj_signal.py模組docstring；"
+        "之前只跑過全樣本、沒有驗證過是不是過擬合，這裡補上IS/OOS切分+OOS bootstrap"
+        "穩健性檢查)",
+    ]
+    for r in squeeze_kdj_results.values():
+        print(f"  [{r['label']}]")
+        summary_lines.append(f"\n  [{r['label']}]")
+        for split_name in ["IS", "OOS"]:
+            stats = r[split_name]
+            split_full = "樣本內(IS)" if split_name == "IS" else "樣本外(OOS) ← 較誠實的參考依據"
+            line = (f"    {split_full}: {stats['trade_count']}筆, PF={_fmt_pf(stats['profit_factor'])}, "
+                    f"勝率={stats['win_rate']:.1f}%, 平均持有{stats['avg_hold_days']:.1f}天, "
+                    f"總損益NT${stats['total_pnl_ntd']:,.0f}, "
+                    f"最大回撤NT${stats['max_drawdown_ntd']:,.0f}, 最大連續虧損{stats['max_consecutive_losses']}筆")
+            print("  " + line.strip())
+            summary_lines.append(line)
+        b = r["bootstrap"]
+        boot_line = (f"    [穩健性] OOS bootstrap 1000次重抽樣：平均總損益NT${b['mean']:,.0f}，"
+                     f"5%~95%區間=[NT${b['p5']:,.0f}, NT${b['p95']:,.0f}]，"
+                     f"正報酬比例={b['pct_positive']:.1f}%，p值={b['p_value']:.3f}，"
+                     f"拿掉最大3筆交易後總損益NT${b['pnl_excluding_top3_ntd']:,.0f}")
+        print("  bootstrap：正報酬比例={:.1f}%, p值={:.3f}, 拿掉最大3筆後損益={:,.0f}".format(
+            b["pct_positive"], b["p_value"], b["pnl_excluding_top3_ntd"]))
+        summary_lines.append(boot_line)
+
+    caveat = ("\n  ⚠️ 以上全程不經過資金/部位管理(每個訊號都視為獨立成交，沒有top_n排名、"
+              "沒有同時持倉上限)，PF/損益數字比真實帳戶能拿到的樂觀——這組驗證回答的是"
+              "「進場/出場邏輯方向上是否穩健」，不是「我的帳戶實際能拿到的PF」")
+    print(caveat.strip())
+    summary_lines.append(caveat)
+    summary_lines.append(
+        "\n判讀方式：先看OOS PF是不是也>1(不是只看IS/全樣本)，再看bootstrap正報酬比例"
+        "(想要>80%才算站得住)跟p值(越接近0越好，超過0.2以上不該當作已驗證)。即使OOS/"
+        "bootstrap數字好看，別忘了上面的資金/部位管理但書——這裡驗證的是訊號邏輯方向，"
+        "不是實際帳戶報酬。"
+    )
+
+    summary_text = "\n".join(summary_lines)
+    summary_path = os.path.join(RESULTS_DIR, "summary.txt")
+    with open(summary_path, "w", encoding="utf-8") as f:
+        f.write(summary_text + "\n")
+    print(f"\n已輸出：{summary_path}")
+
+
 def evaluate_combo(label, price_data, indicators_by_code, regime_series, is_calendar, oos_calendar,
                     starting_capital, hold_days, signal_weights, gate_kwargs, atr_stop_mult,
                     trailing_atr_mult, use_trailing_stop, extra_kwargs, execution_kwargs):
@@ -1642,6 +1724,19 @@ def main():
                               "--with-chip-confirm仍然有效(--with-chip-confirm開啟時，候選2的「全部混搭」"
                               "也會把籌碼訊號一起混進去)，其餘跟突破窗口/突破風格/門檻/ATR/出場配置"
                               "自動搜尋相關的旗標會被忽略(因為對應的階段整個不會執行)")
+    parser.add_argument("--squeeze-kdj-only", action="store_true",
+                         help="只跑布林+Keltner擠壓+KDJ訊號的IS/OOS+bootstrap驗證"
+                              "(run_squeeze_kdj_exit_style_comparison_is_oos)，跳過突破窗口比較→"
+                              "突破風格比較→訊號自動搜尋→門檻網格→ATR敏感度網格→出場配置網格這整套"
+                              "6階段流程——squeeze+KDJ驗證本來就不依賴那6個階段選出的任何東西(它是"
+                              "獨立對universe逐檔股票模擬，不經過scan_momentum_breakout_candidates()/"
+                              "run_momentum_breakout_backtest()那條路徑，訊號本身的進場/出場規則寫死"
+                              "在squeeze_kdj_signal.py裡，不吃訊號權重/門檻這些參數)，開這個旗標可以"
+                              "不用等前面不相關的流程跑完，直接看這個訊號的IS/OOS/bootstrap結果。"
+                              "加這個旗標時，--atr-stop-mult/--trailing-atr-mult/--start/--end/"
+                              "--starting-capital/--max-stocks仍然有效，其餘跟訊號/門檻/突破窗口/"
+                              "出場配置自動搜尋相關的旗標在這裡不適用(squeeze+KDJ的規則是寫死的，"
+                              "不是被忽略，是這些旗標控制的維度跟這個模式測的東西無關)")
     parser.add_argument("--fixed-combo-walkforward-folds", type=int, default=0,
                          help="測試幾組「固定死不重新挑選」的候選規則(FIXED_WALKFORWARD_COMBO_VARIANTS，"
                               "基準+只改一個維度的變體)跨N個獨立、不重疊歷史區塊的表現，0代表不啟用(預設)。"
@@ -1720,6 +1815,10 @@ def main():
     if args.combo_search:
         run_combo_search_mode(args, price_data, indicators_by_code, regime_series,
                                is_calendar, oos_calendar, extra_kwargs, execution_kwargs)
+        return
+
+    if args.squeeze_kdj_only:
+        run_squeeze_kdj_only_mode(args, price_data, universe, is_calendar, oos_calendar)
         return
 
     if args.use_trailing_stop:
