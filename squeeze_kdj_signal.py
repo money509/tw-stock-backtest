@@ -65,7 +65,7 @@ from mean_reversion_engine import (
     compute_bollinger, compute_atr_correct, DEFAULT_MARGIN_CAP_RATIO, STOP_LOSS_COOLDOWN_DAYS,
     _process_mr_day, _close_mr_trade,
 )
-from taifex_universe import estimate_margin
+from taifex_universe import estimate_margin, get_contract_multiplier
 
 SQUEEZE_LOOKBACK_DEFAULT = 10  # 「還在擠壓情境附近」的回看天數，日線上的假設值，未實測調整
 MAX_ARMED_BARS_DEFAULT = 15    # 武裝之後最多等幾天，超過就重置，避免訊號跟擠壓情境脫鉤
@@ -369,6 +369,12 @@ def simulate_variant_b_trades(df: pd.DataFrame, features: pd.DataFrame,
 # 用while迴圈往前掃描，後者是對整個市場逐日walk-forward)，沒辦法簡單重用，但
 # 「進場規則」「變體A/B的出場規則」這兩件事的定義完全跟上面一致，只是改成在
 # day-by-day迴圈裡逐日查表/逐日判斷。
+#
+# 後續(compare_breakout.py --squeeze-kdj-grid混搭網格搜尋)新增、全部預設關閉的選項：
+# 變體B_trail(ATR初始停損+移動停利)、風險預算部位(risk_pct_per_trade)、同日排名改用量比
+# (ranking_rule="volume_ratio")、站上60日均線濾網(entry_filter="above_ma60")、診斷計數器
+# (return_diagnostics)，以及為了讓上千次回測跑得完的預先計算重構
+# (precompute_squeeze_kdj_backtest_arrays)。預設參數下的交易結果跟重構前逐筆完全相同。
 # ============================================================================
 
 MAX_HOLD_DAYS_CAPITAL_CONSTRAINED_DEFAULT = 60
@@ -463,6 +469,120 @@ def _process_squeeze_kdj_variant_a_day(position: dict, row, k_today: float, date
     return position
 
 
+VALID_CAPITAL_CONSTRAINED_VARIANTS = ("A", "B", "B_trail")
+VALID_RANKING_RULES = ("trigger_return", "volume_ratio")
+VALID_ENTRY_FILTERS = (None, "above_ma60")
+VOLUME_RATIO_WINDOW = 20  # 量比 = 當日成交量 / 20日均量，跟momentum_breakout_engine的VolumeRatio同一個定義
+ENTRY_FILTER_MA_PERIOD = 60  # above_ma60濾網用的均線天數，跟momentum_breakout_engine的MA60同一個定義
+
+# 診斷計數器的key，固定順序，方便呼叫端(compare_breakout.py網格模式)直接攤成CSV欄位。
+CAPITAL_CONSTRAINED_DIAGNOSTIC_KEYS = (
+    "candidates_total",            # 當天觸發、且沒有被「持倉中/冷卻期」排除的候選總數
+    "skipped_entry_filter",        # 被進場濾網(entry_filter)擋掉
+    "skipped_no_slot",             # 名額已滿(或排名在top_n截斷之外)，根本沒輪到
+    "skipped_invalid_stop",        # 停損價算不出來(ATR是NaN/<=0、PriorLow是NaN、風險部位下停損距離<=0)
+    "skipped_risk_lots_lt1",       # 風險預算反推口數 < 1口
+    "skipped_single_margin_cap",   # 單筆保證金超過starting_capital的35%
+    "skipped_total_margin_cap",    # 加上這筆之後總保證金超過整體上限
+)
+
+
+def precompute_squeeze_kdj_backtest_arrays(price_data: dict, features_by_code: dict,
+                                            atr_period: int = 14) -> dict:
+    """
+    把run_squeeze_kdj_capital_constrained_backtest()逐日迴圈需要查的所有東西，一次性
+    預先整理成numpy陣列+「日期→列索引」查表dict，讓網格搜尋(compare_breakout.py
+    --squeeze-kdj-grid，1440組參數 x IS/OOS兩段)的每一次回測都直接共用同一份，不用
+    每次都重算、也不用在逐日迴圈裡做df.loc查表。
+
+    為什麼需要這個(效能，不是邏輯變更)：舊版回測在逐日迴圈裡對「每一檔股票、每一天」
+    都做一次 `date in sig_df.index` + `sig_df.loc[date]`，50檔x750天大約要1.8秒才跑完
+    一次回測；網格要跑2880次(1440組 x IS/OOS)，換算下來光50檔就要超過一小時、320檔要
+    好幾個小時，GitHub Actions的150分鐘步驟上限根本撐不住。這裡改成：
+      1. 每檔股票的「已經shift(1)對齊成『今天能不能進場』」的訊號欄位(進場旗標、
+         變體A停損價PriorLow、觸發K棒漲幅、量比、是否站上季線、ATR)只算一次，存成numpy陣列；
+      2. 進場旗標非常稀疏(全市場幾百天才幾十~幾百次)，所以預先建一張
+         `日期 -> [(code, 列索引), ...]` 的事件表(events_by_date)，逐日迴圈只需要看
+         「今天有觸發的那幾檔」，不用每天掃過全部股票；
+      3. OHLC也存成numpy陣列+「日期→列索引」dict，持倉的逐日出場判定直接用列索引取值。
+    這張事件表跟calendar無關(涵蓋價格資料的全部日期)，IS/OOS兩段回測直接共用同一份，
+    逐日迴圈只會查到自己calendar裡的日期，等價於「每個calendar各自建一張」，但只需要建一次。
+
+    對齊方式跟舊版完全一致(見run_squeeze_kdj_capital_constrained_backtest() docstring
+    的「進場時機」說明)：所有訊號欄位都是「t日收盤後才知道的資訊」往後位移一天(shift(1))，
+    第d列存的是「d的前一個交易日的資訊」，查第d列不會有lookahead。
+
+    新增的兩個欄位(網格搜尋才用得到，預設參數下完全不會被讀取，不影響舊行為)：
+      volume_ratio：觸發K棒當天(t日)的成交量 / 含t日在內的20日均量(跟momentum_breakout_engine
+        的VolumeRatio同一個定義)，一樣shift(1)。價格資料沒有Volume欄位時整欄為NaN。
+      above_ma60：觸發K棒當天(t日)收盤價是否 > 含t日在內的60日簡單均線，一樣shift(1)；
+        均線暖身期(前59天)均線是NaN，比較結果視為False(濾網開啟時這幾天一律擋掉，
+        保守處理：資料不足時不假設它站上季線)。
+
+    events_by_date只收「進場旗標=True 且 觸發K棒漲幅不是NaN」的事件——這跟舊版逐日迴圈
+    「EntryToday為False或TriggerStrength是NaN就跳過」的篩選條件完全相同，只是提前做。
+    每個日期底下的事件順序 = features_by_code的迭代順序，跟舊版逐日迴圈掃描候選的順序
+    一致，所以排名同分時(穩定排序)的先後順序也跟舊版一樣。
+
+    回傳：{"atr_period": int, "per_code": {code: {...陣列...}}, "events_by_date": {date: [...]}}
+    """
+    per_code = {}
+    events_by_date = {}
+    for code, features in features_by_code.items():
+        df = price_data.get(code)
+        if df is None:
+            continue
+        index = df.index
+        close = df["Close"]
+        trigger_return = close / close.shift(1) - 1  # t日(觸發K棒)本身的漲幅，排名用
+
+        entry_today = features["EntryFlag"].shift(1).reindex(index).fillna(False).astype(bool).to_numpy()
+        stop_a = features["PriorLow"].shift(1).reindex(index).to_numpy(dtype=float)
+        trigger_strength = trigger_return.shift(1).to_numpy(dtype=float)
+        k = features["K"].reindex(index).to_numpy(dtype=float)
+        atr = compute_atr_correct(df, period=atr_period).shift(1).to_numpy(dtype=float)
+
+        if "Volume" in df.columns:
+            volume = df["Volume"].astype(float)
+            vol_avg = volume.rolling(VOLUME_RATIO_WINDOW).mean()
+            volume_ratio = (volume / vol_avg.replace(0, np.nan)).shift(1).to_numpy(dtype=float)
+        else:
+            volume_ratio = np.full(len(index), np.nan)
+
+        ma = close.rolling(ENTRY_FILTER_MA_PERIOD).mean()
+        above_ma = (close > ma).shift(1).fillna(False).astype(bool).to_numpy()
+
+        per_code[code] = {
+            "dates": index,
+            "date_to_idx": {d: i for i, d in enumerate(index)},
+            "open": df["Open"].to_numpy(dtype=float),
+            "high": df["High"].to_numpy(dtype=float),
+            "low": df["Low"].to_numpy(dtype=float),
+            "close": close.to_numpy(dtype=float),
+            "k": k,
+            "entry_today": entry_today,
+            "stop_a": stop_a,
+            "trigger_strength": trigger_strength,
+            "volume_ratio": volume_ratio,
+            "above_ma60": above_ma,
+            "atr": atr,
+        }
+
+        for i in np.flatnonzero(entry_today):
+            if np.isnan(trigger_strength[i]):
+                continue
+            events_by_date.setdefault(index[i], []).append((code, int(i)))
+
+    return {"atr_period": atr_period, "per_code": per_code, "events_by_date": events_by_date}
+
+
+def _row_at(arrs: dict, i: int) -> dict:
+    """把預先整理好的OHLC陣列第i列包成check_exit()/_process_mr_day()/
+    _process_squeeze_kdj_variant_a_day()看得懂的形狀(只會用到row["Open"/"High"/"Low"/"Close"])，
+    取代舊版的df.loc[date](一個pandas Series)，數值完全相同，只是快很多。"""
+    return {"Open": arrs["open"][i], "High": arrs["high"][i], "Low": arrs["low"][i], "Close": arrs["close"][i]}
+
+
 def run_squeeze_kdj_capital_constrained_backtest(price_data: dict, universe: dict,
                                                    master_calendar: pd.DatetimeIndex,
                                                    starting_capital: float, variant: str = "B",
@@ -472,7 +592,13 @@ def run_squeeze_kdj_capital_constrained_backtest(price_data: dict, universe: dic
                                                    atr_period: int = 14,
                                                    max_hold_days: int = MAX_HOLD_DAYS_CAPITAL_CONSTRAINED_DEFAULT,
                                                    slippage_pct: float = 0.0,
-                                                   features_by_code: dict = None) -> list:
+                                                   features_by_code: dict = None,
+                                                   trailing_atr_mult: float = None,
+                                                   risk_pct_per_trade: float = None,
+                                                   ranking_rule: str = "trigger_return",
+                                                   entry_filter: str = None,
+                                                   return_diagnostics: bool = False,
+                                                   precomputed: dict = None):
     """
     擠壓+KDJ訊號的「資金/部位受限版」完整day-by-day walk-forward回測，只做多方
     (見模組docstring)。跟run_squeeze_kdj_exit_style_comparison()/
@@ -491,18 +617,28 @@ def run_squeeze_kdj_capital_constrained_backtest(price_data: dict, universe: dic
     PriorLow/觸發K棒的漲幅」，查表時直接查第d列，不必在迴圈裡手動做t/t+1的日期運算，
     也不會有lookahead(位移後的資料本來就只包含「昨天」的資訊)。
 
-    同一天多檔股票搶有限名額時怎麼排名(這是這個函式新增的判斷，不是原始驗證過的
-    進場規則的一部分)：
-    原始訊號(EntryFlag)是純0/1的旗標，不像momentum_breakout_engine那樣有一組加權
-    訊號分數可以排名。這裡刻意不發明一個跟原始訊號無關的排名公式，改用一個最貼近
-    「進場規則本身」、不需要新假設的簡單代理指標：觸發K棒當天(t日)本身的漲幅
-    (close_t / close_t-1 - 1)——進場規則第3條本來就要求「t日收紅」，這裡只是把
-    「收得有多紅」這個本來就已經算出來的資訊拿來排序，漲幅越大的候選排越前面，
-    不是引入新的、沒驗證過的邏輯。誠實聲明：這個排名規則本身完全沒有被驗證過
-    (不知道「觸發當天漲幅大」是不是真的代表訊號品質比較好)，只是在「資金有限、
-    必須選一個」的前提下，矮子裡挑將軍的務實選擇；原始驗證(PF=5.01/3.44)裡
-    每個訊號都被視為獨立可成交，根本不存在「選誰」這個問題，所以這個排名規則
-    在原始驗證結果裡完全沒有被驗證過，使用這個函式的人應該把這一點放在心上。
+    同一天多檔股票搶有限名額時怎麼排名(ranking_rule，這是這個函式新增的判斷，不是
+    原始驗證過的進場規則的一部分)：
+      "trigger_return"(預設，舊版唯一的行為)：觸發K棒當天(t日)本身的漲幅
+        (close_t / close_t-1 - 1)，漲幅越大越優先。原始訊號(EntryFlag)是純0/1的旗標，
+        不像momentum_breakout_engine那樣有一組加權訊號分數可以排名，這裡刻意不發明一個
+        跟原始訊號無關的排名公式，改用一個最貼近「進場規則本身」、不需要新假設的簡單代理
+        指標——進場規則第3條本來就要求「t日收紅」，這裡只是把「收得有多紅」拿來排序。
+      "volume_ratio"(網格搜尋新增)：觸發K棒當天的量比(t日成交量 / 含t日的20日均量)，
+        量比越大越優先，假設是「放量反轉比縮量反彈可信」。量比算不出來(NaN，例如沒有
+        Volume欄位或暖身期)的候選排在最後面，但不會被剔除——刻意讓兩種排名規則面對
+        「完全同一批候選」，只差在排序，比較起來才是蘋果比蘋果。
+    誠實聲明：兩種排名規則本身都完全沒有被驗證過(不知道「觸發當天漲幅大/量比大」是不是
+    真的代表訊號品質比較好)，只是在「資金有限、必須選一個」的前提下，矮子裡挑將軍的
+    務實選擇；原始驗證(PF=5.01/3.44)裡每個訊號都被視為獨立可成交，根本不存在「選誰」
+    這個問題，所以排名規則在原始驗證結果裡完全沒有被驗證過，使用這個函式的人應該把
+    這一點放在心上。
+
+    進場濾網(entry_filter，網格搜尋新增，預設None=不過濾，維持舊版行為)：
+      "above_ma60"：只放行觸發K棒當天(t日)收盤價 > 60日簡單均線的候選(同樣shift(1)對齊，
+        無lookahead；均線暖身期一律擋掉)。濾網在排名之前套用，被擋掉的候選不會佔用
+        排名/top_n的位置。這跟原始「抄底反彈」訊號的精神其實有點矛盾(跌破布林下軌的
+        股票多半不在季線上)，是網格裡「順大勢才抄底」這個假設的測試，不預設會比較好。
 
     出場規則(跟上面變體A/B完全一致，只是逐日判斷)：
       variant="B"：進場當下記錄的ATR(atr_period天，預設14天——對齊
@@ -511,6 +647,15 @@ def run_squeeze_kdj_capital_constrained_backtest(price_data: dict, universe: dic
         atr_period參數說明/呼叫端docstring)算出固定停損/停利價位，之後逐日
         重用mean_reversion_engine._process_mr_day()處理停損/停利/強制平倉/冷卻期，
         跟momentum_breakout_engine對非移動停利倉位的處理完全同構，不重新實作。
+      variant="B_trail"(網格搜尋新增)：進場當下ATR的atr_stop_mult倍當初始停損、不設
+        固定停利(target_price=None)，之後交給_process_mr_day()既有的移動停利機制
+        (mean_reversion_engine.update_trailing_stop()：用進場後最高收盤價當錨點、進場當下
+        固定的ATR乘trailing_atr_mult當距離，停損只往有利方向移)。部位的trailing_stop/
+        trailing_atr_mult/atr_entry/trailing_anchor(以及trailing_activation_days=0/
+        trailing_activation_profit_atr=0.0=立即啟動)欄位，逐字照
+        momentum_breakout_engine.try_enter_breakout()的設定方式，不重新發明。
+        trailing_atr_mult沒給時跟atr_stop_mult同一個值(跟try_enter_breakout()同一個慣例)；
+        atr_target_mult在這個變體被忽略。
       variant="A"：停損=觸發K棒前一根K棒的最低價(PriorLow，固定不動)；停利=K值
         曾經衝到>=80之後第一次跌破80那天的收盤價，這個repo兩個既有引擎都沒有這種
         「靠指標狀態出場」的機制，所以寫了_process_squeeze_kdj_variant_a_day()
@@ -519,6 +664,14 @@ def run_squeeze_kdj_capital_constrained_backtest(price_data: dict, universe: dic
     資金/部位管理(逐字鏡射momentum_breakout_engine.run_momentum_breakout_backtest()，
     不重新發明)：
       - max_concurrent_positions：同時最多持有幾個部位(不同標的)，預設3。
+      - 部位大小：預設固定lots口(舊版唯一的行為)。risk_pct_per_trade給定時改用風險預算
+        反推口數，公式逐字照momentum_breakout_engine.try_enter_breakout()：
+        口數 = int(帳戶權益 x risk_pct_per_trade // (停損距離 x 合約乘數))，
+        帳戶權益 = starting_capital + 到今天為止已實現的損益(每天進場前算一次，同一天
+        先進場、當天就出場的那筆不會回頭影響同一天後面候選的權益——跟
+        run_momentum_breakout_backtest()一樣)；停損距離：變體B/B_trail = atr_stop_mult x ATR，
+        變體A = 進場價 - PriorLow(<=0代表停損價在進場價之上，沒辦法反推口數，直接放棄)；
+        算出來 < 1口直接放棄這個候選(不硬凹成1口放大風險)。此時lots參數被忽略。
       - 單筆保證金上限：跟其他引擎一樣，不得超過starting_capital的
         DEFAULT_MARGIN_CAP_RATIO(35%)。
       - 整體保證金上限：max_concurrent_positions > 1時，自動抓
@@ -545,150 +698,196 @@ def run_squeeze_kdj_capital_constrained_backtest(price_data: dict, universe: dic
     這個函式交易的是個股(透過股票期貨)，不是台指期貨本身，沒有對應的結算日強制
     平倉需求，加這個濾網是張冠李戴。
 
-    features_by_code：外部預先算好時直接傳入(見precompute_squeeze_kdj_features_by_code()，
-    IS/OOS兩次呼叫共用同一份)，沒給時這裡自己算一次。
+    效能(預先計算，見precompute_squeeze_kdj_backtest_arrays())：舊版在逐日迴圈裡對每檔
+    股票每天做df.loc查表，網格搜尋上千次回測跑不完；這一版把所有跟「這次回測的資金管理
+    參數」無關的東西一次算好(precomputed)，逐日迴圈只碰「目前持倉」跟「今天有觸發的那
+    幾檔」。用預設參數呼叫時，產生的交易跟重構之前完全相同(test_squeeze_kdj_signal.py
+    有一組凍結的舊版實作逐筆比對)。
+      features_by_code：外部預先算好時直接傳入(見precompute_squeeze_kdj_features_by_code()，
+        IS/OOS兩次呼叫共用同一份)，沒給時這裡自己算一次。
+      precomputed：外部預先用precompute_squeeze_kdj_backtest_arrays()算好時直接傳入(網格
+        搜尋上千次回測共用同一份)；沒給時這裡用features_by_code自己算一次。傳入的
+        precomputed其ATR期數必須等於atr_period，不一致直接報錯(避免默默用錯ATR)。
 
-    回傳：trades list，每筆trade dict的形狀跟mean_reversion_engine._close_mr_trade()
-    產生的完全一樣(code/side/entry_date/exit_date/e_price/exit_price/exit_reason/
-    lots/pnl_ntd/return_pct/hold_days)，可以直接餵summarize_mr()/bootstrap_resample_pnl()。
+    return_diagnostics：預設False，回傳值維持舊版的trades list；True時改回傳
+    (trades, diagnostics)，diagnostics是CAPITAL_CONSTRAINED_DIAGNOSTIC_KEYS這幾個計數器
+    (每個「候選-日」最多只會被記在其中一個「略過原因」底下，成功進場的不記)，用來回答
+    「到底是名額不夠、保證金不夠、還是風險口數不夠，讓訊號沒有變成交易」。
+
+    回傳：trades list(或見return_diagnostics)，每筆trade dict的形狀跟
+    mean_reversion_engine._close_mr_trade()產生的完全一樣(code/side/entry_date/exit_date/
+    e_price/exit_price/exit_reason/lots/pnl_ntd/return_pct/hold_days)，可以直接餵
+    summarize_mr()/bootstrap_resample_pnl()。
     """
-    if variant not in ("A", "B"):
-        raise ValueError(f"variant必須是'A'或'B'，收到{variant!r}")
+    if variant not in VALID_CAPITAL_CONSTRAINED_VARIANTS:
+        raise ValueError(f"variant必須是{VALID_CAPITAL_CONSTRAINED_VARIANTS}其中之一，收到{variant!r}")
+    if ranking_rule not in VALID_RANKING_RULES:
+        raise ValueError(f"ranking_rule必須是{VALID_RANKING_RULES}其中之一，收到{ranking_rule!r}")
+    if entry_filter not in VALID_ENTRY_FILTERS:
+        raise ValueError(f"entry_filter必須是{VALID_ENTRY_FILTERS}其中之一，收到{entry_filter!r}")
 
-    if features_by_code is None:
-        features_by_code = precompute_squeeze_kdj_features_by_code(price_data, universe)
+    if precomputed is None:
+        if features_by_code is None:
+            features_by_code = precompute_squeeze_kdj_features_by_code(price_data, universe)
+        precomputed = precompute_squeeze_kdj_backtest_arrays(price_data, features_by_code, atr_period=atr_period)
+    elif precomputed["atr_period"] != atr_period:
+        raise ValueError(f"precomputed的ATR期數({precomputed['atr_period']})跟atr_period({atr_period})不一致")
 
-    # 逐碼預先算好「查表版」的進場訊號(已經shift(1)對齊成「今天能不能進場」)，
-    # 避免在day-by-day迴圈裡對每個日期重複做t/t+1的日期運算。
-    entry_by_code = {}
-    atr_by_code = {}
-    for code, features in features_by_code.items():
-        df = price_data.get(code)
-        if df is None:
-            continue
-        close = df["Close"]
-        trigger_return = (close / close.shift(1) - 1)  # t日(觸發K棒)本身的漲幅，排名用
-        entry_by_code[code] = pd.DataFrame({
-            "EntryToday": features["EntryFlag"].shift(1).fillna(False).astype(bool),
-            "StopPriceA": features["PriorLow"].shift(1),
-            "TriggerStrength": trigger_return.shift(1),
-        }, index=df.index)
-        if variant == "B":
-            atr_by_code[code] = compute_atr_correct(df, period=atr_period).shift(1)
+    per_code = precomputed["per_code"]
+    events_by_date = precomputed["events_by_date"]
+    uses_atr = variant in ("B", "B_trail")
+    trail_mult = trailing_atr_mult if trailing_atr_mult is not None else atr_stop_mult
+    rank_key_name = "trigger_strength" if ranking_rule == "trigger_return" else "volume_ratio"
 
     effective_total_margin_cap_ratio = None
     if max_concurrent_positions > 1:
         effective_total_margin_cap_ratio = min(DEFAULT_MARGIN_CAP_RATIO * max_concurrent_positions, 0.9)
+    single_margin_cap = starting_capital * DEFAULT_MARGIN_CAP_RATIO
 
+    diag = dict.fromkeys(CAPITAL_CONSTRAINED_DIAGNOSTIC_KEYS, 0)
     trades = []
     cooldown_until = {}
     open_positions = []
 
+    def _process_day(position, arrs, i, date):
+        row = _row_at(arrs, i)
+        if variant == "A":
+            return _process_squeeze_kdj_variant_a_day(position, row, arrs["k"][i], date, trades,
+                                                       max_hold_days, cooldown_until,
+                                                       slippage_pct=slippage_pct)
+        return _process_mr_day(position, row, date, trades, max_hold_days, cooldown_until,
+                               slippage_pct=slippage_pct)
+
     for date in master_calendar:
         # 1) 先處理既有部位的出場判定
-        still_open = []
-        for position in open_positions:
-            df = price_data.get(position["code"])
-            if df is None or date not in df.index:
-                still_open.append(position)
-                continue
-            if date != position["entry_date"]:
-                position["hold_days"] += 1
-            row = df.loc[date]
-            if variant == "B":
-                updated = _process_mr_day(position, row, date, trades, max_hold_days, cooldown_until,
-                                           slippage_pct=slippage_pct)
-            else:
-                k_series = features_by_code[position["code"]]["K"]
-                k_today = k_series.loc[date] if date in k_series.index else np.nan
-                updated = _process_squeeze_kdj_variant_a_day(position, row, k_today, date, trades,
-                                                               max_hold_days, cooldown_until,
-                                                               slippage_pct=slippage_pct)
-            if updated is not None:
-                still_open.append(updated)
-        open_positions = still_open
+        if open_positions:
+            still_open = []
+            for position in open_positions:
+                arrs = per_code[position["code"]]
+                i = arrs["date_to_idx"].get(date)
+                if i is None:
+                    still_open.append(position)
+                    continue
+                if date != position["entry_date"]:
+                    position["hold_days"] += 1
+                updated = _process_day(position, arrs, i, date)
+                if updated is not None:
+                    still_open.append(updated)
+            open_positions = still_open
 
-        # 2) 收集今天觸發進場的候選，依「觸發K棒當天漲幅」排名，依序補進空出來的名額
-        held_codes = {p["code"] for p in open_positions}
-        excluded_codes = {c for c, until in cooldown_until.items() if date < until} | held_codes
-        slots_available = max_concurrent_positions - len(open_positions)
-        if slots_available <= 0:
+        # 2) 收集今天觸發進場的候選(只看事件表裡今天有觸發的那幾檔)，依ranking_rule排名，
+        #    依序補進空出來的名額
+        events = events_by_date.get(date)
+        if not events:
             continue
 
+        held_codes = {p["code"] for p in open_positions}
         candidates = []
-        for code, sig_df in entry_by_code.items():
-            if code in excluded_codes:
+        for code, i in events:
+            if code in held_codes:
                 continue
-            if date not in sig_df.index:
+            until = cooldown_until.get(code)
+            if until is not None and date < until:
                 continue
-            sig_row = sig_df.loc[date]
-            if not bool(sig_row["EntryToday"]):
+            diag["candidates_total"] += 1
+            arrs = per_code[code]
+            if entry_filter == "above_ma60" and not arrs["above_ma60"][i]:
+                diag["skipped_entry_filter"] += 1
                 continue
-            if pd.isna(sig_row["TriggerStrength"]):
-                continue
-            df = price_data.get(code)
-            if df is None or date not in df.index:
-                continue
-            candidates.append({
-                "code": code,
-                "stop_price_a": sig_row["StopPriceA"],
-                "trigger_strength": float(sig_row["TriggerStrength"]),
-            })
+            rank_value = arrs[rank_key_name][i]
+            if np.isnan(rank_value):
+                rank_value = -np.inf  # 只有volume_ratio可能是NaN(trigger_strength是NaN的事件早就被排除)
+            candidates.append((code, i, float(rank_value)))
 
-        candidates.sort(key=lambda c: c["trigger_strength"], reverse=True)
-        candidates = candidates[: max(top_n, slots_available)]
+        slots_available = max_concurrent_positions - len(open_positions)
+        if slots_available <= 0:
+            diag["skipped_no_slot"] += len(candidates)
+            continue
+        if not candidates:
+            continue
+
+        # Python的sort是穩定排序(reverse=True也一樣)，同分時維持事件表的順序，跟舊版一致
+        candidates.sort(key=lambda c: c[2], reverse=True)
+        cut = max(top_n, slots_available)
+        diag["skipped_no_slot"] += max(len(candidates) - cut, 0)
+        candidates = candidates[:cut]
 
         used_margin = sum(p["margin_used"] for p in open_positions)
+        equity = None
+        if risk_pct_per_trade is not None:
+            equity = starting_capital + sum(t["pnl_ntd"] for t in trades)
+
         while slots_available > 0 and candidates:
-            cand = candidates.pop(0)
-            code = cand["code"]
-            df = price_data[code]
-            open_p = df.loc[date, "Open"]
+            code, i, _ = candidates.pop(0)
+            arrs = per_code[code]
+            open_p = arrs["open"][i]
             e_price = open_p * (1 + slippage_pct)
 
-            if variant == "B":
-                atr_at_signal = atr_by_code[code].loc[date] if date in atr_by_code[code].index else np.nan
-                if pd.isna(atr_at_signal) or atr_at_signal <= 0:
+            if uses_atr:
+                atr_at_signal = arrs["atr"][i]
+                if np.isnan(atr_at_signal) or atr_at_signal <= 0:
+                    diag["skipped_invalid_stop"] += 1
                     continue
                 stop_price = e_price - atr_stop_mult * atr_at_signal
-                target_price = e_price + atr_target_mult * atr_at_signal
+                target_price = e_price + atr_target_mult * atr_at_signal if variant == "B" else None
+                stop_distance = atr_stop_mult * atr_at_signal
             else:
-                stop_price = cand["stop_price_a"]
-                if pd.isna(stop_price):
+                stop_price = arrs["stop_a"][i]
+                if np.isnan(stop_price):
+                    diag["skipped_invalid_stop"] += 1
                     continue
                 target_price = None  # 變體A的停利靠target_armed狀態判定，不是固定價位
+                stop_distance = e_price - stop_price
 
-            margin_needed = estimate_margin(code, open_p, lots)
-            if margin_needed > starting_capital * DEFAULT_MARGIN_CAP_RATIO:
+            lots_to_use = lots
+            if risk_pct_per_trade is not None:
+                mult = get_contract_multiplier(code, open_p)
+                if stop_distance <= 0 or mult <= 0:
+                    diag["skipped_invalid_stop"] += 1
+                    continue
+                computed_lots = int(equity * risk_pct_per_trade // (stop_distance * mult))
+                if computed_lots < 1:
+                    diag["skipped_risk_lots_lt1"] += 1
+                    continue
+                lots_to_use = computed_lots
+
+            margin_needed = estimate_margin(code, open_p, lots_to_use)
+            if margin_needed > single_margin_cap:
+                diag["skipped_single_margin_cap"] += 1
                 continue
             if effective_total_margin_cap_ratio is not None and \
                     used_margin + margin_needed > starting_capital * effective_total_margin_cap_ratio:
+                diag["skipped_total_margin_cap"] += 1
                 continue
 
             position = {
                 "code": code, "side": "long", "entry_date": date,
                 "e_price": e_price, "target_price": target_price, "stop_price": stop_price,
-                "lots": lots, "hold_days": 1, "margin_used": margin_needed,
+                "lots": lots_to_use, "hold_days": 1, "margin_used": margin_needed,
             }
             if variant == "A":
                 position["target_armed"] = False
+            elif variant == "B_trail":
+                # 逐字照momentum_breakout_engine.try_enter_breakout()的移動停利欄位設定
+                position["breakeven_after_profit"] = False
+                position["trailing_stop"] = True
+                position["trailing_atr_mult"] = trail_mult
+                position["atr_entry"] = atr_at_signal
+                position["trailing_anchor"] = e_price
+                position["trailing_activation_days"] = 0
+                position["trailing_activation_profit_atr"] = 0.0
 
             used_margin += margin_needed
             slots_available -= 1
 
-            row = df.loc[date]
-            if variant == "B":
-                updated = _process_mr_day(position, row, date, trades, max_hold_days, cooldown_until,
-                                           slippage_pct=slippage_pct)
-            else:
-                k_series = features_by_code[code]["K"]
-                k_today = k_series.loc[date] if date in k_series.index else np.nan
-                updated = _process_squeeze_kdj_variant_a_day(position, row, k_today, date, trades,
-                                                               max_hold_days, cooldown_until,
-                                                               slippage_pct=slippage_pct)
+            updated = _process_day(position, arrs, i, date)
             if updated is not None:
                 open_positions.append(updated)
             else:
                 used_margin -= margin_needed
 
+        diag["skipped_no_slot"] += len(candidates)
+
+    if return_diagnostics:
+        return trades, diag
     return trades

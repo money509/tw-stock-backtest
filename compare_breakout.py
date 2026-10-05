@@ -130,6 +130,7 @@ compare_breakout.py
     python3 compare_breakout.py --use-trailing-stop --max-concurrent-positions 3 \\
         --risk-pct-per-trade 0.02 --slippage-pct 0.002 --multi-period-test
     python3 compare_breakout.py --use-trailing-stop --walkforward-folds 3
+    python3 compare_breakout.py --squeeze-kdj-grid --max-stocks 50   # squeeze+KDJ混搭網格(1440組，只用IS選贏家)
 
 ⚠️ 誠實揭露：跟 mean_reversion_engine.py 共用的已知限制(結算日近似、大盤氛圍濾網用0050
 代理、跌停鎖死/注意股處置股未實作、倖存者偏差、保證金追繳/強制斷頭沒有完整模擬)在這裡
@@ -139,6 +140,7 @@ import argparse
 import datetime
 import os
 
+import numpy as np
 import pandas as pd
 
 from data_loader import load_price_data
@@ -155,6 +157,7 @@ from taifex_universe import get_contract_multiplier
 from squeeze_kdj_signal import (
     compute_squeeze_kdj_features, simulate_variant_a_trades, simulate_variant_b_trades,
     precompute_squeeze_kdj_features_by_code, run_squeeze_kdj_capital_constrained_backtest,
+    precompute_squeeze_kdj_backtest_arrays, CAPITAL_CONSTRAINED_DIAGNOSTIC_KEYS,
 )
 
 RESULTS_DIR = os.path.join(os.path.dirname(__file__), "results_breakout")
@@ -1175,6 +1178,553 @@ def run_squeeze_kdj_capital_constrained_mode(args, price_data, universe, is_cale
     print(f"\n已輸出：{summary_path}")
 
 
+# ============================================================================
+# --squeeze-kdj-grid：squeeze+KDJ資金受限版「風控 x 交易管理 x 進場方式」混搭網格搜尋
+#
+# 方法論(使用者/維護者事先定好、不可以事後改的規則，這是整個模式存在的意義)：
+#   1. 網格只在樣本內(IS) calendar上跑、只用IS的數字挑贏家：選拔指標=IS獲利因子(PF)，
+#      只有IS交易筆數>=SQUEEZE_KDJ_GRID_MIN_IS_TRADES(30)筆的組合有資格被選(筆數不夠的
+#      組合照樣列在報告裡，只是不能當贏家)；同PF時比IS總損益，再同分時比組合編號(純粹
+#      為了結果可重現，不代表任何偏好)。
+#   2. 選出的「唯一一個」IS贏家，才拿去OOS跑一次+bootstrap(1000次、seed=42，跟
+#      evaluate_combo()同一套欄位/慣例)，這是報告裡唯一能當「誠實頭條數字」的結果。
+#   3. 另外列出IS前10名在OOS的PF，並算「全部有資格組合」IS PF跟OOS PF的Spearman排名相關，
+#      回答「IS排名到底有沒有轉移到OOS」。
+#   4. 每一組都在OOS跑一次，但只報告分布(幾組、OOS PF>1的比例、中位數/25%/75%分位數)，
+#      當作參數穩健性檢查——刻意不印「OOS最好的組合」，因為從OOS挑最好的等於拿OOS做選擇，
+#      OOS就不再是樣本外了。
+#   5. 醒目印出總共測了幾組+白話的多重比較警告。
+#   6. 註明OOS之前已經被看過一次(上一輪預設設定的--squeeze-kdj-capital-constrained結果)，
+#      不是完全沒碰過的處女資料。
+# 實作上刻意「先把全部組合的IS跑完、選出贏家，才開始跑OOS」，讓「選拔只看IS」這件事
+# 在程式結構上就成立，不是靠自律。
+# ============================================================================
+
+SQUEEZE_KDJ_GRID_MIN_IS_TRADES = 30
+SQUEEZE_KDJ_GRID_TOP_N = 3          # 不是網格維度，固定沿用資金受限版的預設值(見build_squeeze_kdj_grid_combos)
+SQUEEZE_KDJ_GRID_ATR_PERIOD = 14    # 同上，固定沿用compare_breakout.py呼叫變體B時一貫的14天ATR
+SQUEEZE_KDJ_GRID_TOP_K_REPORT = 10
+SQUEEZE_KDJ_BOOTSTRAP_PASS_PCT_POSITIVE = 80.0  # 專案門檻：bootstrap正報酬比例 > 80%
+SQUEEZE_KDJ_BOOTSTRAP_PASS_P_VALUE = 0.2        # 專案門檻：p值 < 0.2
+
+# 出場配置(10組)：變體A 1組 + 變體B固定ATR停損/停利 3x2=6組 + 變體B移動停利 3組
+SQUEEZE_KDJ_GRID_EXIT_CONFIGS = (
+    [{"variant": "A", "atr_stop_mult": None, "atr_target_mult": None, "trailing_atr_mult": None}]
+    + [{"variant": "B", "atr_stop_mult": s, "atr_target_mult": t, "trailing_atr_mult": None}
+       for s in (1.0, 1.5, 2.0) for t in (2.0, 3.0)]
+    + [{"variant": "B_trail", "atr_stop_mult": m, "atr_target_mult": None, "trailing_atr_mult": m}
+       for m in (1.5, 2.0, 3.0)]
+)
+SQUEEZE_KDJ_GRID_MAX_CONCURRENT_POSITIONS = (1, 3, 5)
+# 部位大小：(固定口數, 每筆風險比例)，兩者擇一
+SQUEEZE_KDJ_GRID_SIZING = ((1, None), (2, None), (None, 0.01), (None, 0.02))
+SQUEEZE_KDJ_GRID_MAX_HOLD_DAYS = (10, 20, 60)
+SQUEEZE_KDJ_GRID_RANKING_RULES = ("trigger_return", "volume_ratio")
+SQUEEZE_KDJ_GRID_ENTRY_FILTERS = (None, "above_ma60")
+
+SQUEEZE_KDJ_RANKING_RULE_LABELS = {
+    "trigger_return": "觸發K棒當天漲幅",
+    "volume_ratio": "觸發K棒當天量比(當日量/20日均量)",
+}
+SQUEEZE_KDJ_ENTRY_FILTER_LABELS = {None: "無", "above_ma60": "觸發K棒收盤站上60日均線"}
+
+# 上一輪真實GitHub Actions執行--squeeze-kdj-capital-constrained(預設設定：
+# max_concurrent_positions=3、固定2口、最長60天、觸發K棒漲幅排名、無濾網、起始資金NT$200k、
+# max_stocks=50)的結果，寫死在這裡純粹是為了讓網格模式的summary能跟「這次網格之前就已經
+# 看過的OOS數字」做誠實對照(也是「OOS已經被看過一次」那句註記的依據)。跟
+# SQUEEZE_KDJ_UNCONSTRAINED_OOS_REFERENCE一樣，條件改變時這裡應該跟著更新。
+SQUEEZE_KDJ_CAPITAL_CONSTRAINED_DEFAULT_REFERENCE = {
+    "A": {"is_pf": 0.93, "is_trades": 59, "oos_pf": 0.75, "oos_trades": 25,
+          "pct_positive": 29.1, "p_value": 0.709},
+    "B": {"is_pf": 0.84, "is_trades": 69, "oos_pf": 1.49, "oos_trades": 34,
+          "pct_positive": 78.7, "p_value": 0.213},
+}
+
+# summarize_mr()裡要帶進網格表的統計量
+SQUEEZE_KDJ_GRID_STAT_KEYS = (
+    "trade_count", "profit_factor", "win_rate", "total_pnl_ntd", "max_drawdown_ntd",
+    "avg_hold_days", "max_consecutive_losses", "pnl_excluding_top3_ntd",
+)
+
+
+def build_squeeze_kdj_grid_combos() -> list:
+    """
+    產生--squeeze-kdj-grid要測的全部參數組合：出場配置10組 x 最大持倉數3種 x 部位大小4種
+    x 最長持有天數3種 x 同日排名規則2種 x 進場濾網2種 = 1440組，每組一個dict，
+    combo_id從1開始連號(只是編號，不代表任何順序上的偏好)。
+
+    刻意「不是」網格維度的東西(見各常數說明)：
+      - starting_capital：使用者真實帳戶規模(--starting-capital)，不是拿來調到回測好看的參數。
+      - top_n：固定3(資金受限版預設)，實際排名截斷是max(top_n, 空出的名額)，
+        max_concurrent_positions=5時自動放寬到5，不需要另外搜尋。
+      - atr_period：固定14天。
+    變體B_trail的初始停損倍數 = 移動停利倍數(同一個值)，見SQUEEZE_KDJ_GRID_EXIT_CONFIGS。
+    """
+    combos = []
+    for exit_cfg in SQUEEZE_KDJ_GRID_EXIT_CONFIGS:
+        for mcp in SQUEEZE_KDJ_GRID_MAX_CONCURRENT_POSITIONS:
+            for lots, risk_pct in SQUEEZE_KDJ_GRID_SIZING:
+                for hold in SQUEEZE_KDJ_GRID_MAX_HOLD_DAYS:
+                    for ranking in SQUEEZE_KDJ_GRID_RANKING_RULES:
+                        for entry_filter in SQUEEZE_KDJ_GRID_ENTRY_FILTERS:
+                            combos.append({
+                                "combo_id": len(combos) + 1,
+                                **exit_cfg,
+                                "max_concurrent_positions": mcp,
+                                "lots": lots, "risk_pct_per_trade": risk_pct,
+                                "max_hold_days": hold,
+                                "ranking_rule": ranking, "entry_filter": entry_filter,
+                            })
+    return combos
+
+
+def squeeze_kdj_grid_combo_to_backtest_kwargs(combo: dict) -> dict:
+    """把一組網格參數轉成run_squeeze_kdj_capital_constrained_backtest()的關鍵字參數。
+    變體A不傳ATR倍數(用不到)；變體B傳停損/停利倍數；變體B_trail傳停損/移動停利倍數；
+    風險預算部位時不傳lots(函式內部會改用風險預算反推口數，lots被忽略)。"""
+    kwargs = {
+        "variant": combo["variant"], "max_concurrent_positions": combo["max_concurrent_positions"],
+        "max_hold_days": combo["max_hold_days"], "ranking_rule": combo["ranking_rule"],
+        "entry_filter": combo["entry_filter"], "top_n": SQUEEZE_KDJ_GRID_TOP_N,
+        "atr_period": SQUEEZE_KDJ_GRID_ATR_PERIOD,
+    }
+    if combo["variant"] == "B":
+        kwargs["atr_stop_mult"] = combo["atr_stop_mult"]
+        kwargs["atr_target_mult"] = combo["atr_target_mult"]
+    elif combo["variant"] == "B_trail":
+        kwargs["atr_stop_mult"] = combo["atr_stop_mult"]
+        kwargs["trailing_atr_mult"] = combo["trailing_atr_mult"]
+    if combo["risk_pct_per_trade"] is not None:
+        kwargs["risk_pct_per_trade"] = combo["risk_pct_per_trade"]
+    else:
+        kwargs["lots"] = combo["lots"]
+    return kwargs
+
+
+def _describe_squeeze_kdj_exit(combo: dict) -> str:
+    if combo["variant"] == "A":
+        return "變體A(停損=觸發K棒前一根低點；停利=K衝上80後再跌破80)"
+    if combo["variant"] == "B":
+        return f"變體B固定ATR(停損{combo['atr_stop_mult']:.1f}倍ATR／停利{combo['atr_target_mult']:.1f}倍ATR)"
+    return f"變體B移動停利(初始停損與移動停利都是{combo['trailing_atr_mult']:.1f}倍ATR，不設固定停利)"
+
+
+def _describe_squeeze_kdj_sizing(combo: dict) -> str:
+    # combo可能來自DataFrame的一列，None會變成NaN，所以用pd.notna判斷
+    if pd.notna(combo["risk_pct_per_trade"]):
+        return f"風險預算：每筆最多賠帳戶權益的{combo['risk_pct_per_trade'] * 100:.0f}%(口數依停損距離反推)"
+    return f"固定{int(combo['lots'])}口"
+
+
+def describe_squeeze_kdj_grid_combo(combo: dict) -> str:
+    """一組網格參數的白話中文說明(summary.txt/CSV共用)。"""
+    return (f"出場：{_describe_squeeze_kdj_exit(combo)}｜最多同時持有{combo['max_concurrent_positions']}檔"
+            f"｜部位：{_describe_squeeze_kdj_sizing(combo)}｜最長持有{combo['max_hold_days']}天"
+            f"｜同日多檔排名：{SQUEEZE_KDJ_RANKING_RULE_LABELS[combo['ranking_rule']]}"
+            f"｜進場濾網：{SQUEEZE_KDJ_ENTRY_FILTER_LABELS[_entry_filter_key(combo['entry_filter'])]}")
+
+
+def _entry_filter_key(value):
+    """DataFrame裡的None可能變成NaN，統一還原成None才能查SQUEEZE_KDJ_ENTRY_FILTER_LABELS。"""
+    return value if isinstance(value, str) else None
+
+
+def rank_squeeze_kdj_grid_on_is(df: pd.DataFrame, min_is_trades: int = SQUEEZE_KDJ_GRID_MIN_IS_TRADES) -> pd.DataFrame:
+    """
+    只看IS欄位，幫每一組標上eligible(IS筆數>=min_is_trades)跟is_rank(只有eligible的組合
+    才有名次，1=最好)。排序：IS PF由高到低 → IS總損益由高到低 → combo_id由小到大(最後這個
+    只是讓同分時結果可重現)。這個函式刻意只讀is_開頭的欄位，就算df裡已經有oos_欄位也
+    不會影響排名(測試會驗證這一點)。
+    """
+    df = df.copy()
+    df["eligible"] = df["is_trade_count"] >= min_is_trades
+    eligible = df[df["eligible"]].sort_values(
+        ["is_profit_factor", "is_total_pnl_ntd", "combo_id"], ascending=[False, False, True],
+    )
+    df["is_rank"] = np.nan
+    df.loc[eligible.index, "is_rank"] = np.arange(1, len(eligible) + 1)
+    return df
+
+
+def select_squeeze_kdj_grid_winner(df: pd.DataFrame):
+    """回傳is_rank==1那一組的combo_id；沒有任何組合符合IS筆數門檻時回傳None。"""
+    winners = df[df["is_rank"] == 1]
+    if winners.empty:
+        return None
+    return int(winners.iloc[0]["combo_id"])
+
+
+def _spearman_is_vs_oos_pf(df: pd.DataFrame) -> dict:
+    """全部「有資格」組合的IS PF vs OOS PF Spearman排名相關。scipy有裝就用
+    scipy.stats.spearmanr，沒有就退回pandas的.corr(method="spearman")。PF=∞
+    (只賺不賠)在排名上就是最大值，排名相關不受影響；少於3組或其中一邊完全沒有變異時
+    回傳NaN。"""
+    sub = df[df["eligible"]]
+    n = len(sub)
+    if n < 3:
+        return {"rho": float("nan"), "n": n, "method": "n<3，無法計算"}
+    is_pf = sub["is_profit_factor"].astype(float)
+    oos_pf = sub["oos_profit_factor"].astype(float)
+    if is_pf.nunique() < 2 or oos_pf.nunique() < 2:
+        return {"rho": float("nan"), "n": n, "method": "PF沒有變異，無法計算"}
+    try:
+        from scipy.stats import spearmanr
+        rho = float(spearmanr(is_pf.to_numpy(), oos_pf.to_numpy()).correlation)
+        method = "scipy.stats.spearmanr"
+    except ImportError:
+        rho = float(is_pf.corr(oos_pf, method="spearman"))
+        method = "pandas .corr(method='spearman')"
+    return {"rho": rho, "n": n, "method": method}
+
+
+def _interpret_spearman(rho: float) -> str:
+    if rho is None or np.isnan(rho):
+        return "無法計算(有資格的組合太少，或PF完全沒有變異)，沒辦法判斷IS排名有沒有轉移到OOS"
+    if rho <= 0.1:
+        return ("≈0或負相關：IS排名幾乎沒有轉移到OOS——IS上表現好的參數，到OOS並沒有比較好，"
+                "IS選出來的「最佳」設定很可能只是雜訊")
+    if rho < 0.3:
+        return "弱正相關：IS排名只有很微弱地轉移到OOS，IS選出來的「最佳」設定仍有很大成分是雜訊"
+    return ("中度以上正相關：IS表現好的參數區域在OOS也傾向比較好，參數之間的差異有一部分可能是真的；"
+            "但這不保證IS贏家本身在OOS一定好，仍以上面IS贏家的OOS+bootstrap為準")
+
+
+def _oos_pf_distribution(df: pd.DataFrame) -> dict:
+    """全部組合OOS PF的分布(參數穩健性檢查用，不是拿來挑組合)。PF=∞先換成一個很大的
+    有限數再算分位數(避免∞-∞變成NaN)，算完如果分位數落在那個值就還原成∞。"""
+    pf = df["oos_profit_factor"].astype(float).to_numpy()
+    n = len(pf)
+    if n == 0:
+        return {"count": 0, "pct_pf_gt_1": 0.0, "median": float("nan"), "p25": float("nan"),
+                "p75": float("nan"), "zero_trade_count": 0}
+    sentinel = 1e9
+    finite = np.where(np.isinf(pf), sentinel, pf)
+
+    def _q(q):
+        v = float(np.percentile(finite, q))
+        return float("inf") if v >= sentinel else v
+
+    return {
+        "count": n,
+        "pct_pf_gt_1": float((pf > 1.0).mean() * 100),
+        "median": _q(50), "p25": _q(25), "p75": _q(75),
+        "zero_trade_count": int((df["oos_trade_count"] == 0).sum()),
+    }
+
+
+def run_squeeze_kdj_grid_search(price_data: dict, universe: dict, starting_capital: float,
+                                 is_calendar, oos_calendar, combos: list = None,
+                                 min_is_trades: int = SQUEEZE_KDJ_GRID_MIN_IS_TRADES,
+                                 progress_every: int = 0) -> dict:
+    """
+    --squeeze-kdj-grid的核心：照上方區塊註解的方法論，跑完整個網格，回傳一個dict：
+      "combos_df"：每組一列(參數、IS/OOS統計、IS/OOS診斷計數器、eligible、is_rank)，
+                   欄位是英文key(寫CSV時才翻成中文，見SQUEEZE_KDJ_GRID_CSV_COLUMNS_ZH)
+      "n_combos"：總共測了幾組
+      "winner_id"/"winner"：IS贏家的combo_id，以及{"combo", "label", "IS", "OOS",
+                   "bootstrap", "oos_trades", "is_diagnostics", "oos_diagnostics"}
+                   (沒有任何組合符合IS筆數門檻時兩者都是None)
+      "spearman"：全部有資格組合IS PF vs OOS PF的Spearman排名相關
+      "oos_distribution"：全部組合OOS PF的分布
+    執行順序刻意是「全部組合先跑IS → 只用IS選出贏家 → 才開始跑OOS」，讓「OOS數字不可能
+    影響選拔」這件事在程式結構上就成立。
+
+    效能：BB/KC/KDJ狀態機(precompute_squeeze_kdj_features_by_code)跟回測要查的陣列/事件表
+    (precompute_squeeze_kdj_backtest_arrays)都只算一次，2880次回測(1440組 x IS/OOS)共用。
+
+    combos：預設build_squeeze_kdj_grid_combos()的完整1440組；測試時可以傳較小的清單。
+    """
+    combos = combos if combos is not None else build_squeeze_kdj_grid_combos()
+    features_by_code = precompute_squeeze_kdj_features_by_code(price_data, universe)
+    precomputed = precompute_squeeze_kdj_backtest_arrays(
+        price_data, features_by_code, atr_period=SQUEEZE_KDJ_GRID_ATR_PERIOD,
+    )
+
+    def _run(combo, calendar):
+        return run_squeeze_kdj_capital_constrained_backtest(
+            price_data=price_data, universe=universe, master_calendar=calendar,
+            starting_capital=starting_capital, features_by_code=features_by_code,
+            precomputed=precomputed, return_diagnostics=True,
+            **squeeze_kdj_grid_combo_to_backtest_kwargs(combo),
+        )
+
+    # ---- 第一階段：全部組合只跑IS ----
+    rows = []
+    is_stats_by_id = {}
+    is_diag_by_id = {}
+    for n_done, combo in enumerate(combos, start=1):
+        trades, diag = _run(combo, is_calendar)
+        stats = summarize_mr(trades, starting_capital)
+        is_stats_by_id[combo["combo_id"]] = stats
+        is_diag_by_id[combo["combo_id"]] = diag
+        rows.append({
+            **combo,
+            **{f"is_{k}": stats[k] for k in SQUEEZE_KDJ_GRID_STAT_KEYS},
+            **{f"is_diag_{k}": diag[k] for k in CAPITAL_CONSTRAINED_DIAGNOSTIC_KEYS},
+        })
+        if progress_every and n_done % progress_every == 0:
+            print(f"  [IS] 已完成 {n_done}/{len(combos)} 組", flush=True)
+
+    df = rank_squeeze_kdj_grid_on_is(pd.DataFrame(rows), min_is_trades=min_is_trades)
+    winner_id = select_squeeze_kdj_grid_winner(df)  # ← 選拔到這裡就定案，下面才開始碰OOS
+
+    # ---- 第二階段：全部組合跑OOS(只拿來做分布/排名轉移檢查，不參與選拔) ----
+    oos_cols = {f"oos_{k}": [] for k in SQUEEZE_KDJ_GRID_STAT_KEYS}
+    oos_cols.update({f"oos_diag_{k}": [] for k in CAPITAL_CONSTRAINED_DIAGNOSTIC_KEYS})
+    winner_oos = None
+    combo_by_id = {c["combo_id"]: c for c in combos}
+    for n_done, combo_id in enumerate(df["combo_id"], start=1):
+        combo = combo_by_id[int(combo_id)]
+        trades, diag = _run(combo, oos_calendar)
+        stats = summarize_mr(trades, starting_capital)
+        for k in SQUEEZE_KDJ_GRID_STAT_KEYS:
+            oos_cols[f"oos_{k}"].append(stats[k])
+        for k in CAPITAL_CONSTRAINED_DIAGNOSTIC_KEYS:
+            oos_cols[f"oos_diag_{k}"].append(diag[k])
+        if winner_id is not None and int(combo_id) == winner_id:
+            winner_oos = (trades, stats, diag)
+        if progress_every and n_done % progress_every == 0:
+            print(f"  [OOS] 已完成 {n_done}/{len(combos)} 組", flush=True)
+    for col, values in oos_cols.items():
+        df[col] = values
+
+    winner = None
+    if winner_id is not None:
+        oos_trades, oos_stats, oos_diag = winner_oos
+        bootstrap_results = bootstrap_resample_pnl(oos_trades, n_resamples=1000, seed=42)
+        winner = {
+            "combo": combo_by_id[winner_id],
+            "label": describe_squeeze_kdj_grid_combo(combo_by_id[winner_id]),
+            "IS": is_stats_by_id[winner_id], "OOS": oos_stats,
+            "bootstrap": {
+                **summarize_bootstrap(bootstrap_results),
+                "p_value": bootstrap_p_value(bootstrap_results),
+                "pnl_excluding_top3_ntd": pnl_excluding_top_n_trades(oos_trades, n=3),
+            },
+            "oos_trades": oos_trades,
+            "is_diagnostics": is_diag_by_id[winner_id], "oos_diagnostics": oos_diag,
+        }
+
+    return {
+        "combos_df": df, "n_combos": len(combos), "winner_id": winner_id, "winner": winner,
+        "spearman": _spearman_is_vs_oos_pf(df), "oos_distribution": _oos_pf_distribution(df),
+        "min_is_trades": min_is_trades,
+    }
+
+
+SQUEEZE_KDJ_GRID_DIAG_LABELS_ZH = {
+    "candidates_total": "候選總數",
+    "skipped_entry_filter": "進場濾網擋掉",
+    "skipped_no_slot": "名額已滿沒輪到",
+    "skipped_invalid_stop": "停損價無效略過",
+    "skipped_risk_lots_lt1": "風險口數不足1口略過",
+    "skipped_single_margin_cap": "單筆保證金上限略過",
+    "skipped_total_margin_cap": "總保證金上限略過",
+}
+SQUEEZE_KDJ_GRID_STAT_LABELS_ZH = {
+    "trade_count": "交易筆數", "profit_factor": "獲利因子PF", "win_rate": "勝率(%)",
+    "total_pnl_ntd": "總損益(NT$)", "max_drawdown_ntd": "最大回撤(NT$)",
+    "avg_hold_days": "平均持有天數", "max_consecutive_losses": "最大連續虧損筆數",
+    "pnl_excluding_top3_ntd": "拿掉最大3筆後損益(NT$)",
+}
+
+# 網格CSV的中文欄名(依輸出順序)。這個檔案既有的CSV都還是直接用英文key當欄名，
+# 這裡是第一個照使用者「欄位翻成中文」要求輸出中文欄名的CSV；IS/OOS/PF/NT$/ATR這些
+# 縮寫刻意保留，跟summary.txt一貫的寫法(例如「樣本內(IS)」「PF=」)一致。
+SQUEEZE_KDJ_GRID_CSV_COLUMNS_ZH = {
+    "is_rank": "IS排名(只有符合資格的組合有名次)",
+    "eligible": f"符合選拔資格(IS筆數>={SQUEEZE_KDJ_GRID_MIN_IS_TRADES})",
+    "combo_id": "組合編號",
+    "description": "組合說明(白話)",
+    "variant": "出場變體(A/B/B_trail)",
+    "atr_stop_mult": "停損ATR倍數",
+    "atr_target_mult": "停利ATR倍數",
+    "trailing_atr_mult": "移動停利ATR倍數",
+    "max_concurrent_positions": "最多同時持倉數",
+    "lots": "固定口數",
+    "risk_pct_per_trade": "每筆風險比例",
+    "max_hold_days": "最長持有天數",
+    "ranking_rule": "同日多檔排名規則",
+    "entry_filter": "進場濾網",
+    **{f"is_{k}": f"IS{v}" for k, v in SQUEEZE_KDJ_GRID_STAT_LABELS_ZH.items()},
+    **{f"oos_{k}": f"OOS{v}" for k, v in SQUEEZE_KDJ_GRID_STAT_LABELS_ZH.items()},
+    **{f"is_diag_{k}": f"IS診斷_{v}" for k, v in SQUEEZE_KDJ_GRID_DIAG_LABELS_ZH.items()},
+    **{f"oos_diag_{k}": f"OOS診斷_{v}" for k, v in SQUEEZE_KDJ_GRID_DIAG_LABELS_ZH.items()},
+}
+
+
+def squeeze_kdj_grid_df_to_csv_frame(df: pd.DataFrame) -> pd.DataFrame:
+    """把run_squeeze_kdj_grid_search()的combos_df整理成要寫進CSV的樣子：加上白話說明、
+    排名/濾網/排名規則翻成中文、依IS排名排序(有資格的在前、沒資格的在後依組合編號)、
+    欄名翻成中文。"""
+    out = df.copy()
+    out["description"] = [describe_squeeze_kdj_grid_combo(r) for r in out.to_dict("records")]
+    out["ranking_rule"] = out["ranking_rule"].map(SQUEEZE_KDJ_RANKING_RULE_LABELS)
+    out["entry_filter"] = out["entry_filter"].map(lambda v: SQUEEZE_KDJ_ENTRY_FILTER_LABELS[_entry_filter_key(v)])
+    out = out.sort_values(["is_rank", "combo_id"], na_position="last")
+    cols = [c for c in SQUEEZE_KDJ_GRID_CSV_COLUMNS_ZH if c in out.columns]
+    return out[cols].rename(columns=SQUEEZE_KDJ_GRID_CSV_COLUMNS_ZH)
+
+
+def _squeeze_kdj_bootstrap_verdict(b: dict) -> str:
+    passes = (b["pct_positive"] > SQUEEZE_KDJ_BOOTSTRAP_PASS_PCT_POSITIVE
+              and b["p_value"] < SQUEEZE_KDJ_BOOTSTRAP_PASS_P_VALUE)
+    if passes:
+        verdict = (f"✅ 通過專案門檻(bootstrap正報酬比例>{SQUEEZE_KDJ_BOOTSTRAP_PASS_PCT_POSITIVE:.0f}% "
+                   f"且 p值<{SQUEEZE_KDJ_BOOTSTRAP_PASS_P_VALUE})")
+    else:
+        verdict = (f"❌ 沒有通過專案門檻(需要bootstrap正報酬比例>{SQUEEZE_KDJ_BOOTSTRAP_PASS_PCT_POSITIVE:.0f}% "
+                   f"且 p值<{SQUEEZE_KDJ_BOOTSTRAP_PASS_P_VALUE}；實際{b['pct_positive']:.1f}% / "
+                   f"p={b['p_value']:.3f})——這組IS贏家在OOS不能算已驗證的優勢")
+    if b["pnl_excluding_top3_ntd"] < 0:
+        verdict += "；另外拿掉OOS最大3筆交易後總損益轉負，獲利高度依賴少數幾筆交易"
+    return verdict
+
+
+def _fmt_stats_line(stats: dict) -> str:
+    return (f"{stats['trade_count']}筆, PF={_fmt_pf(stats['profit_factor'])}, 勝率={stats['win_rate']:.1f}%, "
+            f"平均持有{stats['avg_hold_days']:.1f}天, 總損益NT${stats['total_pnl_ntd']:,.0f}, "
+            f"最大回撤NT${stats['max_drawdown_ntd']:,.0f}, 最大連續虧損{stats['max_consecutive_losses']}筆")
+
+
+def _fmt_diag_line(diag: dict) -> str:
+    return "，".join(f"{SQUEEZE_KDJ_GRID_DIAG_LABELS_ZH[k]}={diag[k]}" for k in CAPITAL_CONSTRAINED_DIAGNOSTIC_KEYS)
+
+
+def _find_default_capital_constrained_combo(df: pd.DataFrame, variant: str):
+    """在網格裡找出「上一輪--squeeze-kdj-capital-constrained預設設定」那一組(它本來就是
+    網格裡的其中一組)：max_concurrent_positions=3、固定2口、最長60天、觸發K棒漲幅排名、
+    無濾網；變體B另外要停損1.0/停利2.0倍ATR。找不到時回傳None。"""
+    mask = (
+        (df["variant"] == variant) & (df["max_concurrent_positions"] == 3) & (df["lots"] == 2)
+        & df["risk_pct_per_trade"].isna() & (df["max_hold_days"] == 60)
+        & (df["ranking_rule"] == "trigger_return") & df["entry_filter"].isna()
+    )
+    if variant == "B":
+        mask &= (df["atr_stop_mult"] == 1.0) & (df["atr_target_mult"] == 2.0)
+    hit = df[mask]
+    return None if hit.empty else hit.iloc[0]
+
+
+def run_squeeze_kdj_grid_mode(args, price_data, universe, is_calendar, oos_calendar):
+    """--squeeze-kdj-grid模式：squeeze+KDJ資金受限版的「風控 x 交易管理 x 進場方式」混搭
+    網格搜尋(1440組，見build_squeeze_kdj_grid_combos())，方法論見上方區塊註解跟
+    run_squeeze_kdj_grid_search() docstring——重點是：只用IS選出一個贏家，拿那一個贏家
+    的OOS+bootstrap當誠實的頭條數字；其餘OOS資訊(IS前10名的OOS PF、Spearman排名相關、
+    全部組合OOS PF分布)都只用來判斷「IS排名有沒有意義」，不拿來挑組合。
+
+    跟--squeeze-kdj-only/--squeeze-kdj-capital-constrained一樣跳過完整6階段流程。
+    --start/--end/--starting-capital/--max-stocks仍然有效；starting_capital刻意不是網格
+    維度(它是使用者真實帳戶規模)。輸出squeeze_kdj_grid_all_combos.csv(中文欄名)+summary.txt。
+    """
+    print("=" * 100)
+    print("--squeeze-kdj-grid模式：squeeze+KDJ資金受限版 風控x交易管理x進場方式 混搭網格搜尋"
+          "(只在IS選贏家，贏家才跑OOS+bootstrap)")
+    print("=" * 100)
+
+    n_expected = len(build_squeeze_kdj_grid_combos())
+    print(f"\n⚠️ 本次一共要測 {n_expected} 組參數組合(IS、OOS各跑一次)...", flush=True)
+    result = run_squeeze_kdj_grid_search(
+        price_data, universe, args.starting_capital, is_calendar, oos_calendar, progress_every=200,
+    )
+    df = result["combos_df"]
+    n_combos = result["n_combos"]
+    min_is_trades = result["min_is_trades"]
+    n_eligible = int(df["eligible"].sum())
+
+    csv_df = squeeze_kdj_grid_df_to_csv_frame(df)
+    csv_df.to_csv(os.path.join(RESULTS_DIR, "squeeze_kdj_grid_all_combos.csv"), index=False, encoding="utf-8-sig")
+
+    lines = [
+        "=" * 100,
+        "布林+Keltner擠壓+KDJ訊號 --squeeze-kdj-grid模式(資金受限版：風控 x 交易管理 x 進場方式 混搭網格搜尋)",
+        f"回測期間：{args.start} ~ {args.end}　起始資金：NT${args.starting_capital:,.0f}",
+        "=" * 100,
+        "",
+        "#" * 100,
+        f"### 本次一共測試了 {n_combos} 組參數組合(出場配置10 x 最大持倉數3 x 部位大小4 x 最長持有天數3 "
+        f"x 同日排名規則2 x 進場濾網2) ###",
+        "#" * 100,
+        f"⚠️ 多重比較警告(白話)：同時測了{n_combos}組，就算每一組其實都沒有真正的優勢，純靠運氣也幾乎"
+        "一定會有幾組在樣本內(IS)看起來很漂亮。IS贏家的IS數字是從上千組裡「挑出來」的，必然偏樂觀，"
+        "不能拿來當實盤期待；比較誠實的只有「IS贏家拿到OOS跑一次」的結果+bootstrap。",
+        "⚠️ OOS不是完全沒碰過的資料：這段OOS期間在上一輪--squeeze-kdj-capital-constrained(預設設定)"
+        "就已經看過一次結果，這次網格的維度設計多少受到那次結果影響，OOS結論的可信度要再打一點折扣。",
+        "ℹ️ 起始資金不是網格維度：它是你真實帳戶的規模(--starting-capital)，不是拿來調到回測好看的參數。",
+        f"選拔規則(事先定好)：只看IS；IS交易筆數>={min_is_trades}筆才有資格；IS PF最高者勝出，同PF比IS總損益。"
+        f"符合資格的組合：{n_eligible}/{n_combos}組。",
+    ]
+
+    winner = result["winner"]
+    lines.append("\n【IS贏家 → OOS一次 + bootstrap(誠實頭條數字)】")
+    if winner is None:
+        lines.append(f"  沒有任何組合的IS交易筆數達到{min_is_trades}筆，無法選出贏家(這本身就是結果："
+                     "資金受限後訊號太稀疏，沒辦法在IS累積足夠樣本)。")
+    else:
+        lines.append(f"  組合編號#{winner['combo']['combo_id']}：{winner['label']}")
+        lines.append(f"    樣本內(IS): {_fmt_stats_line(winner['IS'])}")
+        lines.append(f"    樣本外(OOS) ← 較誠實的參考依據: {_fmt_stats_line(winner['OOS'])}")
+        b = winner["bootstrap"]
+        lines.append(f"    [穩健性] OOS bootstrap 1000次重抽樣：平均總損益NT${b['mean']:,.0f}，"
+                     f"5%~95%區間=[NT${b['p5']:,.0f}, NT${b['p95']:,.0f}]，正報酬比例={b['pct_positive']:.1f}%，"
+                     f"p值={b['p_value']:.3f}，拿掉最大3筆交易後總損益NT${b['pnl_excluding_top3_ntd']:,.0f}")
+        lines.append(f"    判定：{_squeeze_kdj_bootstrap_verdict(b)}")
+        lines.append(f"    [診斷] IS：{_fmt_diag_line(winner['is_diagnostics'])}")
+        lines.append(f"    [診斷] OOS：{_fmt_diag_line(winner['oos_diagnostics'])}")
+
+    lines.append(f"\n【IS前{SQUEEZE_KDJ_GRID_TOP_K_REPORT}名在OOS的表現(看IS排名有沒有轉移到OOS，不是拿來挑組合)】")
+    top = df[df["is_rank"].notna()].sort_values("is_rank").head(SQUEEZE_KDJ_GRID_TOP_K_REPORT)
+    if top.empty:
+        lines.append("  (沒有符合資格的組合)")
+    for r in top.to_dict("records"):
+        lines.append(
+            f"  IS第{int(r['is_rank'])}名 #{r['combo_id']}：IS {r['is_trade_count']}筆 PF={_fmt_pf(r['is_profit_factor'])} "
+            f"損益NT${r['is_total_pnl_ntd']:,.0f} → OOS {r['oos_trade_count']}筆 PF={_fmt_pf(r['oos_profit_factor'])} "
+            f"損益NT${r['oos_total_pnl_ntd']:,.0f}｜{describe_squeeze_kdj_grid_combo(r)}"
+        )
+
+    sp = result["spearman"]
+    rho_txt = "NaN" if np.isnan(sp["rho"]) else f"{sp['rho']:.3f}"
+    lines.append(f"\n【IS排名能不能轉移到OOS】全部{sp['n']}組有資格組合的IS PF vs OOS PF Spearman排名相關"
+                 f" = {rho_txt}({sp['method']})")
+    lines.append(f"  解讀：{_interpret_spearman(sp['rho'])}")
+
+    dist = result["oos_distribution"]
+    lines.append(f"\n【全部{dist['count']}組的OOS PF分布(參數穩健性檢查)】")
+    lines.append(f"  OOS PF>1的比例={dist['pct_pf_gt_1']:.1f}%，中位數={_fmt_pf(dist['median'])}，"
+                 f"25%分位數={_fmt_pf(dist['p25'])}，75%分位數={_fmt_pf(dist['p75'])}"
+                 f"(其中{dist['zero_trade_count']}組OOS完全沒有交易，PF依summarize_mr()慣例記為0)")
+    lines.append("  ⚠️ 這張分布表只用來看「整片參數空間在OOS大致賺不賺」，絕對不要從這裡挑OOS表現最好的"
+                 "組合來用——那等於拿OOS做選擇，OOS就不再是樣本外，挑出來的數字跟IS贏家的IS數字一樣會偏樂觀。")
+
+    lines.append("\n【對照上一輪預設設定(--squeeze-kdj-capital-constrained：最多3檔、固定2口、最長60天、"
+                 "觸發K棒漲幅排名、無濾網)】")
+    for variant in ("A", "B"):
+        ref = SQUEEZE_KDJ_CAPITAL_CONSTRAINED_DEFAULT_REFERENCE[variant]
+        row = _find_default_capital_constrained_combo(df, variant)
+        ref_txt = (f"上一輪GitHub Actions實際結果：IS PF={ref['is_pf']:.2f}({ref['is_trades']}筆)、"
+                   f"OOS PF={ref['oos_pf']:.2f}({ref['oos_trades']}筆)、bootstrap正報酬{ref['pct_positive']:.1f}%、"
+                   f"p={ref['p_value']:.3f}")
+        if row is None:
+            lines.append(f"  變體{variant}預設設定：{ref_txt}；(這次網格裡找不到對應組合)")
+            continue
+        rank_txt = f"IS第{int(row['is_rank'])}名" if pd.notna(row["is_rank"]) else "IS筆數不足、不參與排名"
+        lines.append(f"  變體{variant}預設設定(網格#{int(row['combo_id'])}，{rank_txt})：這次重跑 IS PF="
+                     f"{_fmt_pf(row['is_profit_factor'])}({int(row['is_trade_count'])}筆)、OOS PF="
+                     f"{_fmt_pf(row['oos_profit_factor'])}({int(row['oos_trade_count'])}筆)；{ref_txt}")
+    lines.append("  (IS贏家的IS數字比預設設定好是預期中的事——它本來就是在IS上挑出來的；"
+                 "真正要比的是IS贏家的OOS+bootstrap有沒有比預設設定好、有沒有過專案門檻。)")
+    lines.append(f"\n完整{n_combos}組明細(含IS/OOS統計與診斷計數器)見squeeze_kdj_grid_all_combos.csv。")
+
+    summary_text = "\n".join(lines)
+    print(summary_text)
+    summary_path = os.path.join(RESULTS_DIR, "summary.txt")
+    with open(summary_path, "w", encoding="utf-8") as f:
+        f.write(summary_text + "\n")
+    print(f"\n已輸出：{summary_path}")
+    return result
+
+
 def evaluate_combo(label, price_data, indicators_by_code, regime_series, is_calendar, oos_calendar,
                     starting_capital, hold_days, signal_weights, gate_kwargs, atr_stop_mult,
                     trailing_atr_mult, use_trailing_stop, extra_kwargs, execution_kwargs):
@@ -1935,6 +2485,17 @@ def main():
                               "這整套6階段流程(squeeze+KDJ的訊號規則本身跟那6個階段選出的東西無關)。"
                               "加這個旗標時，--start/--end/--starting-capital/--max-stocks仍然有效，"
                               "其餘跟訊號/門檻/突破窗口/出場配置自動搜尋相關的旗標在這裡不適用")
+    parser.add_argument("--squeeze-kdj-grid", action="store_true",
+                         help="squeeze+KDJ資金受限版混搭網格搜尋(--squeeze-kdj-grid)：把出場方式(變體A/"
+                              "變體B固定ATR停損停利6組/變體B移動停利3組)x最大持倉數(1/3/5)x部位大小(固定1口/"
+                              "固定2口/風險1%%/風險2%%)x最長持有天數(10/20/60)x同日多檔排名規則(觸發K棒漲幅/"
+                              "量比)x進場濾網(無/站上60日均線)共1440組，全部只在樣本內(IS)跑、用IS PF"
+                              "(IS筆數>=30才有資格)選出唯一一個贏家，贏家才拿去樣本外(OOS)跑一次+bootstrap"
+                              "當誠實的頭條數字；另外報告IS前10名的OOS PF、IS PF vs OOS PF的Spearman排名"
+                              "相關、全部組合OOS PF的分布(只看分布、不挑OOS最好的組合)，並醒目標示總共測了"
+                              "幾組跟多重比較警告。輸出squeeze_kdj_grid_all_combos.csv(中文欄名)+summary.txt。"
+                              "跟--squeeze-kdj-only一樣跳過完整6階段流程；--start/--end/--starting-capital/"
+                              "--max-stocks仍然有效(起始資金是真實帳戶規模，不是網格維度)")
     parser.add_argument("--fixed-combo-walkforward-folds", type=int, default=0,
                          help="測試幾組「固定死不重新挑選」的候選規則(FIXED_WALKFORWARD_COMBO_VARIANTS，"
                               "基準+只改一個維度的變體)跨N個獨立、不重疊歷史區塊的表現，0代表不啟用(預設)。"
@@ -2021,6 +2582,10 @@ def main():
 
     if args.squeeze_kdj_capital_constrained:
         run_squeeze_kdj_capital_constrained_mode(args, price_data, universe, is_calendar, oos_calendar)
+        return
+
+    if args.squeeze_kdj_grid:
+        run_squeeze_kdj_grid_mode(args, price_data, universe, is_calendar, oos_calendar)
         return
 
     if args.use_trailing_stop:

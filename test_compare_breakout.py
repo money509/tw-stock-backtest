@@ -907,3 +907,251 @@ class TestSqueezeKdjCapitalConstrainedCliModeSkipsFullPipeline:
         assert "[階段0]" not in summary_text
         assert "ATR倍數敏感度網格" not in summary_text
         assert "--squeeze-kdj-only模式" not in summary_text
+
+
+class TestSqueezeKdjGridCombos:
+    def test_grid_has_1440_unique_combos_with_expected_dimensions(self):
+        combos = cb.build_squeeze_kdj_grid_combos()
+        assert len(combos) == 10 * 3 * 4 * 3 * 2 * 2 == 1440
+        assert [c["combo_id"] for c in combos] == list(range(1, 1441))
+        exit_cfgs = {(c["variant"], c["atr_stop_mult"], c["atr_target_mult"], c["trailing_atr_mult"]) for c in combos}
+        assert len(exit_cfgs) == 10
+        for c in combos:
+            if c["variant"] == "B_trail":
+                assert c["atr_stop_mult"] == c["trailing_atr_mult"]  # 初始停損倍數=移動停利倍數
+        # starting_capital刻意不是網格維度
+        assert all("starting_capital" not in c for c in combos)
+
+    def test_combo_to_kwargs_sizing_and_exit(self):
+        combos = cb.build_squeeze_kdj_grid_combos()
+        risk = next(c for c in combos if c["risk_pct_per_trade"] == 0.02 and c["variant"] == "B_trail")
+        kw = cb.squeeze_kdj_grid_combo_to_backtest_kwargs(risk)
+        assert kw["risk_pct_per_trade"] == 0.02 and "lots" not in kw
+        assert kw["trailing_atr_mult"] == risk["trailing_atr_mult"]
+        fixed = next(c for c in combos if c["lots"] == 1 and c["variant"] == "B")
+        kw = cb.squeeze_kdj_grid_combo_to_backtest_kwargs(fixed)
+        assert kw["lots"] == 1 and "risk_pct_per_trade" not in kw
+        assert kw["atr_target_mult"] == fixed["atr_target_mult"]
+
+
+class TestSqueezeKdjGridSelectsOnIsOnly:
+    """方法論核心：網格只用IS選贏家。這裡monkeypatch回測函式，故意讓「IS最好」跟「OOS最好」
+    是兩個不同的組合——IS最好的是最後一組(#1440)、OOS最好的是第一組(#1)——確認報告出來的
+    贏家是IS那一組，而且它的OOS數字就是它自己(很差)的OOS數字，不會被換成OOS最好的那組。"""
+
+    def _make_df(self, n=120):
+        idx = pd.date_range("2022-01-03", periods=n, freq="B")
+        closes = pd.Series(100.0, index=idx)
+        return pd.DataFrame({"Open": closes, "High": closes + 1, "Low": closes - 1, "Close": closes,
+                             "Volume": pd.Series(1000.0, index=idx)}, index=idx)
+
+    def _fake_trades(self, d, n_win, win, n_loss, loss):
+        out = []
+        for pnl in [win] * n_win + [loss] * n_loss:
+            out.append({"code": "1101", "side": "long", "entry_date": d, "exit_date": d, "e_price": 100.0,
+                        "exit_price": 100.0, "exit_reason": "target", "lots": 1, "pnl_ntd": float(pnl),
+                        "return_pct": pnl / 1e5, "hold_days": 1})
+        return out
+
+    def test_winner_is_is_best_even_when_oos_would_pick_another(self, monkeypatch, tmp_path):
+        df = self._make_df()
+        price_data = {"1101": df}
+        universe = {"1101": {}}
+        is_calendar, oos_calendar = cb.split_is_oos(df.index, is_ratio=0.7)
+        combos = cb.build_squeeze_kdj_grid_combos()
+        is_best = combos[-1]
+        oos_best = combos[0]
+        is_best_kwargs = cb.squeeze_kdj_grid_combo_to_backtest_kwargs(is_best)
+        oos_best_kwargs = cb.squeeze_kdj_grid_combo_to_backtest_kwargs(oos_best)
+        calls = []
+
+        def _matches(kwargs, target):
+            return all(kwargs.get(k) == v for k, v in target.items())
+
+        def _fake_backtest(price_data, universe, master_calendar, starting_capital, **kwargs):
+            is_split = master_calendar[0] == is_calendar[0]
+            calls.append("IS" if is_split else "OOS")
+            d = master_calendar[0]
+            if is_split:
+                if _matches(kwargs, is_best_kwargs):
+                    trades = self._fake_trades(d, 20, 1000, 10, -100)    # IS PF=20
+                else:
+                    trades = self._fake_trades(d, 15, 100, 15, -100)     # IS PF=1
+            else:
+                if _matches(kwargs, oos_best_kwargs):
+                    trades = self._fake_trades(d, 20, 5000, 1, -100)     # OOS PF=1000
+                elif _matches(kwargs, is_best_kwargs):
+                    trades = self._fake_trades(d, 1, 100, 10, -100)      # OOS PF=0.1
+                else:
+                    trades = self._fake_trades(d, 10, 100, 10, -100)
+            assert kwargs.get("return_diagnostics") is True
+            return trades, dict.fromkeys(cb.CAPITAL_CONSTRAINED_DIAGNOSTIC_KEYS, 0)
+
+        monkeypatch.setattr(cb, "run_squeeze_kdj_capital_constrained_backtest", _fake_backtest)
+
+        result = cb.run_squeeze_kdj_grid_search(price_data, universe, 1_000_000, is_calendar, oos_calendar)
+
+        assert result["n_combos"] == 1440
+        assert result["winner_id"] == is_best["combo_id"]
+        assert result["winner_id"] != oos_best["combo_id"]
+        assert result["winner"]["IS"]["profit_factor"] == pytest.approx(20.0)
+        assert result["winner"]["OOS"]["profit_factor"] == pytest.approx(0.1)
+        # 全部IS跑完之後才開始跑OOS(選拔在碰到任何OOS數字之前就定案)
+        assert calls == ["IS"] * 1440 + ["OOS"] * 1440
+        b = result["winner"]["bootstrap"]
+        assert {"mean", "p5", "p95", "pct_positive", "p_value", "pnl_excluding_top3_ntd"} <= set(b)
+
+        # 摘要報告也要報IS贏家，不能出現「OOS最佳組合」
+        monkeypatch.setattr(cb, "RESULTS_DIR", str(tmp_path))
+        monkeypatch.setattr(cb, "run_squeeze_kdj_grid_search", lambda *a, **k: result)
+        args = argparse.Namespace(start="2022-01-03", end="2022-06-30", starting_capital=1_000_000)
+        cb.run_squeeze_kdj_grid_mode(args, price_data, universe, is_calendar, oos_calendar)
+        summary = open(os.path.join(str(tmp_path), "summary.txt"), encoding="utf-8").read()
+        assert f"組合編號#{is_best['combo_id']}：{cb.describe_squeeze_kdj_grid_combo(is_best)}" in summary
+        assert "❌ 沒有通過專案門檻" in summary
+        assert "OOS最佳組合" not in summary
+
+    def test_is_ranking_ignores_oos_columns_and_respects_min_trades(self):
+        df = pd.DataFrame([
+            {"combo_id": 1, "is_trade_count": 29, "is_profit_factor": 9.0, "is_total_pnl_ntd": 1.0,
+             "oos_profit_factor": 0.1},
+            {"combo_id": 2, "is_trade_count": 30, "is_profit_factor": 2.0, "is_total_pnl_ntd": 10.0,
+             "oos_profit_factor": 0.1},
+            {"combo_id": 3, "is_trade_count": 50, "is_profit_factor": 2.0, "is_total_pnl_ntd": 20.0,
+             "oos_profit_factor": 99.0},
+            {"combo_id": 4, "is_trade_count": 50, "is_profit_factor": 1.5, "is_total_pnl_ntd": 99.0,
+             "oos_profit_factor": 999.0},
+        ])
+        ranked = cb.rank_squeeze_kdj_grid_on_is(df, min_is_trades=30)
+        assert list(ranked["eligible"]) == [False, True, True, True]
+        assert pd.isna(ranked.loc[0, "is_rank"])  # 筆數不足：不排名(但仍保留在表裡)
+        # PF同為2.0時比IS總損益：#3(20) > #2(10)；#4 PF較低排最後(就算OOS最好)
+        ranks = ranked.set_index("combo_id")["is_rank"]
+        assert (ranks[2], ranks[3], ranks[4]) == (2.0, 1.0, 3.0)
+        assert cb.select_squeeze_kdj_grid_winner(ranked) == 3
+
+    def test_no_eligible_combo_yields_no_winner(self):
+        df = pd.DataFrame([{"combo_id": 1, "is_trade_count": 5, "is_profit_factor": 3.0, "is_total_pnl_ntd": 1.0}])
+        assert cb.select_squeeze_kdj_grid_winner(cb.rank_squeeze_kdj_grid_on_is(df)) is None
+
+    def test_spearman_and_distribution_helpers(self):
+        df = pd.DataFrame({
+            "eligible": [True, True, True, True, False],
+            "is_profit_factor": [1.0, 2.0, 3.0, 4.0, 9.0],
+            "oos_profit_factor": [4.0, 3.0, 2.0, float("inf"), 0.0],
+            "oos_trade_count": [5, 5, 5, 5, 0],
+        })
+        sp = cb._spearman_is_vs_oos_pf(df)
+        assert sp["n"] == 4
+        # IS名次1,2,3,4對應OOS名次3,2,1,4(∞排最大)：rho = 1 - 6x(4+0+4+0)/(4x15) = 0.2
+        assert sp["rho"] == pytest.approx(0.2)
+        assert "雜訊" in cb._interpret_spearman(sp["rho"])
+        dist = cb._oos_pf_distribution(df)
+        assert dist["count"] == 5
+        assert dist["pct_pf_gt_1"] == pytest.approx(80.0)
+        assert dist["median"] == pytest.approx(3.0)
+        assert dist["zero_trade_count"] == 1
+
+
+class TestSqueezeKdjGridCliModeSkipsFullPipeline:
+    """--squeeze-kdj-grid這個CLI旗標只該走run_squeeze_kdj_grid_mode()，main()完整流程的
+    其餘階段(突破窗口比較、突破風格比較、單一訊號拆解、訊號組合比較、結構門檻變體比較、
+    ATR敏感度網格、出場配置比較、walk-forward/固定規則walk-forward/跨週期驗證，以及
+    --squeeze-kdj-only/--squeeze-kdj-capital-constrained本身)全部不該被呼叫，輸出
+    squeeze_kdj_grid_all_combos.csv(中文欄名、1440列)+summary.txt。"""
+
+    def _build_fake_price_data(self, n=260, seed=29):
+        np.random.seed(seed)
+        idx = pd.date_range("2019-01-01", periods=n, freq="B")
+
+        def _df(closes):
+            closes = pd.Series(closes, index=idx, dtype=float)
+            return pd.DataFrame({
+                "Open": closes, "High": closes * 1.01, "Low": closes * 0.99, "Close": closes,
+                "Volume": pd.Series(1500.0, index=idx),
+            }, index=idx)
+
+        index_trend = np.linspace(0, 30, n) + np.random.normal(0, 1.2, n)
+        stock_trend = np.linspace(0, -15, n) + np.random.normal(0, 1.2, n)
+        return {
+            "2330": _df(np.maximum(100 + index_trend, 1.0)),
+            "1101": _df(np.maximum(100 + stock_trend, 1.0)),
+        }
+
+    def _patch_heavy_stages_to_explode(self, monkeypatch):
+        heavy_stage_names = [
+            "run_breakout_window_comparison", "run_breakout_style_comparison",
+            "run_signal_ablation", "run_signal_combo_comparison", "run_gate_comparison",
+            "run_atr_sensitivity_grid", "run_exit_style_comparison",
+            "run_walkforward_validation", "run_fixed_combo_walkforward",
+            "run_squeeze_kdj_exit_style_comparison", "run_squeeze_kdj_exit_style_comparison_is_oos",
+            "run_squeeze_kdj_only_mode", "run_squeeze_kdj_capital_constrained_mode",
+            "evaluate_squeeze_kdj_capital_constrained", "run_multi_period_validation",
+        ]
+
+        def _boom(name):
+            def _inner(*args, **kwargs):
+                raise AssertionError(f"--squeeze-kdj-grid模式不該呼叫完整流程的階段函式：{name}")
+            return _inner
+
+        for name in heavy_stage_names:
+            monkeypatch.setattr(cb, name, _boom(name))
+
+    def test_skips_full_pipeline_and_writes_grid_output(self, monkeypatch, tmp_path):
+        import data_loader
+        import chip_data_loader
+
+        fake_price_data = self._build_fake_price_data()
+        monkeypatch.setattr(cb, "load_price_data", lambda *a, **k: fake_price_data)
+
+        def _boom(*args, **kwargs):
+            raise AssertionError("--squeeze-kdj-grid模式不該呼叫任何資料下載函式")
+        monkeypatch.setattr(data_loader, "load_price_data", _boom)
+        monkeypatch.setattr(chip_data_loader, "load_chip_data", _boom)
+
+        self._patch_heavy_stages_to_explode(monkeypatch)
+        monkeypatch.setattr(cb, "RESULTS_DIR", str(tmp_path))
+
+        grid_calls = []
+        real_grid = cb.run_squeeze_kdj_grid_search
+
+        def _spy(*args, **kwargs):
+            grid_calls.append(1)
+            return real_grid(*args, **kwargs)
+        monkeypatch.setattr(cb, "run_squeeze_kdj_grid_search", _spy)
+
+        argv = ["compare_breakout.py", "--squeeze-kdj-grid", "--max-stocks", "2", "--starting-capital", "1000000"]
+        monkeypatch.setattr(sys, "argv", argv)
+
+        cb.main()
+
+        assert len(grid_calls) == 1
+        csv_path = os.path.join(str(tmp_path), "squeeze_kdj_grid_all_combos.csv")
+        summary_path = os.path.join(str(tmp_path), "summary.txt")
+        assert os.path.exists(csv_path)
+        assert os.path.exists(summary_path)
+
+        csv_df = pd.read_csv(csv_path, encoding="utf-8-sig")
+        assert len(csv_df) == 1440
+        for col in ("組合編號", "組合說明(白話)", "IS獲利因子PF", "OOS獲利因子PF", "IS診斷_名額已滿沒輪到",
+                    "OOS診斷_單筆保證金上限略過", "IS診斷_總保證金上限略過", "IS診斷_風險口數不足1口略過",
+                    "IS診斷_進場濾網擋掉", "IS排名(只有符合資格的組合有名次)"):
+            assert col in csv_df.columns
+        assert not any(c.startswith("is_") or c.startswith("oos_") for c in csv_df.columns)
+
+        summary_text = open(summary_path, encoding="utf-8").read()
+        assert "--squeeze-kdj-grid模式" in summary_text
+        assert "本次一共測試了 1440 組參數組合" in summary_text
+        assert "多重比較警告" in summary_text
+        assert "OOS不是完全沒碰過的資料" in summary_text
+        assert "起始資金不是網格維度" in summary_text
+        assert "Spearman" in summary_text
+        assert "OOS PF分布" in summary_text
+        assert "絕對不要從這裡挑OOS表現最好的組合" in summary_text
+        assert "對照上一輪預設設定" in summary_text
+        assert "OOS最佳組合" not in summary_text
+        # 完整流程/其他squeeze模式才會出現的區塊標題，這裡不該印出來
+        assert "[階段0]" not in summary_text
+        assert "ATR倍數敏感度網格" not in summary_text
+        assert "--squeeze-kdj-only模式" not in summary_text
+        assert "--squeeze-kdj-capital-constrained模式" not in summary_text
