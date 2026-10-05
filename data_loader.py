@@ -45,21 +45,25 @@ def _symbol_for(code: str, entry=None) -> str:
     return f"{code}{suffix}"
 
 
-def load_price_data(whitelist: dict, start: str, end: str, refresh: bool = False) -> dict:
+def load_price_data(whitelist: dict, start: str, end: str, refresh: bool = False,
+                    cache_dir: str = None) -> dict:
     """
     回傳 {code: DataFrame(Open, High, Low, Close, Volume, index=日期)}。
     有本機快取，重複執行不會一直打 yfinance。refresh=True 會強制重新下載。
+    cache_dir：快取資料夾，預設None=CACHE_DIR(舊行為不變)。每日訊號掃描(daily_squeeze_signals.py)
+    每天的start/end都不同、而且一定要refresh，會傳一個暫存資料夾進來，避免data_cache/每天堆一批用不到的CSV。
 
     改進：不再一檔一檔分開請求 (那樣249檔就是249次個別請求，容易在請求200多次後
     被Yahoo判定為異常流量而卡住/被限速，之前兩次修正逾時的嘗試都沒解決這個根本問題)。
     改用 yf.download() 一次打包多檔一起下載，大幅減少總請求次數。
     """
-    os.makedirs(CACHE_DIR, exist_ok=True)
+    cache_dir = CACHE_DIR if cache_dir is None else cache_dir
+    os.makedirs(cache_dir, exist_ok=True)
     price_data = {}
     to_download = []  # [(code, sym, entry), ...]
 
     for code, entry in whitelist.items():
-        cache_path = os.path.join(CACHE_DIR, f"{code}_{start}_{end}.csv")
+        cache_path = os.path.join(cache_dir, f"{code}_{start}_{end}.csv")
         if not refresh and os.path.exists(cache_path):
             try:
                 cached_df = pd.read_csv(cache_path, index_col=0, parse_dates=True)
@@ -121,7 +125,7 @@ def load_price_data(whitelist: dict, start: str, end: str, refresh: bool = False
                     idx = idx.tz_localize(None)
                 df.index = idx
 
-                cache_path = os.path.join(CACHE_DIR, f"{code}_{start}_{end}.csv")
+                cache_path = os.path.join(cache_dir, f"{code}_{start}_{end}.csv")
                 df.to_csv(cache_path)
                 price_data[code] = df
             except Exception as e:
