@@ -1,0 +1,1 @@
+﻿rank,code,name,signal_date,close,prev_close,trigger_return,tick,limit_price,atr,stop_dist,target_dist,stop_if_fill_at_limit,target_if_fill_at_limit,contract,multiplier,stop_dist_ntd_per_lot,target_dist_ntd_per_lot,margin_est_1lot,margin_over_cap,atr_invalid,backtest_would_skip,entry_date,time_exit_date,data_fresh
