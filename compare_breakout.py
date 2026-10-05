@@ -1355,8 +1355,8 @@ def select_squeeze_kdj_grid_winner(df: pd.DataFrame):
 
 
 def _spearman_is_vs_oos_pf(df: pd.DataFrame) -> dict:
-    """全部「有資格」組合的IS PF vs OOS PF Spearman排名相關。scipy有裝就用
-    scipy.stats.spearmanr，沒有就退回pandas的.corr(method="spearman")。PF=∞
+    """全部「有資格」組合的IS PF vs OOS PF Spearman排名相關，用「排名後Pearson相關」
+    自己算，完全不依賴scipy(GitHub Actions沒裝scipy，見函式內註解)。PF=∞
     (只賺不賠)在排名上就是最大值，排名相關不受影響；少於3組或其中一邊完全沒有變異時
     回傳NaN。"""
     sub = df[df["eligible"]]
@@ -1367,14 +1367,17 @@ def _spearman_is_vs_oos_pf(df: pd.DataFrame) -> dict:
     oos_pf = sub["oos_profit_factor"].astype(float)
     if is_pf.nunique() < 2 or oos_pf.nunique() < 2:
         return {"rho": float("nan"), "n": n, "method": "PF沒有變異，無法計算"}
-    try:
-        from scipy.stats import spearmanr
-        rho = float(spearmanr(is_pf.to_numpy(), oos_pf.to_numpy()).correlation)
-        method = "scipy.stats.spearmanr"
-    except ImportError:
-        rho = float(is_pf.corr(oos_pf, method="spearman"))
-        method = "pandas .corr(method='spearman')"
-    return {"rho": rho, "n": n, "method": method}
+    # 不依賴scipy：GitHub Actions的requirements.txt沒有scipy，而pandas的
+    # .corr(method="spearman")內部其實也會import scipy(pandas/core/nanops.py)，
+    # 舊版「scipy沒裝就退回pandas」的寫法在GitHub上兩條路都會ImportError，
+    # 讓--squeeze-kdj-grid跑完1440組之後在這裡崩潰(exit code 1)。
+    # Spearman的定義就是「排名之後的Pearson相關」，pandas的rank()(平均名次處理同分，
+    # 跟scipy.stats.spearmanr一樣)跟Pearson相關都不需要scipy，結果跟spearmanr完全相同。
+    # PF=∞先換成很大的有限數，排名時一樣是最大值，但避免∞進到Pearson計算變成NaN。
+    is_rank = is_pf.replace([np.inf], 1e18).rank(method="average")
+    oos_rank = oos_pf.replace([np.inf], 1e18).rank(method="average")
+    rho = float(np.corrcoef(is_rank.to_numpy(), oos_rank.to_numpy())[0, 1])
+    return {"rho": rho, "n": n, "method": "排名後Pearson相關(等同Spearman，不需scipy)"}
 
 
 def _interpret_spearman(rho: float) -> str:

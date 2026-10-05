@@ -1155,3 +1155,31 @@ class TestSqueezeKdjGridCliModeSkipsFullPipeline:
         assert "ATR倍數敏感度網格" not in summary_text
         assert "--squeeze-kdj-only模式" not in summary_text
         assert "--squeeze-kdj-capital-constrained模式" not in summary_text
+
+
+class TestSqueezeKdjGridSpearmanWithoutScipy:
+    """回歸測試：GitHub Actions的requirements.txt沒有scipy。舊版「scipy沒裝就退回
+    pandas .corr(method='spearman')」在GitHub上兩條路都會ImportError(pandas的spearman
+    內部也import scipy)，讓--squeeze-kdj-grid跑完1440組之後在算Spearman時崩潰(exit code 1)。"""
+
+    def _df(self):
+        return pd.DataFrame({
+            "eligible": [True] * 6,
+            "is_profit_factor": [1.0, 2.0, 3.0, 4.0, 5.0, float("inf")],
+            "oos_profit_factor": [2.0, 1.0, 4.0, 3.0, 2.0, 6.0],
+        })
+
+    def test_works_when_scipy_is_not_installed(self, monkeypatch):
+        monkeypatch.setitem(sys.modules, "scipy", None)
+        monkeypatch.setitem(sys.modules, "scipy.stats", None)
+        sp = cb._spearman_is_vs_oos_pf(self._df())
+        assert sp["n"] == 6
+        assert np.isfinite(sp["rho"])
+
+    def test_matches_scipy_spearmanr_including_ties_and_inf(self):
+        scipy_stats = pytest.importorskip("scipy.stats")
+        df = self._df()
+        got = cb._spearman_is_vs_oos_pf(df)["rho"]
+        is_pf = df["is_profit_factor"].replace([np.inf], 1e18)
+        expected = scipy_stats.spearmanr(is_pf, df["oos_profit_factor"]).correlation
+        assert got == pytest.approx(expected, abs=1e-12)
