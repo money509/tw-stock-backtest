@@ -7,8 +7,10 @@ from squeeze_kdj_signal import (
     compute_keltner_channel, compute_squeeze_flag, compute_kdj_k,
     compute_squeeze_kdj_features, compute_entry_state_machine,
     simulate_variant_a_trades, simulate_variant_b_trades,
+    precompute_squeeze_kdj_features_by_code, run_squeeze_kdj_capital_constrained_backtest,
+    _process_squeeze_kdj_variant_a_day,
 )
-from mean_reversion_engine import compute_bollinger
+from mean_reversion_engine import compute_bollinger, STOP_LOSS_COOLDOWN_DAYS
 
 
 def _make_df(opens, highs, lows, closes):
@@ -276,3 +278,272 @@ class TestVariantBExit:
         assert len(trades) == 1
         assert trades[0]["exit_reason"] == "hold_days_reached"
         assert trades[0]["hold_days"] == 3
+
+
+# ============================================================================
+# run_squeeze_kdj_capital_constrained_backtest() 及相關輔助函式的測試。
+#
+# 共用做法：直接手造「已經算好」的features DataFrame(EntryFlag/PriorLow/K欄位)，
+# 透過features_by_code參數直接餵給回測函式，跳過真正的BB/KC/KDJ計算鏈路——
+# 這些鏈路本身(擠壓判定/KDJ的K值)已經在上面的TestSqueezeFlag/TestKDJ/
+# TestEntryStateMachine測過，這裡只測「資金受限版的day-by-day迴圈邏輯本身對不對」，
+# 兩件事不要混在一起測，才看得出問題出在哪一層。
+# ============================================================================
+
+def _make_flat_df(price, n=20, start="2022-01-03"):
+    idx = pd.date_range(start, periods=n, freq="B")
+    closes = pd.Series([price] * n, index=idx, dtype=float)
+    return pd.DataFrame({
+        "Open": closes, "High": closes + 1.0, "Low": closes - 1.0, "Close": closes,
+    }, index=idx)
+
+
+def _make_fixed_features(df, entry_idx, prior_low, k_series=None):
+    """造一份只在entry_idx這天EntryFlag=True的features，K預設全程50(不會觸發變體A停利)。"""
+    n = len(df)
+    entry_flag = np.zeros(n, dtype=bool)
+    entry_flag[entry_idx] = True
+    prior_low_arr = np.full(n, np.nan)
+    prior_low_arr[entry_idx] = prior_low
+    if k_series is None:
+        k_series = pd.Series([50.0] * n, index=df.index)
+    return pd.DataFrame({
+        "EntryFlag": entry_flag, "PriorLow": prior_low_arr, "K": k_series,
+    }, index=df.index)
+
+
+class TestPrecomputeSqueezeKdjFeaturesByCode:
+    def test_skips_stocks_shorter_than_60_rows_and_keeps_the_rest(self):
+        price_data = {
+            "1101": _make_flat_df(20.0, n=59),   # 太短，該被跳過
+            "1102": _make_flat_df(15.0, n=60),   # 剛好60，該保留
+        }
+        universe = {"1101": {}, "1102": {}}
+        result = precompute_squeeze_kdj_features_by_code(price_data, universe)
+        assert set(result.keys()) == {"1102"}
+        for col in ("Squeeze", "SqueezeRecent", "K", "EntryFlag", "PriorLow"):
+            assert col in result["1102"].columns
+
+
+class TestCapitalConstrainedInvalidVariant:
+    def test_invalid_variant_raises_value_error(self):
+        price_data = {"1101": _make_flat_df(20.0)}
+        universe = {"1101": {}}
+        with pytest.raises(ValueError):
+            run_squeeze_kdj_capital_constrained_backtest(
+                price_data, universe, price_data["1101"].index, starting_capital=1_000_000,
+                variant="C",
+            )
+
+
+class TestCapitalConstrainedEntryTiming:
+    def test_entry_executes_at_open_of_day_after_entry_flag_not_same_day_or_two_days_later(self):
+        """EntryFlag在idx5觸發，進場該發生在idx6開盤，不是idx5或idx7——
+        這是確認features_by_code的.shift(1)對齊沒有錯位(見
+        run_squeeze_kdj_capital_constrained_backtest() docstring的「進場時機」說明)。"""
+        df = _make_flat_df(20.0, n=20)
+        features = _make_fixed_features(df, entry_idx=5, prior_low=1.0)  # 停損價很低，不會被打到
+        price_data = {"1101": df}
+        universe = {"1101": {}}
+
+        trades = run_squeeze_kdj_capital_constrained_backtest(
+            price_data, universe, df.index, starting_capital=1_000_000, variant="A",
+            max_concurrent_positions=1, top_n=1, features_by_code={"1101": features},
+            max_hold_days=3,
+        )
+        assert len(trades) == 1
+        assert trades[0]["entry_date"] == df.index[6]
+
+
+class TestCapitalConstrainedVariantAExit:
+    def test_target_fires_after_k_reaches_80_then_drops_below(self):
+        idx = pd.date_range("2022-01-03", periods=10, freq="B")
+        closes = pd.Series([100.0] * 10, index=idx)
+        df = pd.DataFrame({
+            "Open": closes, "High": closes + 1.0, "Low": closes - 20.0,  # 停損價設得極低，不會被打到
+            "Close": closes,
+        }, index=idx)
+        # 進場於idx2(EntryFlag在idx1)；K：idx2=70 idx3=85(武裝) idx4=90 idx5=75(武裝後跌破80 -> 觸發停利)
+        k = pd.Series([50, 50, 70, 85, 90, 75, 60, 60, 60, 60], index=idx, dtype=float)
+        features = _make_fixed_features(df, entry_idx=1, prior_low=-1000.0, k_series=k)
+        price_data = {"1101": df}
+        universe = {"1101": {}}
+
+        trades = run_squeeze_kdj_capital_constrained_backtest(
+            price_data, universe, df.index, starting_capital=1_000_000, variant="A",
+            max_concurrent_positions=1, top_n=1, features_by_code={"1101": features},
+            max_hold_days=30,
+        )
+        assert len(trades) == 1
+        assert trades[0]["exit_reason"] == "target"
+        assert trades[0]["exit_date"] == idx[5]
+        assert trades[0]["exit_price"] == pytest.approx(100.0)
+
+    def test_stop_hits_prior_low(self):
+        idx = pd.date_range("2022-01-03", periods=10, freq="B")
+        closes = pd.Series([100.0] * 10, index=idx)
+        lows = pd.Series([99.0] * 10, index=idx)
+        lows.iloc[3] = 50.0  # idx3大跌破停損
+        df = pd.DataFrame({"Open": closes, "High": closes + 1.0, "Low": lows, "Close": closes}, index=idx)
+        features = _make_fixed_features(df, entry_idx=1, prior_low=95.0)
+        price_data = {"1101": df}
+        universe = {"1101": {}}
+
+        trades = run_squeeze_kdj_capital_constrained_backtest(
+            price_data, universe, df.index, starting_capital=1_000_000, variant="A",
+            max_concurrent_positions=1, top_n=1, features_by_code={"1101": features},
+            max_hold_days=30,
+        )
+        assert len(trades) == 1
+        assert trades[0]["exit_reason"] == "stop"
+        assert trades[0]["exit_price"] == pytest.approx(95.0)
+
+
+class TestProcessSqueezeKdjVariantADayDirectly:
+    def test_stop_gap_uses_open_price_and_sets_cooldown(self):
+        idx = pd.date_range("2022-01-03", periods=3, freq="B")
+        row = pd.Series({"Open": 90.0, "High": 91.0, "Low": 89.0, "Close": 90.0})
+        position = {
+            "code": "1101", "side": "long", "entry_date": idx[0], "e_price": 100.0,
+            "target_price": None, "stop_price": 95.0, "lots": 1, "hold_days": 1,
+            "margin_used": 0.0, "target_armed": False,
+        }
+        trades = []
+        cooldown_until = {}
+        result = _process_squeeze_kdj_variant_a_day(
+            position, row, k_today=50.0, date=idx[1], trades=trades,
+            max_hold_days=30, cooldown_until=cooldown_until,
+        )
+        assert result is None
+        assert len(trades) == 1
+        assert trades[0]["exit_reason"] == "stop_gap"
+        assert trades[0]["exit_price"] == pytest.approx(90.0)
+        assert cooldown_until["1101"] == idx[1] + pd.Timedelta(days=STOP_LOSS_COOLDOWN_DAYS * 2)
+
+
+class TestCapitalConstrainedVariantBAtrFramework:
+    def test_stop_and_target_reuse_process_mr_day_shape(self):
+        idx = pd.date_range("2022-01-03", periods=25, freq="B")
+        n = len(idx)
+        closes = pd.Series([100.0] * n, index=idx)
+        df = pd.DataFrame({
+            "Open": closes, "High": closes + 1.0, "Low": closes - 1.0, "Close": closes,
+        }, index=idx)
+        df.loc[df.index[-1], "High"] = 300.0  # 最後一天大幅衝高，確保能在資料結束前觸發停利
+        entry_idx = n - 5
+        features = _make_fixed_features(df, entry_idx=entry_idx, prior_low=np.nan)
+        price_data = {"1101": df}
+        universe = {"1101": {}}
+
+        trades = run_squeeze_kdj_capital_constrained_backtest(
+            price_data, universe, df.index, starting_capital=1_000_000, variant="B",
+            max_concurrent_positions=1, top_n=1, features_by_code={"1101": features},
+            atr_stop_mult=1.0, atr_target_mult=2.0, atr_period=14, max_hold_days=30,
+        )
+        assert len(trades) == 1
+        t = trades[0]
+        assert t["exit_reason"] == "target"
+        # trade dict形狀要跟mean_reversion_engine._close_mr_trade()輸出相容
+        for key in ("code", "side", "entry_date", "exit_date", "e_price", "exit_price",
+                    "exit_reason", "lots", "pnl_ntd", "return_pct", "hold_days"):
+            assert key in t
+
+
+class TestCapitalConstrainedMarginCap:
+    def test_candidate_skipped_when_margin_exceeds_single_trade_cap(self):
+        # 2330是台積電(mini合約100股，保證金比例13.5%)，故意用很小的starting_capital
+        # 讓單筆保證金超過35%上限，確認候選被跳過、不會硬擠進場。
+        idx = pd.date_range("2022-01-03", periods=10, freq="B")
+        price = 600.0
+        closes = pd.Series([price] * 10, index=idx)
+        df = pd.DataFrame({
+            "Open": closes, "High": closes + 1.0, "Low": closes - 1.0, "Close": closes,
+        }, index=idx)
+        features = _make_fixed_features(df, entry_idx=1, prior_low=price - 100.0)
+        price_data = {"2330": df}
+        universe = {"2330": {}}
+
+        trades = run_squeeze_kdj_capital_constrained_backtest(
+            price_data, universe, df.index, starting_capital=1_000.0,  # 小到任何保證金都會超過35%
+            variant="A", max_concurrent_positions=1, top_n=1,
+            features_by_code={"2330": features}, max_hold_days=5,
+        )
+        assert trades == []
+
+
+class TestCapitalConstrainedMaxConcurrentPositionsAndRanking:
+    def test_slots_fill_up_to_max_concurrent_positions(self):
+        idx = pd.date_range("2022-01-03", periods=10, freq="B")
+        price_data = {}
+        features_by_code = {}
+        universe = {}
+        for i, code in enumerate(["1101", "1102", "1210"]):
+            df = _make_flat_df(20.0 + i, n=10, start="2022-01-03")
+            df.index = idx
+            price_data[code] = df
+            features_by_code[code] = _make_fixed_features(df, entry_idx=1, prior_low=1.0)
+            universe[code] = {}
+
+        trades = run_squeeze_kdj_capital_constrained_backtest(
+            price_data, universe, idx, starting_capital=10_000_000, variant="A",
+            max_concurrent_positions=2, top_n=3, features_by_code=features_by_code,
+            max_hold_days=3,
+        )
+        # 3檔股票同一天都觸發，名額只有2個，只能有2筆交易成交
+        assert len(trades) == 2
+
+    def test_ranking_prefers_bigger_trigger_day_return_when_slots_limited(self):
+        # 兩檔股票同一天(idx=t=1)觸發，但觸發K棒當天(t=1)的漲幅不同：code A漲5%、
+        # code B漲1%。只有1個名額時，應該優先選A(漲幅較大者)。
+        idx = pd.date_range("2022-01-03", periods=10, freq="B")
+
+        def _df_with_trigger_return(closes_t0, closes_t1):
+            closes = [closes_t0, closes_t1] + [closes_t1] * 8
+            s = pd.Series(closes, index=idx, dtype=float)
+            return pd.DataFrame({"Open": s, "High": s + 1.0, "Low": s - 1.0, "Close": s}, index=idx)
+
+        df_big = _df_with_trigger_return(100.0, 105.0)   # t=1漲5%
+        df_small = _df_with_trigger_return(100.0, 101.0)  # t=1漲1%
+        price_data = {"1101": df_big, "1102": df_small}
+        universe = {"1101": {}, "1102": {}}
+        features_by_code = {
+            "1101": _make_fixed_features(df_big, entry_idx=1, prior_low=1.0),
+            "1102": _make_fixed_features(df_small, entry_idx=1, prior_low=1.0),
+        }
+
+        trades = run_squeeze_kdj_capital_constrained_backtest(
+            price_data, universe, idx, starting_capital=10_000_000, variant="A",
+            max_concurrent_positions=1, top_n=1, features_by_code=features_by_code,
+            max_hold_days=3,
+        )
+        assert len(trades) == 1
+        assert trades[0]["code"] == "1101"
+
+
+class TestCapitalConstrainedCooldownAfterStop:
+    def test_stopped_out_code_excluded_during_cooldown_window(self):
+        idx = pd.date_range("2022-01-03", periods=20, freq="B")
+        closes = pd.Series([100.0] * 20, index=idx)
+        lows = pd.Series([99.0] * 20, index=idx)
+        lows.iloc[3] = 50.0  # idx3觸發停損出場(進場於idx2)
+        df = pd.DataFrame({"Open": closes, "High": closes + 1.0, "Low": lows, "Close": closes}, index=idx)
+
+        entry_flag = np.zeros(20, dtype=bool)
+        entry_flag[1] = True   # 第一次武裝觸發 -> idx2進場 -> idx3停損
+        entry_flag[5] = True   # 冷卻期內的第二次觸發，idx6理論上該進場但被冷卻排除
+        prior_low = np.full(20, np.nan)
+        prior_low[1] = 95.0
+        prior_low[5] = 95.0
+        k = pd.Series([50.0] * 20, index=idx)
+        features = pd.DataFrame({"EntryFlag": entry_flag, "PriorLow": prior_low, "K": k}, index=idx)
+
+        price_data = {"1101": df}
+        universe = {"1101": {}}
+        trades = run_squeeze_kdj_capital_constrained_backtest(
+            price_data, universe, idx, starting_capital=1_000_000, variant="A",
+            max_concurrent_positions=1, top_n=1, features_by_code={"1101": features},
+            max_hold_days=30,
+        )
+        # 只有第一筆(idx2進場、idx3停損)會成交，第二次觸發(idx6該進場)落在冷卻期內被排除
+        assert len(trades) == 1
+        assert trades[0]["exit_reason"] == "stop"

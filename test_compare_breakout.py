@@ -753,3 +753,157 @@ class TestRunSqueezeKdjExitStyleComparisonIsOos:
         df_out = cb._squeeze_kdj_is_oos_results_to_df(results)
         assert set(df_out["variant"]) == set(cb.SQUEEZE_KDJ_VARIANT_LABELS.values())
         assert "OOS_bootstrap(1000次重抽樣)" in set(df_out["split"])
+
+
+class TestEvaluateSqueezeKdjCapitalConstrained:
+    """evaluate_squeeze_kdj_capital_constrained()：驗證(a) IS/OOS是各自呼叫
+    run_squeeze_kdj_capital_constrained_backtest()跑一次完整的day-by-day回測(不是先跑
+    一次全期間再事後切分)——每次呼叫都是全新的trades/open_positions/cooldown_until，
+    (b) 回傳格式比照evaluate_combo()，(c) bootstrap統計量都有算出來。"""
+
+    def _make_df(self, n=40, start="2022-01-03"):
+        idx = pd.date_range(start, periods=n, freq="B")
+        closes = pd.Series([100.0] * n, index=idx, dtype=float)
+        return pd.DataFrame({
+            "Open": closes, "High": closes + 1.0, "Low": closes - 1.0, "Close": closes,
+        }, index=idx)
+
+    def test_calls_engine_once_per_split_with_correct_calendar_and_returns_evaluate_combo_shape(self, monkeypatch):
+        df = self._make_df()
+        price_data = {"1101": df}
+        universe = {"1101": {}}
+        is_calendar, oos_calendar = cb.split_is_oos(df.index, is_ratio=0.7)
+
+        calls = []
+
+        def _fake_backtest(price_data, universe, master_calendar, starting_capital, variant="B",
+                            lots=2, top_n=3, max_concurrent_positions=3, atr_stop_mult=1.0,
+                            atr_target_mult=2.0, atr_period=14, max_hold_days=60,
+                            slippage_pct=0.0, features_by_code=None):
+            calls.append({"master_calendar": master_calendar, "features_by_code": features_by_code})
+            # 每次呼叫都回傳跟calendar長度成比例的固定小賺交易，確保IS/OOS筆數不同，
+            # 可以用來確認真的各自獨立跑了一次(不是共用同一份結果)。
+            d = master_calendar[0]
+            return [{
+                "code": "1101", "side": "long", "entry_date": d,
+                "exit_date": d, "e_price": 100.0, "exit_price": 101.0,
+                "exit_reason": "target", "lots": 1, "pnl_ntd": 100.0,
+                "return_pct": 0.01, "hold_days": 1,
+            }]
+
+        monkeypatch.setattr(cb, "run_squeeze_kdj_capital_constrained_backtest", _fake_backtest)
+
+        result = cb.evaluate_squeeze_kdj_capital_constrained(
+            price_data, universe, starting_capital=1_000_000,
+            is_calendar=is_calendar, oos_calendar=oos_calendar, variant="B",
+            top_n=3, max_concurrent_positions=3, lots=2,
+        )
+
+        assert len(calls) == 2  # IS一次、OOS一次，各自獨立呼叫，不是共用同一次結果
+        assert list(calls[0]["master_calendar"]) == list(is_calendar)
+        assert list(calls[1]["master_calendar"]) == list(oos_calendar)
+        # 兩次呼叫共用同一份(已經預先算好的)features_by_code
+        assert calls[0]["features_by_code"] is calls[1]["features_by_code"]
+
+        assert set(result.keys()) == {"label", "IS", "OOS", "bootstrap", "oos_trades"}
+        assert result["IS"]["trade_count"] == 1
+        assert result["OOS"]["trade_count"] == 1
+        expected_bootstrap_keys = {"mean", "p5", "p95", "pct_positive", "p_value", "pnl_excluding_top3_ntd"}
+        assert expected_bootstrap_keys.issubset(result["bootstrap"].keys())
+
+
+class TestSqueezeKdjCapitalConstrainedCliModeSkipsFullPipeline:
+    """--squeeze-kdj-capital-constrained這個CLI旗標只該呼叫
+    evaluate_squeeze_kdj_capital_constrained()(變體A、B各一次)，main()完整流程的
+    其餘階段(突破窗口比較、突破風格比較、單一訊號拆解、訊號組合比較、結構門檻變體
+    比較、ATR敏感度網格、出場配置比較，以及walk-forward/固定規則walk-forward/
+    跨週期驗證、甚至--squeeze-kdj-only本身)全部不該被呼叫，改成走
+    run_squeeze_kdj_capital_constrained_mode()，輸出
+    squeeze_kdj_capital_constrained_is_oos.csv+summary.txt。"""
+
+    def _build_fake_price_data(self, n=260, seed=23):
+        np.random.seed(seed)
+        idx = pd.date_range("2019-01-01", periods=n, freq="B")
+
+        def _df(closes):
+            closes = pd.Series(closes, index=idx, dtype=float)
+            return pd.DataFrame({
+                "Open": closes, "High": closes * 1.01, "Low": closes * 0.99, "Close": closes,
+                "Volume": pd.Series(1500.0, index=idx),
+            }, index=idx)
+
+        index_trend = np.linspace(0, 30, n) + np.random.normal(0, 1.2, n)
+        stock_trend = np.linspace(0, -15, n) + np.random.normal(0, 1.2, n)
+        return {
+            "2330": _df(np.maximum(100 + index_trend, 1.0)),
+            "1101": _df(np.maximum(100 + stock_trend, 1.0)),
+        }
+
+    def _patch_heavy_stages_to_explode(self, monkeypatch):
+        heavy_stage_names = [
+            "run_breakout_window_comparison", "run_breakout_style_comparison",
+            "run_signal_ablation", "run_signal_combo_comparison", "run_gate_comparison",
+            "run_atr_sensitivity_grid", "run_exit_style_comparison",
+            "run_walkforward_validation", "run_fixed_combo_walkforward",
+            "run_squeeze_kdj_exit_style_comparison", "run_squeeze_kdj_exit_style_comparison_is_oos",
+            "run_squeeze_kdj_only_mode", "run_multi_period_validation",
+        ]
+
+        def _boom(name):
+            def _inner(*args, **kwargs):
+                raise AssertionError(f"--squeeze-kdj-capital-constrained模式不該呼叫完整流程的階段函式：{name}")
+            return _inner
+
+        for name in heavy_stage_names:
+            monkeypatch.setattr(cb, name, _boom(name))
+
+    def test_skips_full_pipeline_and_writes_capital_constrained_output(self, monkeypatch, tmp_path):
+        import data_loader
+        import chip_data_loader
+
+        fake_price_data = self._build_fake_price_data()
+        monkeypatch.setattr(cb, "load_price_data", lambda *a, **k: fake_price_data)
+
+        def _boom(*args, **kwargs):
+            raise AssertionError("--squeeze-kdj-capital-constrained模式不該呼叫任何資料下載函式")
+        monkeypatch.setattr(data_loader, "load_price_data", _boom)
+        monkeypatch.setattr(chip_data_loader, "load_chip_data", _boom)
+
+        self._patch_heavy_stages_to_explode(monkeypatch)
+        monkeypatch.setattr(cb, "RESULTS_DIR", str(tmp_path))
+
+        evaluate_calls = []
+        real_evaluate = cb.evaluate_squeeze_kdj_capital_constrained
+
+        def _spy(*args, **kwargs):
+            evaluate_calls.append(kwargs.get("variant") or (args[5] if len(args) > 5 else None))
+            return real_evaluate(*args, **kwargs)
+        monkeypatch.setattr(cb, "evaluate_squeeze_kdj_capital_constrained", _spy)
+
+        argv = [
+            "compare_breakout.py", "--squeeze-kdj-capital-constrained", "--max-stocks", "2",
+            "--starting-capital", "1000000",
+        ]
+        monkeypatch.setattr(sys, "argv", argv)
+
+        cb.main()
+
+        assert len(evaluate_calls) == 2  # 變體A、變體B各一次
+
+        csv_path = os.path.join(str(tmp_path), "squeeze_kdj_capital_constrained_is_oos.csv")
+        summary_path = os.path.join(str(tmp_path), "summary.txt")
+        assert os.path.exists(csv_path)
+        assert os.path.exists(summary_path)
+
+        summary_text = open(summary_path, encoding="utf-8").read()
+        assert "--squeeze-kdj-capital-constrained模式" in summary_text
+        assert "資金受限版" in summary_text
+        assert "樣本外(OOS)" in summary_text
+        assert "bootstrap" in summary_text
+        # 核心訴求：有明確對照資金無限版的數字並講清楚撐住/打折/崩潰
+        assert "對照資金無限版" in summary_text
+        assert "排名judgment call" in summary_text
+        # 完整流程/--squeeze-kdj-only才會出現的區塊標題，這裡不該印出來
+        assert "[階段0]" not in summary_text
+        assert "ATR倍數敏感度網格" not in summary_text
+        assert "--squeeze-kdj-only模式" not in summary_text

@@ -154,6 +154,7 @@ from robustness_analysis import (
 from taifex_universe import get_contract_multiplier
 from squeeze_kdj_signal import (
     compute_squeeze_kdj_features, simulate_variant_a_trades, simulate_variant_b_trades,
+    precompute_squeeze_kdj_features_by_code, run_squeeze_kdj_capital_constrained_backtest,
 )
 
 RESULTS_DIR = os.path.join(os.path.dirname(__file__), "results_breakout")
@@ -993,6 +994,187 @@ def run_squeeze_kdj_only_mode(args, price_data, universe, is_calendar, oos_calen
     print(f"\n已輸出：{summary_path}")
 
 
+# 之前(--squeeze-kdj-only)驗證過的「資金無限」OOS基準數字，寫死在這裡純粹是為了讓
+# run_squeeze_kdj_capital_constrained_mode()的summary能做「誠實對照」，不是這裡重新跑出來的——
+# 如果之後--squeeze-kdj-only的驗證結果改變(例如universe/期間設定不同)，這裡的基準數字
+# 應該跟著更新，不然對照會失真。
+SQUEEZE_KDJ_UNCONSTRAINED_OOS_REFERENCE = {
+    "A": {"profit_factor": 5.01, "avg_hold_days": 16.2},
+    "B": {"profit_factor": 3.44, "avg_hold_days": 6.1},
+}
+
+
+def evaluate_squeeze_kdj_capital_constrained(price_data: dict, universe: dict, starting_capital: float,
+                                              is_calendar, oos_calendar, variant: str = "B",
+                                              top_n: int = 3, max_concurrent_positions: int = 3,
+                                              lots: int = 2) -> dict:
+    """
+    把squeeze_kdj_signal.run_squeeze_kdj_capital_constrained_backtest()接上這個檔案
+    既有的IS/OOS + bootstrap驗證方法論，結構完全比照evaluate_combo()：IS/OOS calendar
+    各自完整跑一次day-by-day回測(不是先跑一次全期間再事後切分)，因為資金/部位管理
+    本身有跨日的狀態(open_positions/cooldown_until)，IS跑到最後剩下的未平倉部位、冷卻期
+    不該帶進OOS那次回測——每次呼叫都是全新的trades=[]/open_positions=[]/cooldown_until={}，
+    OOS那次回測對「IS最後幾天發生了什麼」完全不知情，這是跟compare_breakout.py其餘所有
+    IS/OOS組合(evaluate_combo()/run_walkforward_validation()等)一致的做法，也是
+    run_squeeze_kdj_exit_style_comparison_is_oos()故意指出「這裡不適用」的那個模式——
+    那個函式是先一次性模擬完整段落再用entry_date切分，原因是它完全不經過day-by-day
+    master_calendar迴圈(直接呼叫simulate_variant_a_trades/simulate_variant_b_trades)，
+    沒有calendar可以切；這裡改用run_squeeze_kdj_capital_constrained_backtest()，本來
+    就是day-by-day walk-forward，有calendar可以切，就該跟專案裡其他有calendar的回測
+    一樣老老實實跑兩次。
+
+    features_by_code(BB/KC/KDJ狀態機計算)只算一次、IS/OOS共用——這部分不受
+    max_concurrent_positions/variant等資金管理參數影響，跟其他引擎的precompute_*
+    共用慣例一致。
+
+    回傳格式跟evaluate_combo()一樣：{"label", "IS", "OOS", "bootstrap", "oos_trades"}，
+    方便呼叫端用同一套輸出/印法(例如_squeeze_kdj_is_oos_results_to_df()可以直接重用，
+    只要把variant="A"/"B"兩次呼叫的結果組成{"A": ..., "B": ...}這種dict)。
+    """
+    features_by_code = precompute_squeeze_kdj_features_by_code(price_data, universe)
+    label = f"資金受限版 {SQUEEZE_KDJ_VARIANT_LABELS[variant]}(max_concurrent_positions={max_concurrent_positions}, top_n={top_n})"
+
+    results = {"label": label}
+    oos_trades = None
+    for split_name, calendar in [("IS", is_calendar), ("OOS", oos_calendar)]:
+        trades = run_squeeze_kdj_capital_constrained_backtest(
+            price_data=price_data, universe=universe, master_calendar=calendar,
+            starting_capital=starting_capital, variant=variant, lots=lots,
+            top_n=top_n, max_concurrent_positions=max_concurrent_positions,
+            features_by_code=features_by_code,
+        )
+        stats = summarize_mr(trades, starting_capital)
+        results[split_name] = stats
+        if split_name == "OOS":
+            oos_trades = trades
+
+    bootstrap_results = bootstrap_resample_pnl(oos_trades or [], n_resamples=1000, seed=42)
+    bootstrap_stats = summarize_bootstrap(bootstrap_results)
+    results["bootstrap"] = {
+        **bootstrap_stats,
+        "p_value": bootstrap_p_value(bootstrap_results),
+        "pnl_excluding_top3_ntd": pnl_excluding_top_n_trades(oos_trades or [], n=3),
+    }
+    results["oos_trades"] = oos_trades
+    return results
+
+
+def run_squeeze_kdj_capital_constrained_mode(args, price_data, universe, is_calendar, oos_calendar):
+    """--squeeze-kdj-capital-constrained模式：把已經驗證過(--squeeze-kdj-only)的
+    squeeze+KDJ進場訊號，接上這個專案「真正會拿去模擬實戰」的資金/部位管理框架
+    (top_n排名+max_concurrent_positions持倉上限+保證金查表，見
+    squeeze_kdj_signal.run_squeeze_kdj_capital_constrained_backtest())，回答
+    --squeeze-kdj-only刻意沒有回答的問題：「拿掉『資金無限、每個訊號都能同時成交』
+    這個樂觀假設之後，實際帳戶能拿到的PF還剩多少」。
+
+    只跑變體A跟變體B各一組(max_concurrent_positions=3, top_n=3)，不另外做
+    max_concurrent_positions=1 vs 3這種維度的網格——這兩個是本來就已經驗證過方向正確
+    的訊號，這裡要回答的是「資金受限後退化多少」這一個問題，不是重新做一次參數搜尋
+    (參數搜尋的多重比較風險，這個repo已經在--simple-combo/--combo-search的docstring
+    裡用IS PF=1.41/OOS PF=0.48的真實教訓講得很清楚了，這裡沒有必要再冒一次)；
+    max_concurrent_positions=3/top_n=3是矩陣裡一個中庸、不算激進的設定，足以看出
+    「有資金限制 vs 沒有」這個最核心的對比，GitHub Actions本來就已經跑得很慢，
+    --squeeze-kdj-only存在的理由就是給一個快速模式，這裡沒有必要犧牲這個優點。
+    """
+    print("=" * 100)
+    print("--squeeze-kdj-capital-constrained模式：把squeeze+KDJ訊號接上資金/部位管理框架"
+          "(top_n排名+max_concurrent_positions持倉上限+保證金查表)，看真實帳戶(資金有限、"
+          "不可能同時吃下所有訊號)實際能拿到的PF")
+    print("=" * 100)
+
+    results = {}
+    for variant in ("A", "B"):
+        print(f"\n[{SQUEEZE_KDJ_VARIANT_LABELS[variant]}] 資金受限版 "
+              f"(max_concurrent_positions=3, top_n=3) ...")
+        results[variant] = evaluate_squeeze_kdj_capital_constrained(
+            price_data, universe, args.starting_capital, is_calendar, oos_calendar,
+            variant=variant, top_n=3, max_concurrent_positions=3, lots=2,
+        )
+
+    constrained_df = _squeeze_kdj_is_oos_results_to_df(results)
+    constrained_df.to_csv(os.path.join(RESULTS_DIR, "squeeze_kdj_capital_constrained_is_oos.csv"),
+                           index=False, encoding="utf-8-sig")
+
+    summary_lines = [
+        "=" * 100,
+        "布林+Keltner擠壓+KDJ訊號 --squeeze-kdj-capital-constrained模式"
+        "(資金/部位受限版，接上top_n排名+max_concurrent_positions持倉上限+保證金查表)",
+        f"回測期間：{args.start} ~ {args.end}　起始資金：NT${args.starting_capital:,.0f}",
+        "=" * 100,
+        "\n(這個比較跟--squeeze-kdj-only共用同一個訊號定義，差別只在這裡加上了真實帳戶的"
+        "資金/部位管理限制；只做多方，見squeeze_kdj_signal.py模組docstring)",
+    ]
+    for variant, r in results.items():
+        ref = SQUEEZE_KDJ_UNCONSTRAINED_OOS_REFERENCE[variant]
+        print(f"  [{r['label']}]")
+        summary_lines.append(f"\n  [{r['label']}]")
+        for split_name in ["IS", "OOS"]:
+            stats = r[split_name]
+            split_full = "樣本內(IS)" if split_name == "IS" else "樣本外(OOS) ← 較誠實的參考依據"
+            line = (f"    {split_full}: {stats['trade_count']}筆, PF={_fmt_pf(stats['profit_factor'])}, "
+                    f"勝率={stats['win_rate']:.1f}%, 平均持有{stats['avg_hold_days']:.1f}天, "
+                    f"總損益NT${stats['total_pnl_ntd']:,.0f}, "
+                    f"最大回撤NT${stats['max_drawdown_ntd']:,.0f}, 最大連續虧損{stats['max_consecutive_losses']}筆")
+            print("  " + line.strip())
+            summary_lines.append(line)
+        b = r["bootstrap"]
+        boot_line = (f"    [穩健性] OOS bootstrap 1000次重抽樣：平均總損益NT${b['mean']:,.0f}，"
+                     f"5%~95%區間=[NT${b['p5']:,.0f}, NT${b['p95']:,.0f}]，"
+                     f"正報酬比例={b['pct_positive']:.1f}%，p值={b['p_value']:.3f}，"
+                     f"拿掉最大3筆交易後總損益NT${b['pnl_excluding_top3_ntd']:,.0f}")
+        print("  bootstrap：正報酬比例={:.1f}%, p值={:.3f}, 拿掉最大3筆後損益={:,.0f}".format(
+            b["pct_positive"], b["p_value"], b["pnl_excluding_top3_ntd"]))
+        summary_lines.append(boot_line)
+
+        # 這是整個練習最核心的輸出：跟之前--squeeze-kdj-only算出的「資金無限」OOS PF
+        # 直接對照，誠實講清楚資金受限後是「撐住」「打折」還是「崩潰」。
+        oos_pf = r["OOS"]["profit_factor"]
+        unconstrained_pf = ref["profit_factor"]
+        if oos_pf == float("inf") or unconstrained_pf == 0:
+            verdict = "(無法直接算比例，見原始數字自行判斷)"
+        elif oos_pf >= unconstrained_pf * 0.8:
+            verdict = "PF大致撐住(>=資金無限版的80%)，資金限制對這個訊號的影響不大"
+        elif oos_pf >= unconstrained_pf * 0.4:
+            verdict = "PF明顯打折(介於資金無限版的40%~80%之間)，資金限制確實有實質影響，" \
+                      "不能直接拿資金無限版的數字當實盤期待"
+        elif oos_pf > 1.0:
+            verdict = "PF大幅崩潰(<資金無限版的40%)，但仍>1，資金受限後優勢大幅萎縮"
+        else:
+            verdict = "PF崩潰到<=1，資金受限後這個訊號在真實帳戶規模下可能已經不具優勢"
+        compare_line = (
+            f"    ⚖️ 對照資金無限版(--squeeze-kdj-only)OOS PF={_fmt_pf(unconstrained_pf)}"
+            f"(平均持有{ref['avg_hold_days']:.1f}天) vs 資金受限版OOS PF={_fmt_pf(oos_pf)}"
+            f"(平均持有{r['OOS']['avg_hold_days']:.1f}天)：{verdict}"
+        )
+        print(compare_line.strip())
+        summary_lines.append(compare_line)
+
+    ranking_caveat = (
+        "\n  ⚠️ 排名judgment call：同一天如果有超過max_concurrent_positions個空位的候選同時"
+        "觸發訊號，這裡用「觸發K棒當天本身的漲幅(close_t/close_t-1 - 1)」排名、漲幅越大越"
+        "優先進場——這是為了資金受限情境才新增的判斷，不是原始--squeeze-kdj-only驗證過的"
+        "進場規則的一部分(原始驗證裡每個訊號都視為獨立可成交，不存在『選誰』這個問題)。"
+        "這個排名規則本身完全沒有被驗證過是不是真的有效，只是在『資金有限、必須選一個』"
+        "的前提下，一個跟進場規則本身相關、沒有引入新假設的務實選擇，不該被誤認成已經"
+        "驗證過的訊號品質排序。"
+    )
+    print(ranking_caveat.strip())
+    summary_lines.append(ranking_caveat)
+    summary_lines.append(
+        "\n判讀方式：先看OOS PF是不是也>1，再看跟資金無限版的對照(上面每個變體後面的"
+        "⚖️那一行)是撐住/打折/崩潰，最後看bootstrap正報酬比例(>80%才算站得住)跟p值"
+        "(越接近0越好)。這整組數字才是比較貼近『我的帳戶實際能拿到的PF』的誠實答案，"
+        "--squeeze-kdj-only算出的PF=5.01/3.44本來就刻意不考慮資金限制，不該直接拿來"
+        "當實盤期待(見run_squeeze_kdj_exit_style_comparison_is_oos() docstring的caveat)。"
+    )
+
+    summary_text = "\n".join(summary_lines)
+    summary_path = os.path.join(RESULTS_DIR, "summary.txt")
+    with open(summary_path, "w", encoding="utf-8") as f:
+        f.write(summary_text + "\n")
+    print(f"\n已輸出：{summary_path}")
+
+
 def evaluate_combo(label, price_data, indicators_by_code, regime_series, is_calendar, oos_calendar,
                     starting_capital, hold_days, signal_weights, gate_kwargs, atr_stop_mult,
                     trailing_atr_mult, use_trailing_stop, extra_kwargs, execution_kwargs):
@@ -1737,6 +1919,22 @@ def main():
                               "--starting-capital/--max-stocks仍然有效，其餘跟訊號/門檻/突破窗口/"
                               "出場配置自動搜尋相關的旗標在這裡不適用(squeeze+KDJ的規則是寫死的，"
                               "不是被忽略，是這些旗標控制的維度跟這個模式測的東西無關)")
+    parser.add_argument("--squeeze-kdj-capital-constrained", action="store_true",
+                         help="資金/部位受限版squeeze+KDJ驗證(--squeeze-kdj-capital-constrained)："
+                              "把--squeeze-kdj-only已經驗證過的進場訊號，接上這個專案『真正會拿去"
+                              "模擬實戰』的資金/部位管理框架(top_n排名+max_concurrent_positions"
+                              "持倉上限+保證金查表，見squeeze_kdj_signal.run_squeeze_kdj_"
+                              "capital_constrained_backtest())，跑一次day-by-day walk-forward"
+                              "+IS/OOS/bootstrap驗證，輸出變體A/B各自的資金受限版PF，並明確對照"
+                              "--squeeze-kdj-only算出的資金無限版OOS PF(變體A=5.01/變體B=3.44)，"
+                              "誠實講清楚『拿掉每個訊號都能無限制同時成交這個樂觀假設之後，實際"
+                              "帳戶能拿到的PF撐住、打折、還是崩潰』——這是--squeeze-kdj-only刻意"
+                              "沒有回答的問題(--squeeze-kdj-only的訊號驗證完全不經過資金/部位管理，"
+                              "見該模式docstring的誠實caveat)。跟--squeeze-kdj-only一樣跳過突破窗口"
+                              "比較→突破風格比較→訊號自動搜尋→門檻網格→ATR敏感度網格→出場配置網格"
+                              "這整套6階段流程(squeeze+KDJ的訊號規則本身跟那6個階段選出的東西無關)。"
+                              "加這個旗標時，--start/--end/--starting-capital/--max-stocks仍然有效，"
+                              "其餘跟訊號/門檻/突破窗口/出場配置自動搜尋相關的旗標在這裡不適用")
     parser.add_argument("--fixed-combo-walkforward-folds", type=int, default=0,
                          help="測試幾組「固定死不重新挑選」的候選規則(FIXED_WALKFORWARD_COMBO_VARIANTS，"
                               "基準+只改一個維度的變體)跨N個獨立、不重疊歷史區塊的表現，0代表不啟用(預設)。"
@@ -1819,6 +2017,10 @@ def main():
 
     if args.squeeze_kdj_only:
         run_squeeze_kdj_only_mode(args, price_data, universe, is_calendar, oos_calendar)
+        return
+
+    if args.squeeze_kdj_capital_constrained:
+        run_squeeze_kdj_capital_constrained_mode(args, price_data, universe, is_calendar, oos_calendar)
         return
 
     if args.use_trailing_stop:
