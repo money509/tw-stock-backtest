@@ -552,13 +552,26 @@ def precompute_squeeze_kdj_backtest_arrays(price_data: dict, features_by_code: d
         ma = close.rolling(ENTRY_FILTER_MA_PERIOD).mean()
         above_ma = (close > ma).shift(1).fillna(False).astype(bool).to_numpy()
 
+        open_arr = df["Open"].to_numpy(dtype=float)
+        high_arr = df["High"].to_numpy(dtype=float)
+        low_arr = df["Low"].to_numpy(dtype=float)
+        close_arr = close.to_numpy(dtype=float)
+        # 價格不完整的列(Open/High/Low/Close任一個是NaN)一律當成「這天沒有這檔的資料」：
+        # data_loader.load_price_data()只用dropna(how="all")清資料，yfinance偶爾會回傳
+        # 「有成交量、但價格欄位是NaN」的列，這種列會留在price_data裡。如果不排除，
+        # NaN開盤價會被拿去當成交價、NaN收盤價會被拿去強制平倉，損益變成NaN之後，
+        # 風險預算口數int(NaN)會直接讓整個程式崩潰(GitHub Actions --squeeze-kdj-grid
+        # 實際發生過exit code 1)。這裡讓這種列跟「日期不在df.index裡」走同一條路：
+        # 持倉當天不做出場判定(留到下一個有效交易日)、當天也不會產生進場候選。
+        valid_price = np.isfinite(open_arr) & np.isfinite(high_arr) & np.isfinite(low_arr) & np.isfinite(close_arr)
+
         per_code[code] = {
             "dates": index,
-            "date_to_idx": {d: i for i, d in enumerate(index)},
-            "open": df["Open"].to_numpy(dtype=float),
-            "high": df["High"].to_numpy(dtype=float),
-            "low": df["Low"].to_numpy(dtype=float),
-            "close": close.to_numpy(dtype=float),
+            "date_to_idx": {d: i for i, d in enumerate(index) if valid_price[i]},
+            "open": open_arr,
+            "high": high_arr,
+            "low": low_arr,
+            "close": close_arr,
             "k": k,
             "entry_today": entry_today,
             "stop_a": stop_a,
@@ -571,6 +584,8 @@ def precompute_squeeze_kdj_backtest_arrays(price_data: dict, features_by_code: d
         for i in np.flatnonzero(entry_today):
             if np.isnan(trigger_strength[i]):
                 continue
+            if not valid_price[i]:
+                continue  # 進場日(t+1)價格不完整，沒有可信的開盤成交價，見上方valid_price說明
             events_by_date.setdefault(index[i], []).append((code, int(i)))
 
     return {"atr_period": atr_period, "per_code": per_code, "events_by_date": events_by_date}
@@ -842,7 +857,8 @@ def run_squeeze_kdj_capital_constrained_backtest(price_data: dict, universe: dic
             lots_to_use = lots
             if risk_pct_per_trade is not None:
                 mult = get_contract_multiplier(code, open_p)
-                if stop_distance <= 0 or mult <= 0:
+                if not (np.isfinite(stop_distance) and np.isfinite(equity) and np.isfinite(mult)) \
+                        or stop_distance <= 0 or mult <= 0:
                     diag["skipped_invalid_stop"] += 1
                     continue
                 computed_lots = int(equity * risk_pct_per_trade // (stop_distance * mult))

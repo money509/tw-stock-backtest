@@ -331,6 +331,53 @@ class TestPrecomputeSqueezeKdjFeaturesByCode:
             assert col in result["1102"].columns
 
 
+class TestCapitalConstrainedNaNPriceRows:
+    """回歸測試：GitHub Actions --squeeze-kdj-grid在真實資料上exit code 1。
+    data_loader只用dropna(how="all")清資料，yfinance偶爾回傳「有成交量但價格是NaN」的列，
+    這種列以前會被拿去當成交價/強制平倉價，損益變NaN後風險預算口數int(NaN)直接崩潰。
+    現在價格不完整的列一律當成「這天沒有這檔的資料」。"""
+
+    def test_no_entry_when_entry_day_open_is_nan(self):
+        df = _make_flat_df(20.0, n=20)
+        df.iloc[6, df.columns.get_loc("Open")] = np.nan  # EntryFlag在idx5 → 原本該在idx6開盤進場
+        features = _make_fixed_features(df, entry_idx=5, prior_low=1.0)
+        trades = run_squeeze_kdj_capital_constrained_backtest(
+            {"1101": df}, {"1101": {}}, df.index, starting_capital=1_000_000, variant="A",
+            max_concurrent_positions=1, top_n=1, features_by_code={"1101": features}, max_hold_days=3,
+        )
+        assert trades == []
+
+    def test_open_position_skips_nan_day_instead_of_closing_at_nan_price(self):
+        df = _make_flat_df(20.0, n=20)
+        df.iloc[8, :] = np.nan  # 原本max_hold_days=3會在idx8用收盤價強制平倉
+        features = _make_fixed_features(df, entry_idx=5, prior_low=1.0)
+        trades = run_squeeze_kdj_capital_constrained_backtest(
+            {"1101": df}, {"1101": {}}, df.index, starting_capital=1_000_000, variant="A",
+            max_concurrent_positions=1, top_n=1, features_by_code={"1101": features}, max_hold_days=3,
+        )
+        assert len(trades) == 1
+        assert trades[0]["exit_date"] == df.index[9]
+        assert np.isfinite(trades[0]["exit_price"]) and np.isfinite(trades[0]["pnl_ntd"])
+
+    def test_risk_sizing_does_not_crash_with_nan_rows(self):
+        df = _make_flat_df(20.0, n=30)
+        df.iloc[8, :] = np.nan
+        df.iloc[16, df.columns.get_loc("Open")] = np.nan
+        n = len(df)
+        entry_flag = np.zeros(n, dtype=bool)
+        entry_flag[[5, 15, 20]] = True
+        features = pd.DataFrame({
+            "EntryFlag": entry_flag, "PriorLow": np.where(entry_flag, 15.0, np.nan),
+            "K": [50.0] * n,
+        }, index=df.index)
+        trades = run_squeeze_kdj_capital_constrained_backtest(
+            {"1101": df}, {"1101": {}}, df.index, starting_capital=1_000_000, variant="A",
+            max_concurrent_positions=1, top_n=1, features_by_code={"1101": features},
+            max_hold_days=3, risk_pct_per_trade=0.02,
+        )
+        assert all(np.isfinite(t["pnl_ntd"]) for t in trades)
+
+
 class TestCapitalConstrainedInvalidVariant:
     def test_invalid_variant_raises_value_error(self):
         price_data = {"1101": _make_flat_df(20.0)}
