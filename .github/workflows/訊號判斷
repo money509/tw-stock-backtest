@@ -1,0 +1,99 @@
+name: 擠壓+KDJ 每日訊號(收盤後掃描)
+
+# 每個交易日收盤後掃一次全部股票期貨標的，結果寫進 signals/latest.md(隔天開盤前用手機看)，
+# 同時保留 signals/YYYY-MM-DD.md / .csv 當歷史紀錄，並commit回repo。
+#
+# 排程注意事項：
+#  - GitHub的cron一律是UTC。"0 11 * * 1-5" = 週一~週五 UTC 11:00 = 台北時間 19:00(台灣沒有夏令時間)。
+#    台股13:30收盤，留5個半小時給資料源(yfinance/Yahoo)更新當天日K。
+#  - GitHub排程常常會延遲(尖峰時段延遲幾分鐘到一小時以上都有)，偶爾甚至會漏跑；
+#    如果早上看到 latest.md 的日期不是昨天(上一個交易日)，請手動到Actions頁面按 Run workflow。
+#  - 國定假日(休市)也會照跑：那天沒有新資料，latest.md 會顯示「資料還沒更新」的警告，忽略即可。
+#  - 排程只會在預設分支(default branch)上執行；這個檔案要合併進預設分支才會開始自動跑。
+#  - repo連續60天沒有任何活動，GitHub會自動停用排程；這裡每天commit signals/ 本身就算活動，
+#    正常情況下不會被停用(如果被停用了，到Actions頁面重新Enable即可)。
+
+on:
+  schedule:
+    - cron: "0 11 * * 1-5"
+  workflow_dispatch:
+    inputs:
+      as_of:
+        description: '訊號日(YYYY-MM-DD)，留空=今天(台北時間)；用來回補或測試某一天'
+        required: false
+        default: ''
+      capital:
+        description: '帳戶資金(新台幣)，用來判斷單筆保證金是否超過35%上限'
+        required: false
+        default: '200000'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: daily-squeeze-signals
+  cancel-in-progress: false
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      # 只跑掃描器自己的測試當開跑前檢查(包含「跟回測逐日一致」的比對)，不跑整套測試，保持快速。
+      - name: Pre-flight test
+        run: python -m pytest -q test_daily_squeeze_signals.py
+
+      # 不使用 actions/cache：掃描器每次都強制重新下載(refresh)，避免讀到資料還沒更新時的舊快取。
+      - name: Scan signals
+        env:
+          AS_OF: ${{ github.event.inputs.as_of }}
+          CAPITAL: ${{ github.event.inputs.capital }}
+        run: |
+          ARGS="--output-dir signals"
+          if [ -n "$AS_OF" ]; then
+            ARGS="$ARGS --as-of $AS_OF"
+          fi
+          if [ -n "$CAPITAL" ]; then
+            ARGS="$ARGS --capital $CAPITAL"
+          fi
+          python daily_squeeze_signals.py $ARGS
+
+      - name: Commit signals back to repo
+        env:
+          AS_OF: ${{ github.event.inputs.as_of }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add signals/
+          if git diff --cached --quiet; then
+            echo "signals/ 沒有變更，不commit"
+            exit 0
+          fi
+          git commit -m "擠壓+KDJ每日訊號 ${AS_OF:-$(TZ=Asia/Taipei date +%F)}"
+          for i in 1 2 3; do
+            git pull --rebase origin "${GITHUB_REF_NAME}" && git push origin "HEAD:${GITHUB_REF_NAME}" && exit 0
+            echo "push失敗，第${i}次重試 ..."
+            sleep 5
+          done
+          exit 1
+
+      - name: Upload signals
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: daily-squeeze-signals
+          path: signals/
+          if-no-files-found: warn
