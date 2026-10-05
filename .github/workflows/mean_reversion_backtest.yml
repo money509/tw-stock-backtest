@@ -75,6 +75,10 @@ on:
         description: '只驗證squeeze+KDJ模式(--squeeze-kdj-only)：只跑布林+Keltner擠壓+KDJ訊號的IS/OOS+bootstrap驗證，跳過突破窗口比較/突破風格比較/訊號自動搜尋/門檻網格/ATR網格/出場配置網格這整套6階段流程——squeeze+KDJ驗證本來就不依賴那6個階段選出的任何東西(它是獨立對universe逐檔股票模擬，訊號本身的進場/出場規則寫死在squeeze_kdj_signal.py裡)，開這個選項可以不用等前面不相關的流程跑完，直接看這個訊號的IS/OOS/bootstrap結果，跑起來比simple_combo/combo_search更快。開啟後，上面max_stocks/starting_capital/atr_stop_mult/trailing_atr_mult/start_date/end_date仍然有效，其餘跟訊號/門檻/突破窗口/出場配置自動搜尋相關的選項在這裡不適用'
         required: false
         default: 'false'
+      squeeze_kdj_capital_constrained:
+        description: '資金/部位受限版squeeze+KDJ驗證(--squeeze-kdj-capital-constrained)：squeeze_kdj_only驗證的是「每個觸發訊號都能無限制同時成交」這個樂觀假設下的訊號品質(變體A/B的OOS PF分別約5.01/3.44)，這個選項回答squeeze_kdj_only刻意沒有回答的問題——拿掉這個樂觀假設、把同一套進場/出場訊號接上這個repo「真正會拿去模擬實戰」的資金/部位管理框架(top_n排名+max_concurrent_positions持倉上限+保證金查表，固定max_concurrent_positions=3/top_n=3)之後，真實帳戶實際能拿到的PF還剩多少(撐住/打折/崩潰，summary.txt會明確對照squeeze_kdj_only的數字講清楚)。同樣跳過突破窗口比較/突破風格比較/訊號自動搜尋/門檻網格/ATR網格/出場配置網格這6階段流程，只是比squeeze_kdj_only多了一層資金管理的現實限制，跑起來比squeeze_kdj_only慢一點(day-by-day逐日競爭有限名額，不是每檔股票獨立一次性模擬)但仍然比完整6階段流程快很多。開啟後，上面max_stocks/starting_capital/start_date/end_date仍然有效，其餘跟訊號/門檻/突破窗口/出場配置自動搜尋相關的選項在這裡不適用；注意這個選項跟squeeze_kdj_only目前是互斥的(main()依序檢查，squeeze_kdj_only若同時開啟會先被處理並直接return，這個選項就不會執行)，兩個都想看的話請分兩次分別執行'
+        required: false
+        default: 'false'
 
 jobs:
   backtest:
@@ -153,6 +157,9 @@ jobs:
           fi
           if [ "${{ github.event.inputs.squeeze_kdj_only }}" = "true" ]; then
             ARGS="$ARGS --squeeze-kdj-only"
+          fi
+          if [ "${{ github.event.inputs.squeeze_kdj_capital_constrained }}" = "true" ]; then
+            ARGS="$ARGS --squeeze-kdj-capital-constrained"
           fi
           python compare_breakout.py $ARGS
 
