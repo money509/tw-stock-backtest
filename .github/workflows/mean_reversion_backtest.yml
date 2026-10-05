@@ -83,6 +83,10 @@ on:
         description: 'squeeze+KDJ資金受限版混搭網格搜尋(--squeeze-kdj-grid)：把風控、交易管理、進場方式混在一起找最佳組合——出場方式10種(變體A原規則1種、變體B固定ATR停損1.0/1.5/2.0倍x停利2.0/3.0倍共6種、變體B移動停利1.5/2.0/3.0倍ATR共3種)x最多同時持倉1/3/5檔x部位大小(固定1口/固定2口/每筆風險1%/每筆風險2%)x最長持有10/20/60天x同日多檔排名規則(觸發K棒漲幅/量比)x進場濾網(無/站上60日均線)，一共1440組。方法論是事先定死的：全部組合只在樣本內(IS)跑，用IS的PF選出唯一一個贏家(IS交易筆數至少30筆才有資格，同PF比IS總損益)，只有這個贏家才拿去樣本外(OOS)跑一次+bootstrap 1000次，當作誠實的頭條數字，並直接判定有沒有過專案門檻(bootstrap正報酬比例>80%且p值<0.2)；另外報告IS前10名在OOS的PF、IS PF跟OOS PF的Spearman排名相關(看IS排名到底能不能轉移到OOS，接近0或負代表選出來的「最佳」很可能只是雜訊)、全部1440組OOS PF的分布(只看分布，刻意不印也不該去挑「OOS最好的組合」，那等於拿OOS做選擇)。⚠️一次測1440組有嚴重的多重比較(multiple comparisons)風險，IS贏家的IS數字一定偏樂觀，summary.txt會醒目提醒；而且這段OOS在上一輪squeeze_kdj_capital_constrained已經看過一次，不是完全沒碰過的資料。起始資金不是網格維度(它是你真實帳戶的規模，用上面starting_capital設定)。輸出squeeze_kdj_grid_all_combos.csv(每組一列、中文欄名，含IS/OOS統計跟「名額已滿/保證金上限/風險口數不足1口/濾網擋掉」等診斷計數)+summary.txt。效能：回測已改成預先計算共用，合成資料實測1440組x(IS+OOS)在50檔約5秒、249檔(全部標的)約11秒就跑完，時間主要花在下載資料，max_stocks設0(全部)也遠低於步驟150分鐘上限，不需要另外限制max_stocks。開啟後，上面max_stocks/starting_capital/start_date/end_date仍然有效，其餘跟訊號/門檻/突破窗口/出場配置自動搜尋相關的選項在這裡不適用；跟squeeze_kdj_only/squeeze_kdj_capital_constrained互斥(main()依序檢查，那兩個若同時開啟會先執行並直接return，這個選項就不會執行)'
         required: false
         default: 'false'
+      squeeze_kdj_fixed:
+        description: 'squeeze+KDJ固定設定長歷史回測(--squeeze-kdj-fixed)：1440組網格(squeeze_kdj_grid)沒有選出通過驗證的設定之後，你自己選定的那一組——變體B固定ATR停損1.0倍/停利3.0倍、最多同時持有3檔、最長持有20天、同日多檔用觸發K棒漲幅排名、無進場濾網、top_n=3、ATR14天——拉長歷史重新檢驗。一共跑4個情境：固定1口/固定2口 x 成交模型(①理想成交：隔天開盤價成交、無滑價；②限價：用訊號那天的收盤價+1檔掛限價單，隔天開盤價超過限價就不追、等下一個訊號，有成交時進場多付1檔滑價(但不超過限價)，停損/跳空停損/持有到期強制平倉這類市價出場也多付1檔，固定價位停利是掛好的限價單不加滑價；1檔的大小依台股升降單位級距，股票期貨比照標的股票)。每個情境在整段期間連續回測一次(只有一組固定設定、沒有挑選，不需要切IS/OOS；連續跑才是真實帳戶的路徑)，再依進場日切成兩段：進場日早於2023-10-06的是「未見過區段」(網格跟你挑設定時完全沒看過的年份，這是報告裡最誠實的數字，會單獨做bootstrap 1000次並判定有沒有過專案門檻：PF>1且bootstrap正報酬比例>80%)，2023-10-06之後的是「已見過區段」(偏樂觀，只當對照)；另外輸出逐年表(交易筆數/PF/勝率/損益/年內最大回撤/拿掉最大3筆後損益)、診斷計數(含限價沒成交被略過幾次、佔多少比例)、權益路徑(期末權益/最大回撤金額與佔起始資金比例/最長連續虧損筆數)。⚠️請搭配「回測起始日期」(start_date)=2018-01-01、掃描股票數量(max_stocks)=0(全部標的)執行；起始日期留空(預設最近3年)會沒有未見過區段，summary會提醒你重跑。輸出squeeze_kdj_fixed_scenarios.csv/squeeze_kdj_fixed_yearly.csv/squeeze_kdj_fixed_trades.csv(中文欄名)+summary.txt。開啟後，上面max_stocks/starting_capital/start_date/end_date仍然有效，其餘跟訊號/門檻/突破窗口/出場配置自動搜尋相關的選項在這裡不適用；跟squeeze_kdj_only/squeeze_kdj_capital_constrained/squeeze_kdj_grid互斥(main()依序檢查，那幾個若同時開啟會先執行並直接return，這個選項就不會執行)。從2018年開始要下載約8.75年x全部標的的日K，第一次執行(沒有快取)下載會比3年多花幾分鐘，回測本身只要幾十秒，遠低於步驟150分鐘上限'
+        required: false
+        default: 'false'
 
 jobs:
   backtest:
@@ -167,6 +171,9 @@ jobs:
           fi
           if [ "${{ github.event.inputs.squeeze_kdj_grid }}" = "true" ]; then
             ARGS="$ARGS --squeeze-kdj-grid"
+          fi
+          if [ "${{ github.event.inputs.squeeze_kdj_fixed }}" = "true" ]; then
+            ARGS="$ARGS --squeeze-kdj-fixed"
           fi
           python compare_breakout.py $ARGS
 
