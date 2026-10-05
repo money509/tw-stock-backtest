@@ -1183,3 +1183,223 @@ class TestSqueezeKdjGridSpearmanWithoutScipy:
         is_pf = df["is_profit_factor"].replace([np.inf], 1e18)
         expected = scipy_stats.spearmanr(is_pf, df["oos_profit_factor"]).correlation
         assert got == pytest.approx(expected, abs=1e-12)
+
+
+# ============================================================================
+# --squeeze-kdj-fixed：使用者選定的單一固定設定，長歷史連續回測 + 限價1檔成交模型
+# ============================================================================
+from taifex_universe import STOCK_FUTURES_UNIVERSE
+
+
+def _fixed_trade(entry, exit_, pnl, code="1101"):
+    return {"code": code, "side": "long", "entry_date": pd.Timestamp(entry), "exit_date": pd.Timestamp(exit_),
+            "e_price": 100.0, "exit_price": 100.0, "exit_reason": "stop", "lots": 1,
+            "pnl_ntd": float(pnl), "return_pct": pnl / 200_000.0, "hold_days": 3}
+
+
+def _make_regime_switching_market(codes, start="2022-01-03", n_days=700, seed=0):
+    """波動度每40天在低/高之間切換，讓squeeze+KDJ訊號在合理資料量內會觸發好幾次。"""
+    rng = np.random.default_rng(seed)
+    idx = pd.bdate_range(start, periods=n_days)
+    price_data = {}
+    for code in codes:
+        vol = np.where((np.arange(n_days) // 40) % 2 == 0, 0.006, 0.025) * rng.uniform(0.7, 1.3)
+        close = 50 * rng.uniform(0.5, 4) * np.exp(np.cumsum(rng.normal(0.0002, vol)))
+        open_ = close * (1 + rng.normal(0, 0.004, n_days))
+        high = np.maximum(open_, close) * (1 + np.abs(rng.normal(0, 0.006, n_days)))
+        low = np.minimum(open_, close) * (1 - np.abs(rng.normal(0, 0.006, n_days)))
+        price_data[code] = pd.DataFrame({"Open": open_, "High": high, "Low": low, "Close": close,
+                                         "Volume": rng.lognormal(8, 0.5, n_days)}, index=idx)
+    return price_data, idx
+
+
+class TestSqueezeKdjFixedHelpers:
+    def test_split_at_grid_data_start_uses_entry_date(self):
+        trades = [_fixed_trade("2023-10-05", "2023-10-20", 100),   # 進場在前、出場在後 → 未見過
+                  _fixed_trade("2023-10-06", "2023-10-10", -50),   # 剛好在分界 → 已見過
+                  _fixed_trade("2024-01-02", "2024-01-05", 30)]
+        unseen, seen = cb.split_trades_by_grid_data_start(trades)
+        assert cb.SQUEEZE_KDJ_GRID_DATA_START == "2023-10-06"
+        assert [t["pnl_ntd"] for t in unseen] == [100]
+        assert [t["pnl_ntd"] for t in seen] == [-50, 30]
+
+    def test_yearly_table_groups_by_exit_year(self):
+        trades = [_fixed_trade("2018-12-27", "2019-01-03", 300),  # 進場2018、出場2019 → 算2019
+                  _fixed_trade("2019-03-01", "2019-03-05", -100),
+                  _fixed_trade("2019-05-01", "2019-05-06", 200),
+                  _fixed_trade("2021-02-01", "2021-02-03", -40)]
+        rows = cb.squeeze_kdj_yearly_table(trades, 200_000)
+        assert [r["year"] for r in rows] == [2019, 2021]
+        y2019 = rows[0]
+        assert y2019["trade_count"] == 3
+        assert y2019["total_pnl_ntd"] == pytest.approx(400)
+        assert y2019["profit_factor"] == pytest.approx(500 / 100)
+        assert y2019["win_rate"] == pytest.approx(200 / 3)
+        assert y2019["max_drawdown_ntd"] == pytest.approx(-100)  # 年內權益從0開始：+300 → +200 → +400
+        assert y2019["pnl_excluding_top3_ntd"] == pytest.approx(0)
+        assert rows[1]["profit_factor"] == 0.0
+
+    def test_limit_skip_shares_denominators(self):
+        diag = dict.fromkeys(cb.CAPITAL_CONSTRAINED_DIAGNOSTIC_KEYS, 0)
+        diag.update(candidates_total=20, skipped_entry_filter=0, skipped_no_slot=10, skipped_limit_not_filled=4)
+        shares = cb._limit_skip_shares(diag)
+        assert shares["orders_placed"] == 10
+        assert shares["pct_of_candidates"] == pytest.approx(20.0)
+        assert shares["pct_of_orders_placed"] == pytest.approx(40.0)
+
+    def test_diag_label_exists_for_every_key(self):
+        for k in cb.CAPITAL_CONSTRAINED_DIAGNOSTIC_KEYS:
+            assert k in cb.SQUEEZE_KDJ_GRID_DIAG_LABELS_ZH
+        assert "skipped_limit_not_filled" in cb.CAPITAL_CONSTRAINED_DIAGNOSTIC_KEYS
+
+    def test_grid_verdict_default_wording_unchanged(self):
+        b = {"pct_positive": 50.0, "p_value": 0.5, "pnl_excluding_top3_ntd": -1.0}
+        v = cb._squeeze_kdj_bootstrap_verdict(b)
+        assert "這組IS贏家在OOS不能算已驗證的優勢" in v
+        assert "拿掉OOS最大3筆交易後總損益轉負" in v
+
+    def test_backtests_use_fixed_setting_full_calendar_and_four_scenarios(self, monkeypatch):
+        codes = ["1101", "1102"]
+        price_data, idx = _make_regime_switching_market(codes, n_days=200)
+        universe = {c: STOCK_FUTURES_UNIVERSE[c] for c in codes}
+        calls = []
+        real = cb.run_squeeze_kdj_capital_constrained_backtest
+
+        def _spy(**kwargs):
+            calls.append(kwargs)
+            return real(**kwargs)
+        monkeypatch.setattr(cb, "run_squeeze_kdj_capital_constrained_backtest", _spy)
+        results = cb.run_squeeze_kdj_fixed_backtests(price_data, universe, 1_000_000, idx)
+        assert [(c["lots"], c["execution_model"]) for c in calls] == list(cb.SQUEEZE_KDJ_FIXED_SCENARIOS)
+        assert len(calls) == 4
+        for c in calls:
+            assert c["master_calendar"] is idx  # 一次連續回測，不切IS/OOS
+            assert c["variant"] == "B" and c["atr_stop_mult"] == 1.0 and c["atr_target_mult"] == 3.0
+            assert c["max_concurrent_positions"] == 3 and c["max_hold_days"] == 20
+            assert c["ranking_rule"] == "trigger_return" and c["entry_filter"] is None
+            assert c["top_n"] == 3 and c["atr_period"] == 14
+            assert "slippage_pct" not in c  # 沒有另外傳百分比滑價(限價模型要求slippage_pct=0)
+        assert calls[0]["precomputed"] is calls[3]["precomputed"]  # 預先計算共用
+        assert len(results) == 4
+
+
+class TestSqueezeKdjFixedCliMode:
+    def _patch_heavy_stages_to_explode(self, monkeypatch):
+        heavy_stage_names = [
+            "run_breakout_window_comparison", "run_breakout_style_comparison",
+            "run_signal_ablation", "run_signal_combo_comparison", "run_gate_comparison",
+            "run_atr_sensitivity_grid", "run_exit_style_comparison",
+            "run_walkforward_validation", "run_fixed_combo_walkforward",
+            "run_squeeze_kdj_exit_style_comparison", "run_squeeze_kdj_exit_style_comparison_is_oos",
+            "run_squeeze_kdj_only_mode", "run_squeeze_kdj_capital_constrained_mode",
+            "evaluate_squeeze_kdj_capital_constrained", "run_squeeze_kdj_grid_mode",
+            "run_squeeze_kdj_grid_search", "run_multi_period_validation",
+        ]
+
+        def _boom(name):
+            def _inner(*args, **kwargs):
+                raise AssertionError(f"--squeeze-kdj-fixed模式不該呼叫：{name}")
+            return _inner
+
+        for name in heavy_stage_names:
+            monkeypatch.setattr(cb, name, _boom(name))
+
+    def test_skips_full_pipeline_writes_outputs_without_scipy(self, monkeypatch, tmp_path):
+        import data_loader
+        import chip_data_loader
+        monkeypatch.setitem(sys.modules, "scipy", None)
+        monkeypatch.setitem(sys.modules, "scipy.stats", None)
+
+        codes = list(STOCK_FUTURES_UNIVERSE)[:12]
+        price_data, idx = _make_regime_switching_market(codes + ["2330"], start="2022-01-03", n_days=750, seed=3)
+        monkeypatch.setattr(cb, "load_price_data", lambda *a, **k: price_data)
+
+        def _boom(*args, **kwargs):
+            raise AssertionError("--squeeze-kdj-fixed模式不該呼叫任何資料下載函式")
+        monkeypatch.setattr(data_loader, "load_price_data", _boom)
+        monkeypatch.setattr(chip_data_loader, "load_chip_data", _boom)
+        self._patch_heavy_stages_to_explode(monkeypatch)
+        monkeypatch.setattr(cb, "RESULTS_DIR", str(tmp_path))
+
+        mode_calls = []
+        real_mode = cb.run_squeeze_kdj_fixed_mode
+
+        def _spy(*args, **kwargs):
+            mode_calls.append(args)
+            return real_mode(*args, **kwargs)
+        monkeypatch.setattr(cb, "run_squeeze_kdj_fixed_mode", _spy)
+
+        argv = ["compare_breakout.py", "--squeeze-kdj-fixed", "--max-stocks", "12",
+                "--start", "2022-01-03", "--end", "2024-11-15", "--starting-capital", "1000000"]
+        monkeypatch.setattr(sys, "argv", argv)
+        cb.main()
+
+        assert len(mode_calls) == 1
+        assert mode_calls[0][5].equals(idx)  # master_calendar = 2330的完整日期序列
+
+        scen = pd.read_csv(tmp_path / "squeeze_kdj_fixed_scenarios.csv", encoding="utf-8-sig")
+        assert len(scen) == 4
+        for col in ("情境說明", "全期間交易筆數", "未見過區段獲利因子PF", "已見過區段獲利因子PF",
+                    "未見過區段bootstrap正報酬比例(%)", "未見過區段通過專案門檻(PF>1且bootstrap正報酬>80%)",
+                    "全期間診斷_限價1檔沒成交略過", "限價沒成交佔候選總數(%)", "期末權益(NT$)",
+                    "最大回撤佔起始資金(%)", "最長連續虧損筆數"):
+            assert col in scen.columns
+        assert not any(c.startswith(("is_", "oos_", "full_", "unseen_")) for c in scen.columns)
+        # 理想成交情境不會有限價略過
+        open_rows = scen[scen["成交模型"].str.contains("理想成交")]
+        assert (open_rows["全期間診斷_限價1檔沒成交略過"] == 0).all()
+        # 全期間筆數 = 未見過 + 已見過
+        assert (scen["全期間交易筆數"] == scen["未見過區段交易筆數"] + scen["已見過區段交易筆數"]).all()
+        assert scen["全期間交易筆數"].sum() > 0, "合成資料要有交易，測試才有意義"
+        assert scen["未見過區段交易筆數"].sum() > 0 and scen["已見過區段交易筆數"].sum() > 0
+
+        yearly = pd.read_csv(tmp_path / "squeeze_kdj_fixed_yearly.csv", encoding="utf-8-sig")
+        assert list(yearly.columns) == ["情境說明", "年度(依出場日)", "交易筆數", "獲利因子PF", "勝率(%)",
+                                        "總損益(NT$)", "年內最大回撤(NT$)", "拿掉最大3筆後損益(NT$)"]
+        assert set(yearly["年度(依出場日)"]) <= {2022, 2023, 2024}
+        trades = pd.read_csv(tmp_path / "squeeze_kdj_fixed_trades.csv", encoding="utf-8-sig")
+        assert set(trades["區段"]) == {"未見過", "已見過"}
+        assert trades["情境說明"].nunique() == 4
+        assert len(trades) == scen["全期間交易筆數"].sum()
+        for _, g in trades.groupby("情境說明"):
+            assert g.groupby(pd.to_datetime(g["出場日"]).dt.year).size().sum() == len(g)
+
+        summary = (tmp_path / "summary.txt").read_text(encoding="utf-8")
+        assert "--squeeze-kdj-fixed模式" in summary
+        assert "最誠實的數字" in summary
+        assert "偏樂觀" in summary
+        assert "一次連續回測" in summary
+        assert "同一個" in summary and "檢定" in summary  # p<0.2跟>80%是同一個檢定
+        assert "1440" in summary and "95%" in summary
+        assert "倖存者偏差" in summary and "基差" in summary and "開盤" in summary
+        assert "限價沒成交" in summary
+        assert "沒有任何「未見過區段」" not in summary
+        for n in range(1, 5):
+            assert f"情境{n}" in summary
+        assert "[階段0]" not in summary
+        assert "--squeeze-kdj-grid模式" not in summary
+
+    def test_no_unseen_segment_message_when_start_after_grid_data(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(cb, "RESULTS_DIR", str(tmp_path))
+        codes = ["1101", "1102", "2330"]
+        price_data, idx = _make_regime_switching_market(codes, start="2024-01-02", n_days=260)
+        universe = {c: STOCK_FUTURES_UNIVERSE[c] for c in codes}
+        args = argparse.Namespace(start="2024-01-02", end="2024-12-31", starting_capital=1_000_000)
+        is_cal, oos_cal = cb.split_is_oos(idx)
+        results = cb.run_squeeze_kdj_fixed_mode(args, price_data, universe, is_cal, oos_cal, idx)
+        summary = (tmp_path / "summary.txt").read_text(encoding="utf-8")
+        assert "沒有任何「未見過區段」" in summary
+        assert "2018-01-01" in summary
+        assert "未見過區段：無" in summary
+        assert all(r["segments"]["unseen"]["stats"]["trade_count"] == 0 for r in results)
+
+
+class TestSqueezeKdjFixedVerdictWording:
+    def test_top3_dependency_suffix_only_when_segment_is_profitable(self):
+        b = {"pct_positive": 10.0, "p_value": 0.9, "pnl_excluding_top3_ntd": -500.0}
+        losing = {"stats": {"trade_count": 5, "profit_factor": 0.5, "total_pnl_ntd": -100.0}, "bootstrap": b}
+        winning = {"stats": {"trade_count": 5, "profit_factor": 1.5, "total_pnl_ntd": 100.0}, "bootstrap": b}
+        assert "獲利高度依賴" not in cb._squeeze_kdj_fixed_segment_verdict(losing, "未見過區段")
+        assert "拿掉未見過區段最大3筆" in cb._squeeze_kdj_fixed_segment_verdict(winning, "未見過區段")
+        empty = {"stats": {"trade_count": 0, "profit_factor": 0.0, "total_pnl_ntd": 0.0}, "bootstrap": b}
+        assert "沒有任何交易" in cb._squeeze_kdj_fixed_segment_verdict(empty, "未見過區段")

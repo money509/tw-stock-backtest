@@ -1173,3 +1173,262 @@ class TestCapitalConstrainedDiagnostics:
         assert len(trades) == 2
         assert diag["skipped_total_margin_cap"] == 1
         assert diag["skipped_single_margin_cap"] == 0
+
+
+# ============================================================================
+# 成交模型 execution_model="limit_1tick"(--squeeze-kdj-fixed新增)：
+# 限價 = 觸發K棒收盤 + 1檔，開盤 > 限價不追；成交 = min(開盤+1檔, 限價)；
+# 市價型出場(停損/跳空停損/到期強制平倉/移動停利停損/變體A K值停利)多付1檔；變體B固定停利不加滑價。
+# ============================================================================
+from squeeze_kdj_signal import taiwan_tick_size, VALID_EXECUTION_MODELS
+import squeeze_kdj_signal as skd
+from mean_reversion_engine import COMMISSION_PER_LOT_PER_LEG
+
+
+class TestTaiwanTickSize:
+    @pytest.mark.parametrize("price, tick", [
+        (0.5, 0.01), (9.99, 0.01), (10.0, 0.05), (49.95, 0.05), (50.0, 0.1), (99.9, 0.1),
+        (100.0, 0.5), (499.5, 0.5), (500.0, 1.0), (999.0, 1.0), (1000.0, 5.0), (5000.0, 5.0),
+    ])
+    def test_boundaries(self, price, tick):
+        assert taiwan_tick_size(price) == tick
+
+    @pytest.mark.parametrize("bad", [0.0, -1.0, np.nan, np.inf])
+    def test_invalid_price_raises(self, bad):
+        with pytest.raises(ValueError):
+            taiwan_tick_size(bad)
+
+
+def _limit_df(n=30, price=100.0):
+    """持平100(H=101/L=99 → ATR14=2.0)。EntryFlag放在idx20 → 觸發K棒收盤100、限價100.5，idx21進場。"""
+    return _make_flat_df(price, n=n)
+
+
+def _run_limit(df, features, code="1101", **kwargs):
+    params = dict(variant="B", atr_stop_mult=1.0, atr_target_mult=3.0, max_concurrent_positions=1, top_n=1,
+                  max_hold_days=30, execution_model="limit_1tick", return_diagnostics=True, lots=2)
+    params.update(kwargs)
+    return run_squeeze_kdj_capital_constrained_backtest(
+        {code: df}, {code: {}}, df.index, 1_000_000, features_by_code={code: features}, **params)
+
+
+def _expected_pnl(code, e_price, exit_price, lots):
+    mult = get_contract_multiplier(code, e_price)
+    return (exit_price - e_price) * mult * lots - COMMISSION_PER_LOT_PER_LEG * lots * 2
+
+
+class TestLimit1TickEntry:
+    def test_precompute_trigger_close_is_previous_row_close(self):
+        df = _limit_df()
+        df.iloc[20, df.columns.get_loc("Close")] = 101.0
+        features = _make_fixed_features(df, entry_idx=20, prior_low=np.nan)
+        pre = precompute_squeeze_kdj_backtest_arrays({"1101": df}, {"1101": features}, atr_period=14)
+        tc = pre["per_code"]["1101"]["trigger_close"]
+        assert tc[21] == 101.0 and tc[20] == 100.0 and np.isnan(tc[0])
+
+    def test_skip_when_open_above_close_plus_one_tick(self):
+        df = _limit_df()
+        df.iloc[21, df.columns.get_loc("Open")] = 100.6  # 限價100.5，開盤高出 → 不追
+        features = _make_fixed_features(df, entry_idx=20, prior_low=np.nan)
+        trades, diag = _run_limit(df, features, max_hold_days=3)
+        assert trades == []
+        assert diag["skipped_limit_not_filled"] == 1
+        assert diag["candidates_total"] == 1
+        # 同一份資料用理想成交模型會進場(確認略過真的是限價規則造成的)
+        trades_open, diag_open = _run_limit(df, features, execution_model="open", max_hold_days=3)
+        assert len(trades_open) == 1 and diag_open["skipped_limit_not_filled"] == 0
+
+    @pytest.mark.parametrize("open_price, expected_fill", [
+        (100.0, 100.5),   # min(100+0.5, 100.5)
+        (100.2, 100.5),   # min(100.7, 100.5) → 被限價封頂
+        (100.5, 100.5),   # 剛好等於限價 → 成交在限價
+        (99.95, 100.05),  # 99.95的tick=0.1 → 100.05 < 限價
+        (95.0, 95.1),     # 跳空開低：開盤+1檔
+    ])
+    def test_fill_price_and_b_stop_target_from_fill(self, monkeypatch, open_price, expected_fill):
+        df = _limit_df()
+        df.iloc[21, df.columns.get_loc("Open")] = open_price
+        df.iloc[21, df.columns.get_loc("Low")] = min(99.0, open_price)
+        features = _make_fixed_features(df, entry_idx=20, prior_low=np.nan)
+        seen = []
+
+        def _spy(position, row, date, trades, max_hold_days, cooldown_until, slippage_pct=0.0):
+            seen.append(dict(position))
+            return _process_mr_day(position, row, date, trades, max_hold_days, cooldown_until,
+                                   slippage_pct=slippage_pct)
+        monkeypatch.setattr(skd, "_process_mr_day", _spy)
+        trades, diag = _run_limit(df, features, max_hold_days=3)
+        first = seen[0]
+        assert first["e_price"] == pytest.approx(expected_fill)
+        assert first["stop_price"] == pytest.approx(expected_fill - 1.0 * 2.0)
+        assert first["target_price"] == pytest.approx(expected_fill + 3.0 * 2.0)
+        assert diag["skipped_limit_not_filled"] == 0
+        assert trades[0]["e_price"] == pytest.approx(expected_fill)
+
+    def test_slippage_pct_with_limit_model_raises(self):
+        df = _limit_df()
+        features = _make_fixed_features(df, entry_idx=20, prior_low=np.nan)
+        with pytest.raises(ValueError):
+            _run_limit(df, features, slippage_pct=0.001)
+
+    def test_invalid_execution_model_raises(self):
+        df = _limit_df()
+        features = _make_fixed_features(df, entry_idx=20, prior_low=np.nan)
+        assert VALID_EXECUTION_MODELS == ("open", "limit_1tick")
+        with pytest.raises(ValueError):
+            _run_limit(df, features, execution_model="vwap")
+
+
+class TestLimit1TickExits:
+    """進場都是idx21開盤100 → 成交100.5，停損98.5、停利106.5(變體B，ATR=2)。"""
+
+    def _df_features(self):
+        df = _limit_df()
+        return df, _make_fixed_features(df, entry_idx=20, prior_low=np.nan)
+
+    def test_stop_exit_one_tick_worse_and_pnl_recomputed(self):
+        df, features = self._df_features()
+        df.iloc[23, df.columns.get_loc("Low")] = 90.0
+        trades, _ = _run_limit(df, features)
+        assert len(trades) == 1  # 重算時有把原本那筆拿掉，不會重複
+        t = trades[0]
+        assert t["exit_reason"] == "stop"
+        assert t["exit_price"] == pytest.approx(98.5 - 0.1)
+        assert t["pnl_ntd"] == pytest.approx(_expected_pnl("1101", 100.5, 98.4, 2))
+        # 手續費不變：損益 + 手續費 = 純價差
+        mult = get_contract_multiplier("1101", 100.5)
+        assert t["pnl_ntd"] + COMMISSION_PER_LOT_PER_LEG * 2 * 2 == pytest.approx((98.4 - 100.5) * mult * 2)
+        assert t["return_pct"] == pytest.approx(t["pnl_ntd"] / (100.5 * mult * 2))
+
+    def test_stop_gap_one_tick_below_open(self):
+        df, features = self._df_features()
+        df.iloc[23, df.columns.get_loc("Open")] = 97.0
+        df.iloc[23, df.columns.get_loc("Low")] = 96.0
+        trades, _ = _run_limit(df, features)
+        assert trades[0]["exit_reason"] == "stop_gap"
+        assert trades[0]["exit_price"] == pytest.approx(97.0 - 0.1)
+
+    def test_fixed_target_exit_has_no_slippage(self):
+        df, features = self._df_features()
+        df.iloc[23, df.columns.get_loc("High")] = 110.0
+        trades, _ = _run_limit(df, features)
+        assert trades[0]["exit_reason"] == "target"
+        assert trades[0]["exit_price"] == pytest.approx(106.5)
+        assert trades[0]["pnl_ntd"] == pytest.approx(_expected_pnl("1101", 100.5, 106.5, 2))
+
+    def test_forced_close_one_tick_worse(self):
+        df, features = self._df_features()
+        trades, _ = _run_limit(df, features, max_hold_days=3)
+        t = trades[0]
+        assert t["exit_reason"] == "forced_close"
+        assert t["exit_date"] == df.index[23]
+        assert t["exit_price"] == pytest.approx(100.0 - 0.5)  # 收盤100的tick是0.5
+
+    def test_variant_a_k_exit_one_tick_worse(self):
+        idx = pd.date_range("2022-01-03", periods=10, freq="B")
+        closes = pd.Series([100.0] * 10, index=idx)
+        df = pd.DataFrame({"Open": closes, "High": closes + 1.0, "Low": closes - 20.0, "Close": closes}, index=idx)
+        k = pd.Series([50, 50, 70, 85, 90, 75, 60, 60, 60, 60], index=idx, dtype=float)
+        features = _make_fixed_features(df, entry_idx=1, prior_low=-1000.0, k_series=k)
+        trades, _ = _run_limit(df, features, variant="A")
+        t = trades[0]
+        assert t["e_price"] == pytest.approx(100.5)
+        assert t["exit_reason"] == "target"
+        assert t["exit_date"] == idx[5]
+        assert t["exit_price"] == pytest.approx(99.5)
+
+    def test_variant_a_stop_one_tick_worse(self):
+        df, _ = self._df_features()
+        df.iloc[23, df.columns.get_loc("Low")] = 90.0
+        features = _make_fixed_features(df, entry_idx=20, prior_low=95.0)
+        trades, _ = _run_limit(df, features, variant="A")
+        assert trades[0]["exit_reason"] == "stop"
+        assert trades[0]["exit_price"] == pytest.approx(95.0 - 0.1)
+
+    def test_trailing_stop_exit_one_tick_worse(self):
+        """B_trail 1.5倍：成交100.5 → 初始停損97.5；idx22收104→停損101、idx23收108→停損105；
+        idx24盤中殺到90 → 105停損，再多付1檔(105的tick=0.5) → 104.5。"""
+        df = _make_trailing_df()
+        features = _make_fixed_features(df, entry_idx=20, prior_low=np.nan)
+        trades, _ = _run_limit(df, features, variant="B_trail", atr_stop_mult=1.5, trailing_atr_mult=1.5)
+        t = trades[0]
+        assert t["e_price"] == pytest.approx(100.5)
+        assert t["exit_date"] == df.index[24]
+        assert t["exit_reason"] == "stop"
+        assert t["exit_price"] == pytest.approx(104.5)
+
+    def test_cooldown_still_applied_after_stop(self):
+        """idx23停損 → 冷卻到idx23+10個日曆天；冷卻期內的觸發(idx26進場)被排除，
+        冷卻期過後的觸發(idx31進場)正常進場。"""
+        df = _limit_df(n=40)
+        df.iloc[23, df.columns.get_loc("Low")] = 90.0
+        entry_flag = np.zeros(40, dtype=bool)
+        entry_flag[[20, 25, 30]] = True
+        features = pd.DataFrame({"EntryFlag": entry_flag, "PriorLow": np.nan,
+                                 "K": pd.Series(50.0, index=df.index)}, index=df.index)
+        cooldown_end = df.index[23] + pd.Timedelta(days=STOP_LOSS_COOLDOWN_DAYS * 2)
+        assert df.index[26] < cooldown_end <= df.index[31]
+        trades, diag = _run_limit(df, features, max_hold_days=3)
+        assert [t["entry_date"] for t in trades] == [df.index[21], df.index[31]]
+        assert trades[0]["exit_reason"] == "stop"
+        assert diag["candidates_total"] == 2  # 冷卻期內那次在候選之前就被排除
+
+    def test_cooldown_set_exactly_once_per_stop(self, monkeypatch):
+        """冷卻期只在原本的出場函式裡設定一次，重算出場價時不會再碰cooldown_until。"""
+        df, features = self._df_features()
+        df.iloc[23, df.columns.get_loc("Low")] = 90.0
+        writes = []
+
+        class _CountingDict(dict):
+            def __setitem__(self, key, value):
+                writes.append((key, value))
+                super().__setitem__(key, value)
+
+        real = skd._process_mr_day
+        holder = {}
+
+        def _spy(position, row, date, trades, max_hold_days, cooldown_until, slippage_pct=0.0):
+            # 第一次呼叫時把引擎內部的cooldown_until換成會計數的dict(同一個物件持續沿用)
+            proxy = holder.setdefault("proxy", _CountingDict(cooldown_until))
+            result = real(position, row, date, trades, max_hold_days, proxy, slippage_pct=slippage_pct)
+            cooldown_until.update(proxy)
+            return result
+        monkeypatch.setattr(skd, "_process_mr_day", _spy)
+        trades, _ = _run_limit(df, features)
+        assert len(trades) == 1
+        assert writes == [("1101", df.index[23] + pd.Timedelta(days=STOP_LOSS_COOLDOWN_DAYS * 2))]
+
+
+class TestExecutionModelOpenMatchesLegacy:
+    @pytest.mark.parametrize("scenario", _SNAPSHOT_SCENARIOS[:4])
+    def test_explicit_open_model_identical_to_pre_refactor_version(self, scenario):
+        seed, variant, mcp, lots, capital, slip, top_n, hold, cal = scenario
+        price_data, universe, idx = _make_synthetic_market(seed=seed)
+        calendar = {"full": idx, "is": idx[:280], "oos": idx[280:]}[cal]
+        features_by_code = precompute_squeeze_kdj_features_by_code(price_data, universe)
+        kwargs = dict(variant=variant, lots=lots, top_n=top_n, max_concurrent_positions=mcp,
+                      max_hold_days=hold, slippage_pct=slip, features_by_code=features_by_code)
+        legacy = _legacy_capital_constrained_backtest(price_data, universe, calendar, capital, **kwargs)
+        new, diag = run_squeeze_kdj_capital_constrained_backtest(
+            price_data, universe, calendar, capital, execution_model="open", return_diagnostics=True, **kwargs)
+        assert len(legacy) > 0
+        assert new == legacy
+        assert diag["skipped_limit_not_filled"] == 0
+
+    def test_limit_model_differs_and_is_never_better_per_trade_on_synthetic_market(self):
+        """同一份合成市場：限價模型每一筆跟理想模型「同一天進場的同一檔」相比，進場價只會更高、
+        市價出場價只會更低(1檔)，所以這類配對交易的損益不會比較好。"""
+        price_data, universe, idx = _make_synthetic_market(seed=0)
+        kw = dict(variant="B", lots=1, top_n=3, max_concurrent_positions=3, max_hold_days=20,
+                  atr_target_mult=3.0, return_diagnostics=True)
+        ideal, _ = run_squeeze_kdj_capital_constrained_backtest(price_data, universe, idx, 1_000_000, **kw)
+        lim, diag = run_squeeze_kdj_capital_constrained_backtest(price_data, universe, idx, 1_000_000,
+                                                                  execution_model="limit_1tick", **kw)
+        assert lim != ideal
+        ideal_by_key = {(t["code"], t["entry_date"]): t for t in ideal}
+        for t in lim:
+            o = ideal_by_key.get((t["code"], t["entry_date"]))
+            if o is None:
+                continue
+            assert t["e_price"] >= o["e_price"] - 1e-9
+        assert set(diag) == set(CAPITAL_CONSTRAINED_DIAGNOSTIC_KEYS)

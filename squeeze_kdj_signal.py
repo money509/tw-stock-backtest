@@ -375,6 +375,8 @@ def simulate_variant_b_trades(df: pd.DataFrame, features: pd.DataFrame,
 # (ranking_rule="volume_ratio")、站上60日均線濾網(entry_filter="above_ma60")、診斷計數器
 # (return_diagnostics)，以及為了讓上千次回測跑得完的預先計算重構
 # (precompute_squeeze_kdj_backtest_arrays)。預設參數下的交易結果跟重構前逐筆完全相同。
+# 再後續(--squeeze-kdj-fixed)新增、預設關閉的選項：成交模型execution_model="limit_1tick"
+# (限價=觸發K棒收盤+1檔、開盤超過限價不追；進場/市價型出場各多付1檔滑價，見taiwan_tick_size())。
 # ============================================================================
 
 MAX_HOLD_DAYS_CAPITAL_CONSTRAINED_DEFAULT = 60
@@ -484,7 +486,63 @@ CAPITAL_CONSTRAINED_DIAGNOSTIC_KEYS = (
     "skipped_risk_lots_lt1",       # 風險預算反推口數 < 1口
     "skipped_single_margin_cap",   # 單筆保證金超過starting_capital的35%
     "skipped_total_margin_cap",    # 加上這筆之後總保證金超過整體上限
+    "skipped_limit_not_filled",    # execution_model="limit_1tick"：進場日開盤價高於限價(前一根收盤+1檔)，不追價略過
 )
+
+# ----------------------------------------------------------------------------
+# 成交模型(execution_model)：tick(最小升降單位)滑價 + 限價不追價
+# ----------------------------------------------------------------------------
+VALID_EXECUTION_MODELS = ("open", "limit_1tick")
+
+# 台股(上市/上櫃普通股)的最小升降單位(tick)表：(價格上限(不含), tick)，依序比對。
+# 證交所/櫃買中心現行規定：未滿10元0.01、10~未滿50元0.05、50~未滿100元0.1、
+# 100~未滿500元0.5、500~未滿1000元1、1000元以上5。
+TAIWAN_STOCK_TICK_TABLE = (
+    (10.0, 0.01),
+    (50.0, 0.05),
+    (100.0, 0.1),
+    (500.0, 0.5),
+    (1000.0, 1.0),
+)
+TAIWAN_STOCK_TICK_ABOVE_1000 = 5.0
+
+
+def taiwan_tick_size(price: float) -> float:
+    """
+    回傳台股/股票期貨在這個價位的最小升降單位(1檔/1 tick)。
+
+    價格 < 10 → 0.01；10 ~ <50 → 0.05；50 ~ <100 → 0.1；100 ~ <500 → 0.5；
+    500 ~ <1000 → 1；>= 1000 → 5。邊界值歸到上面那一級(例如剛好50元的tick是0.1)。
+
+    股票期貨的假設(誠實聲明)：期交所股票期貨契約規格的「最小升降單位」是比照標的
+    股票的升降單位級距(同一張價格級距表)，所以這裡股票期貨直接沿用標的股票的tick表。
+    這是依據期交所契約規格的認知寫的，repo裡沒有任何其他地方定義過tick/升降單位
+    (已搜尋過，沒有互相矛盾的寫法)；回測本身也是用「標的股票」的yfinance日K(未還原權值，
+    auto_adjust=False)當股票期貨價格的代理，所以tick以標的股價計算是一致的。
+    ETF的升降單位級距不同(50元以下0.01、以上0.05)，但STOCK_FUTURES_UNIVERSE目前沒有ETF，
+    不影響；之後如果加入ETF期貨，這個函式要另外處理。
+
+    NaN/非正數價格沒有意義，直接丟ValueError，避免默默算出錯的滑價。
+    """
+    if price is None or not np.isfinite(price) or price <= 0:
+        raise ValueError(f"taiwan_tick_size()需要正的有限價格，收到{price!r}")
+    for upper, tick in TAIWAN_STOCK_TICK_TABLE:
+        if price < upper:
+            return tick
+    return TAIWAN_STOCK_TICK_ABOVE_1000
+
+
+def _is_market_type_exit(reason: str, variant: str) -> bool:
+    """execution_model="limit_1tick"時，哪些出場算「市價型」(要多付1檔滑價)：
+    停損(stop，含移動停利的停損)、跳空停損(stop_gap)、持有天數到期強制平倉(forced_close)
+    一律是市價；變體A的停利(target)是「K跌破80那天收盤後」才確認的訊號、用收盤價出場，
+    沒有事先掛好的價位，實務上是市價單，也算市價型。只有變體B的固定價位停利(target)是
+    事先掛好的限價單(resting limit order)，碰到就用掛單價成交，不加滑價。"""
+    if reason in ("stop", "stop_gap", "forced_close"):
+        return True
+    if reason == "target":
+        return variant == "A"
+    return False
 
 
 def precompute_squeeze_kdj_backtest_arrays(price_data: dict, features_by_code: dict,
@@ -518,6 +576,8 @@ def precompute_squeeze_kdj_backtest_arrays(price_data: dict, features_by_code: d
       above_ma60：觸發K棒當天(t日)收盤價是否 > 含t日在內的60日簡單均線，一樣shift(1)；
         均線暖身期(前59天)均線是NaN，比較結果視為False(濾網開啟時這幾天一律擋掉，
         保守處理：資料不足時不假設它站上季線)。
+    另外的trigger_close(execution_model="limit_1tick"才用得到)：觸發K棒當天(t日)的收盤價，
+      一樣shift(1)，第d列 = d的前一個交易日收盤價，用來算「前一根收盤+1檔」的限價。
 
     events_by_date只收「進場旗標=True 且 觸發K棒漲幅不是NaN」的事件——這跟舊版逐日迴圈
     「EntryToday為False或TriggerStrength是NaN就跳過」的篩選條件完全相同，只是提前做。
@@ -551,6 +611,9 @@ def precompute_squeeze_kdj_backtest_arrays(price_data: dict, features_by_code: d
 
         ma = close.rolling(ENTRY_FILTER_MA_PERIOD).mean()
         above_ma = (close > ma).shift(1).fillna(False).astype(bool).to_numpy()
+        # 觸發K棒(t日)的收盤價，一樣shift(1)對齊到進場日(t+1)那一列：execution_model="limit_1tick"
+        # 的限價 = 這個價格 + 1檔(使用者在t日收盤後決定、掛t+1日的限價單，只看得到t日收盤)。
+        trigger_close = close.shift(1).to_numpy(dtype=float)
 
         open_arr = df["Open"].to_numpy(dtype=float)
         high_arr = df["High"].to_numpy(dtype=float)
@@ -579,6 +642,7 @@ def precompute_squeeze_kdj_backtest_arrays(price_data: dict, features_by_code: d
             "volume_ratio": volume_ratio,
             "above_ma60": above_ma,
             "atr": atr,
+            "trigger_close": trigger_close,
         }
 
         for i in np.flatnonzero(entry_today):
@@ -613,7 +677,8 @@ def run_squeeze_kdj_capital_constrained_backtest(price_data: dict, universe: dic
                                                    ranking_rule: str = "trigger_return",
                                                    entry_filter: str = None,
                                                    return_diagnostics: bool = False,
-                                                   precomputed: dict = None):
+                                                   precomputed: dict = None,
+                                                   execution_model: str = "open"):
     """
     擠壓+KDJ訊號的「資金/部位受限版」完整day-by-day walk-forward回測，只做多方
     (見模組docstring)。跟run_squeeze_kdj_exit_style_comparison()/
@@ -729,6 +794,33 @@ def run_squeeze_kdj_capital_constrained_backtest(price_data: dict, universe: dic
     (每個「候選-日」最多只會被記在其中一個「略過原因」底下，成功進場的不記)，用來回答
     「到底是名額不夠、保證金不夠、還是風險口數不夠，讓訊號沒有變成交易」。
 
+    execution_model(成交模型，--squeeze-kdj-fixed新增)：
+      "open"(預設，舊版唯一的行為)：進場用t+1日開盤價成交(可另外用slippage_pct加百分比滑價)，
+        出場用check_exit()/變體A函式算出的價位，完全不變(test_squeeze_kdj_signal.py的凍結
+        舊版實作比對保證逐筆相同)。
+      "limit_1tick"(使用者實際的下單方式：「滑價1檔；開盤價比我要買的價位高超過1檔就不買，
+        等下一個訊號」)：
+        - 進場：使用者在觸發K棒(t日)收盤後才決定，只看得到t日收盤價，所以參考價 = t日收盤
+          (precompute的trigger_close，已shift(1)對齊)；限價 = 參考價 + 1檔(tick用參考價算，
+          見taiwan_tick_size())。t+1日開盤價 > 限價 → 不追價，這個候選略過(診斷計數器
+          skipped_limit_not_filled)；否則成交價 = min(開盤價 + 1檔, 限價)——開盤成交再多付1檔
+          不利滑價(tick用開盤價算)，但最多不會超過自己掛的限價；跳空開低時就是開盤價+1檔。
+          變體B/B_trail的停損/停利價位用這個成交價套原本的公式算(e_price = 成交價)。
+          這個檢查排在每個候選進到「逐一嘗試進場」迴圈後的第一步(早於停損價/口數/保證金檢查)：
+          「開盤價高於限價」是開盤那一刻才知道、且一旦發生就根本沒有部位，所以先判定。
+          被略過的候選跟其他略過原因一樣不佔名額，會往下嘗試排名下一個候選(跟保證金上限
+          略過的既有處理一致；實務上等於「多掛幾張限價單、成交的先佔名額」，是務實近似)。
+        - 出場：市價型出場(停損stop、跳空停損stop_gap、max_hold_days到期forced_close、移動停利
+          的停損、變體A的K值停利(收盤價出場))一律再多付1檔不利滑價(出場價 - 1檔，tick用原本
+          的出場價算)；變體B的固定價位停利是事先掛好的限價單，碰到就用掛單價成交，不加滑價
+          (判定規則見_is_market_type_exit())。實作上完全不修改mean_reversion_engine：
+          _process_mr_day()/_process_squeeze_kdj_variant_a_day()照舊出場(冷卻期也在裡面設定、
+          只設一次)，出場後如果是市價型，把剛剛append進trades的那一筆拿掉，用調整後的出場價
+          重新呼叫同一個_close_mr_trade()，損益/手續費/報酬率全部由同一個函式重算(手續費不變)。
+        - 這個模型下slippage_pct必須是0(兩種滑價疊加沒有意義)，否則丟ValueError。
+        - 邊界上的小近似(偏保守)：出場「往下1檔」的tick用出場價本身的級距算，剛好落在級距
+          邊界時(例如100元)真實的下一檔是99.9，這裡算成99.5，多扣了一點，影響極小。
+
     回傳：trades list(或見return_diagnostics)，每筆trade dict的形狀跟
     mean_reversion_engine._close_mr_trade()產生的完全一樣(code/side/entry_date/exit_date/
     e_price/exit_price/exit_reason/lots/pnl_ntd/return_pct/hold_days)，可以直接餵
@@ -740,6 +832,12 @@ def run_squeeze_kdj_capital_constrained_backtest(price_data: dict, universe: dic
         raise ValueError(f"ranking_rule必須是{VALID_RANKING_RULES}其中之一，收到{ranking_rule!r}")
     if entry_filter not in VALID_ENTRY_FILTERS:
         raise ValueError(f"entry_filter必須是{VALID_ENTRY_FILTERS}其中之一，收到{entry_filter!r}")
+    if execution_model not in VALID_EXECUTION_MODELS:
+        raise ValueError(f"execution_model必須是{VALID_EXECUTION_MODELS}其中之一，收到{execution_model!r}")
+    limit_1tick = execution_model == "limit_1tick"
+    if limit_1tick and slippage_pct != 0:
+        raise ValueError("execution_model='limit_1tick'已經內建1檔滑價，slippage_pct必須是0"
+                         f"(收到{slippage_pct!r})，不要兩種滑價疊加")
 
     if precomputed is None:
         if features_by_code is None:
@@ -766,12 +864,24 @@ def run_squeeze_kdj_capital_constrained_backtest(price_data: dict, universe: dic
 
     def _process_day(position, arrs, i, date):
         row = _row_at(arrs, i)
+        n_trades_before = len(trades)
         if variant == "A":
-            return _process_squeeze_kdj_variant_a_day(position, row, arrs["k"][i], date, trades,
-                                                       max_hold_days, cooldown_until,
-                                                       slippage_pct=slippage_pct)
-        return _process_mr_day(position, row, date, trades, max_hold_days, cooldown_until,
-                               slippage_pct=slippage_pct)
+            updated = _process_squeeze_kdj_variant_a_day(position, row, arrs["k"][i], date, trades,
+                                                          max_hold_days, cooldown_until,
+                                                          slippage_pct=slippage_pct)
+        else:
+            updated = _process_mr_day(position, row, date, trades, max_hold_days, cooldown_until,
+                                      slippage_pct=slippage_pct)
+        if limit_1tick and updated is None and len(trades) == n_trades_before + 1:
+            # 市價型出場多付1檔：拿掉剛剛那筆，用調整後的價格經同一個_close_mr_trade()重算損益。
+            # 冷卻期已經在上面的出場函式裡設定過(只設一次)，這裡不再碰cooldown_until。
+            closed = trades[-1]
+            if _is_market_type_exit(closed["exit_reason"], variant):
+                trades.pop()
+                raw_exit = closed["exit_price"]
+                _close_mr_trade(position, raw_exit - taiwan_tick_size(raw_exit),
+                                closed["exit_reason"], date, trades)
+        return updated
 
     for date in master_calendar:
         # 1) 先處理既有部位的出場判定
@@ -836,7 +946,20 @@ def run_squeeze_kdj_capital_constrained_backtest(price_data: dict, universe: dic
             code, i, _ = candidates.pop(0)
             arrs = per_code[code]
             open_p = arrs["open"][i]
-            e_price = open_p * (1 + slippage_pct)
+            if limit_1tick:
+                ref_close = arrs["trigger_close"][i]
+                if not np.isfinite(ref_close) or ref_close <= 0:
+                    # 實際上到不了這裡(觸發K棒收盤是NaN時trigger_strength也是NaN，事件早就被排除)，
+                    # 保險起見：沒有參考價就沒辦法掛限價單，當作沒成交
+                    diag["skipped_limit_not_filled"] += 1
+                    continue
+                limit_price = ref_close + taiwan_tick_size(ref_close)
+                if open_p > limit_price:
+                    diag["skipped_limit_not_filled"] += 1
+                    continue
+                e_price = min(open_p + taiwan_tick_size(open_p), limit_price)
+            else:
+                e_price = open_p * (1 + slippage_pct)
 
             if uses_atr:
                 atr_at_signal = arrs["atr"][i]

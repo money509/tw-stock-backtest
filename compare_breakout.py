@@ -131,6 +131,7 @@ compare_breakout.py
         --risk-pct-per-trade 0.02 --slippage-pct 0.002 --multi-period-test
     python3 compare_breakout.py --use-trailing-stop --walkforward-folds 3
     python3 compare_breakout.py --squeeze-kdj-grid --max-stocks 50   # squeeze+KDJ混搭網格(1440組，只用IS選贏家)
+    python3 compare_breakout.py --squeeze-kdj-fixed --start 2018-01-01 --max-stocks 0   # 選定的固定設定長歷史+限價1檔成交
 
 ⚠️ 誠實揭露：跟 mean_reversion_engine.py 共用的已知限制(結算日近似、大盤氛圍濾網用0050
 代理、跌停鎖死/注意股處置股未實作、倖存者偏差、保證金追繳/強制斷頭沒有完整模擬)在這裡
@@ -1523,6 +1524,7 @@ SQUEEZE_KDJ_GRID_DIAG_LABELS_ZH = {
     "skipped_risk_lots_lt1": "風險口數不足1口略過",
     "skipped_single_margin_cap": "單筆保證金上限略過",
     "skipped_total_margin_cap": "總保證金上限略過",
+    "skipped_limit_not_filled": "限價1檔沒成交略過",
 }
 SQUEEZE_KDJ_GRID_STAT_LABELS_ZH = {
     "trade_count": "交易筆數", "profit_factor": "獲利因子PF", "win_rate": "勝率(%)",
@@ -1569,18 +1571,28 @@ def squeeze_kdj_grid_df_to_csv_frame(df: pd.DataFrame) -> pd.DataFrame:
     return out[cols].rename(columns=SQUEEZE_KDJ_GRID_CSV_COLUMNS_ZH)
 
 
-def _squeeze_kdj_bootstrap_verdict(b: dict) -> str:
-    passes = (b["pct_positive"] > SQUEEZE_KDJ_BOOTSTRAP_PASS_PCT_POSITIVE
-              and b["p_value"] < SQUEEZE_KDJ_BOOTSTRAP_PASS_P_VALUE)
-    if passes:
+def _squeeze_kdj_bootstrap_passes(b: dict) -> bool:
+    """專案bootstrap門檻：正報酬比例>80% 且 p值<0.2。p值 = 1 - 正報酬比例(見
+    robustness_analysis.bootstrap_p_value())，所以這兩個條件其實是同一個檢定，不是兩道關卡。"""
+    return (b["pct_positive"] > SQUEEZE_KDJ_BOOTSTRAP_PASS_PCT_POSITIVE
+            and b["p_value"] < SQUEEZE_KDJ_BOOTSTRAP_PASS_P_VALUE)
+
+
+def _squeeze_kdj_bootstrap_verdict(b: dict, subject: str = "這組IS贏家在OOS", segment: str = "OOS",
+                                   total_pnl: float = None) -> str:
+    """bootstrap判定的白話句子。subject/segment預設值就是--squeeze-kdj-grid原本的措辭
+    (網格模式輸出完全不變)；--squeeze-kdj-fixed會傳入自己的區段名稱(例如「未見過區段」)。
+    total_pnl給定且<=0時，不加「拿掉最大3筆後轉負、獲利高度依賴少數幾筆」那句——本來就沒有
+    獲利，那句話沒有意義；沒給(網格模式)時維持舊行為。"""
+    if _squeeze_kdj_bootstrap_passes(b):
         verdict = (f"✅ 通過專案門檻(bootstrap正報酬比例>{SQUEEZE_KDJ_BOOTSTRAP_PASS_PCT_POSITIVE:.0f}% "
                    f"且 p值<{SQUEEZE_KDJ_BOOTSTRAP_PASS_P_VALUE})")
     else:
         verdict = (f"❌ 沒有通過專案門檻(需要bootstrap正報酬比例>{SQUEEZE_KDJ_BOOTSTRAP_PASS_PCT_POSITIVE:.0f}% "
                    f"且 p值<{SQUEEZE_KDJ_BOOTSTRAP_PASS_P_VALUE}；實際{b['pct_positive']:.1f}% / "
-                   f"p={b['p_value']:.3f})——這組IS贏家在OOS不能算已驗證的優勢")
-    if b["pnl_excluding_top3_ntd"] < 0:
-        verdict += "；另外拿掉OOS最大3筆交易後總損益轉負，獲利高度依賴少數幾筆交易"
+                   f"p={b['p_value']:.3f})——{subject}不能算已驗證的優勢")
+    if b["pnl_excluding_top3_ntd"] < 0 and (total_pnl is None or total_pnl > 0):
+        verdict += f"；另外拿掉{segment}最大3筆交易後總損益轉負，獲利高度依賴少數幾筆交易"
     return verdict
 
 
@@ -1726,6 +1738,414 @@ def run_squeeze_kdj_grid_mode(args, price_data, universe, is_calendar, oos_calen
         f.write(summary_text + "\n")
     print(f"\n已輸出：{summary_path}")
     return result
+
+
+# ============================================================================
+# --squeeze-kdj-fixed：1440組網格之後，使用者「自己選定」的單一固定設定，拉長歷史(建議從
+# 2018-01-01開始)、加上真實的成交模型，看它在「選參數時完全沒看過的年份」表現如何。
+#
+# 背景：--squeeze-kdj-grid(IS=2023-10-06~2026-10-05的前70%，OOS=後30%)沒有選出任何通過驗證
+# 的設定。使用者看完整份網格結果之後，挑了下面SQUEEZE_KDJ_FIXED_SETTING這一組繼續追。這組設定
+# 是「看過2023-10-06之後全部資料(IS+OOS)」才挑出來的，所以2023-10-06之後的任何數字都已經被
+# 選擇過程污染，只有更早的年份才是真正沒看過的資料——這就是這個模式存在的理由。
+# ============================================================================
+
+SQUEEZE_KDJ_GRID_DATA_START = "2023-10-06"
+# 1440組網格(--squeeze-kdj-grid)跟使用者挑選固定設定時看的資料起始日。網格回測期間是
+# 2023-10-06 ~ 2026-10-05(IS取前70%、OOS取後30%)，使用者是看完IS跟OOS的結果才選定設定，
+# 所以「進場日 >= 這一天」的交易全部算「已見過」(偏樂觀)；「進場日 < 這一天」的交易，
+# 在選參數的過程中完全沒有出現過，是這份報告裡最誠實的數字。
+# 注意：區段是用「進場日」切，橫跨這一天的那幾筆交易(進場在前、出場在後)算未見過區段，
+# 最多只影響max_hold_days(20天)內的少數幾筆。
+
+SQUEEZE_KDJ_FIXED_SETTING = {
+    "variant": "B", "atr_stop_mult": 1.0, "atr_target_mult": 3.0,
+    "max_concurrent_positions": 3, "max_hold_days": 20,
+    "ranking_rule": "trigger_return", "entry_filter": None,
+    "top_n": 3, "atr_period": 14,
+}
+# (固定口數, 成交模型)，4個情境。這組設定在1440組網格裡對應的是「變體B停損1.0/停利3.0倍ATR、
+# 最多3檔、固定1口或2口、最長20天、觸發K棒漲幅排名、無濾網」那兩組。
+SQUEEZE_KDJ_FIXED_SCENARIOS = (
+    (1, "open"), (1, "limit_1tick"), (2, "open"), (2, "limit_1tick"),
+)
+SQUEEZE_KDJ_EXECUTION_MODEL_LABELS = {
+    "open": "理想成交(隔天開盤價成交，無滑價)",
+    "limit_1tick": "限價：前一根收盤+1檔，開盤超過不追；進場/市價出場滑價1檔",
+}
+SQUEEZE_KDJ_FIXED_BOOTSTRAP_N = 1000
+SQUEEZE_KDJ_FIXED_BOOTSTRAP_SEED = 42
+SQUEEZE_KDJ_FIXED_SEGMENTS = (("full", "全期間"), ("unseen", "未見過區段"), ("seen", "已見過區段"))
+SQUEEZE_KDJ_EXIT_REASON_LABELS_ZH = {
+    "stop": "停損", "stop_gap": "跳空停損(開盤價出場)", "target": "停利",
+    "forced_close": "持有天數到期強制平倉",
+}
+
+
+def squeeze_kdj_fixed_scenario_label(lots: int, execution_model: str) -> str:
+    return f"固定{lots}口｜{SQUEEZE_KDJ_EXECUTION_MODEL_LABELS[execution_model]}"
+
+
+def describe_squeeze_kdj_fixed_setting() -> str:
+    s = SQUEEZE_KDJ_FIXED_SETTING
+    return (f"變體B固定ATR(停損{s['atr_stop_mult']:.1f}倍ATR／停利{s['atr_target_mult']:.1f}倍ATR，"
+            f"ATR{s['atr_period']}天)｜最多同時持有{s['max_concurrent_positions']}檔｜最長持有{s['max_hold_days']}天"
+            f"｜同日多檔排名：{SQUEEZE_KDJ_RANKING_RULE_LABELS[s['ranking_rule']]}(top_n={s['top_n']})"
+            f"｜進場濾網：{SQUEEZE_KDJ_ENTRY_FILTER_LABELS[s['entry_filter']]}")
+
+
+def split_trades_by_grid_data_start(trades: list, boundary: str = SQUEEZE_KDJ_GRID_DATA_START):
+    """依「進場日」切成(未見過, 已見過)兩段：進場日 < boundary 的是未見過，其餘是已見過。
+    各段保留原本的交易順序(出場日先後)，summarize_mr()的權益路徑才有意義。"""
+    cut = pd.Timestamp(boundary)
+    unseen = [t for t in trades if pd.Timestamp(t["entry_date"]) < cut]
+    seen = [t for t in trades if pd.Timestamp(t["entry_date"]) >= cut]
+    return unseen, seen
+
+
+def _squeeze_kdj_fixed_bootstrap(trades: list) -> dict:
+    """跟--squeeze-kdj-grid贏家同一套bootstrap欄位(1000次、seed=42)。"""
+    results = bootstrap_resample_pnl(trades, n_resamples=SQUEEZE_KDJ_FIXED_BOOTSTRAP_N,
+                                     seed=SQUEEZE_KDJ_FIXED_BOOTSTRAP_SEED)
+    return {
+        **summarize_bootstrap(results),
+        "p_value": bootstrap_p_value(results),
+        "pnl_excluding_top3_ntd": pnl_excluding_top_n_trades(trades, n=3),
+    }
+
+
+def _squeeze_kdj_fixed_segment(trades: list, starting_capital: float) -> dict:
+    stats = summarize_mr(trades, starting_capital)
+    b = _squeeze_kdj_fixed_bootstrap(trades)
+    passes = stats["trade_count"] > 0 and stats["profit_factor"] > 1.0 and _squeeze_kdj_bootstrap_passes(b)
+    return {"stats": stats, "bootstrap": b, "passes": passes, "trades": trades}
+
+
+def squeeze_kdj_yearly_table(trades: list, starting_capital: float) -> list:
+    """依「出場日」的日曆年分組(損益是在出場那天實現的)，每年一列：交易筆數、PF、勝率、
+    總損益、年內最大回撤(該年交易依出場順序累加的權益曲線，從年初的0開始算)、拿掉該年最大
+    3筆後損益。沒有交易的年份不會出現(回測期間內某年完全沒交易時，呼叫端看得出缺年)。"""
+    by_year = {}
+    for t in trades:
+        by_year.setdefault(pd.Timestamp(t["exit_date"]).year, []).append(t)
+    rows = []
+    for year in sorted(by_year):
+        stats = summarize_mr(by_year[year], starting_capital)
+        rows.append({
+            "year": year, "trade_count": stats["trade_count"], "profit_factor": stats["profit_factor"],
+            "win_rate": stats["win_rate"], "total_pnl_ntd": stats["total_pnl_ntd"],
+            "max_drawdown_ntd": stats["max_drawdown_ntd"],
+            "pnl_excluding_top3_ntd": stats["pnl_excluding_top3_ntd"],
+        })
+    return rows
+
+
+def _limit_skip_shares(diag: dict) -> dict:
+    """限價不追價略過的比例，兩種分母：
+    佔候選總數(candidates_total)：所有沒被「持倉中/冷卻期」排除的觸發訊號；
+    佔實際掛單數：真的輪到要下單的候選 = 候選總數 - 濾網擋掉 - 名額已滿沒輪到(每個候選在
+    回測裡只會落在「濾網/名額/逐一嘗試進場」三條路其中一條，逐一嘗試進場的第一步就是限價檢查)。"""
+    total = diag["candidates_total"]
+    placed = total - diag["skipped_entry_filter"] - diag["skipped_no_slot"]
+    skipped = diag["skipped_limit_not_filled"]
+    return {
+        "orders_placed": placed,
+        "pct_of_candidates": skipped / total * 100 if total > 0 else 0.0,
+        "pct_of_orders_placed": skipped / placed * 100 if placed > 0 else 0.0,
+    }
+
+
+def run_squeeze_kdj_fixed_backtests(price_data: dict, universe: dict, starting_capital: float,
+                                     master_calendar, scenarios=SQUEEZE_KDJ_FIXED_SCENARIOS) -> list:
+    """
+    --squeeze-kdj-fixed的計算核心(不寫檔，方便測試)：對每個(固定口數, 成交模型)情境，
+    在「完整的master_calendar」上跑一次連續的資金受限回測，回傳每個情境一個dict：
+      lots/execution_model/label、trades、diagnostics、limit_skip(略過比例)、
+      segments{"full"/"unseen"/"seen": {"stats", "bootstrap", "passes", "trades"}}、yearly。
+
+    為什麼是「一次連續回測」而不是IS/OOS各跑一次：這裡只有一組固定設定，沒有任何「挑選」
+    要做，切IS/OOS本身不會帶來額外的保護(切分的意義是讓選拔只看IS，這裡沒有選拔)。連續跑一次
+    才是真實帳戶會走過的路徑——持倉、冷卻期、名額佔用都會自然延續到下一段，不會在切分點被
+    人為清空；「未見過/已見過」改用交易的進場日事後切開來看(split_trades_by_grid_data_start())。
+
+    BB/KC/KDJ狀態機與回測查表陣列只算一次，4個情境共用(跟網格模式同一個做法)。
+    """
+    s = SQUEEZE_KDJ_FIXED_SETTING
+    features_by_code = precompute_squeeze_kdj_features_by_code(price_data, universe)
+    precomputed = precompute_squeeze_kdj_backtest_arrays(price_data, features_by_code, atr_period=s["atr_period"])
+    results = []
+    for lots, execution_model in scenarios:
+        trades, diag = run_squeeze_kdj_capital_constrained_backtest(
+            price_data=price_data, universe=universe, master_calendar=master_calendar,
+            starting_capital=starting_capital, variant=s["variant"], lots=lots, top_n=s["top_n"],
+            max_concurrent_positions=s["max_concurrent_positions"], atr_stop_mult=s["atr_stop_mult"],
+            atr_target_mult=s["atr_target_mult"], atr_period=s["atr_period"], max_hold_days=s["max_hold_days"],
+            ranking_rule=s["ranking_rule"], entry_filter=s["entry_filter"], features_by_code=features_by_code,
+            precomputed=precomputed, return_diagnostics=True, execution_model=execution_model,
+        )
+        unseen, seen = split_trades_by_grid_data_start(trades)
+        results.append({
+            "lots": lots, "execution_model": execution_model,
+            "label": squeeze_kdj_fixed_scenario_label(lots, execution_model),
+            "trades": trades, "diagnostics": diag, "limit_skip": _limit_skip_shares(diag),
+            "segments": {
+                "full": _squeeze_kdj_fixed_segment(trades, starting_capital),
+                "unseen": _squeeze_kdj_fixed_segment(unseen, starting_capital),
+                "seen": _squeeze_kdj_fixed_segment(seen, starting_capital),
+            },
+            "yearly": squeeze_kdj_yearly_table(trades, starting_capital),
+        })
+    return results
+
+
+SQUEEZE_KDJ_FIXED_BOOTSTRAP_LABELS_ZH = {
+    "mean": "bootstrap平均總損益(NT$)", "p5": "bootstrap 5%分位總損益(NT$)",
+    "p95": "bootstrap 95%分位總損益(NT$)", "pct_positive": "bootstrap正報酬比例(%)", "p_value": "bootstrap p值",
+}
+
+
+def squeeze_kdj_fixed_scenarios_frame(results: list, starting_capital: float) -> pd.DataFrame:
+    """squeeze_kdj_fixed_scenarios.csv：每個情境一列，全期間/未見過/已見過三段的統計+bootstrap+
+    是否過門檻，加上全期間的診斷計數器、限價略過比例、權益路徑摘要。欄名直接用中文(跟網格CSV
+    同一個風格：IS/OOS/PF/NT$這類縮寫保留)。"""
+    rows = []
+    for n, r in enumerate(results, start=1):
+        row = {"情境編號": n, "情境說明": r["label"], "固定口數": r["lots"],
+               "成交模型": SQUEEZE_KDJ_EXECUTION_MODEL_LABELS[r["execution_model"]]}
+        for seg_key, seg_label in SQUEEZE_KDJ_FIXED_SEGMENTS:
+            seg = r["segments"][seg_key]
+            for k, v in SQUEEZE_KDJ_GRID_STAT_LABELS_ZH.items():
+                row[f"{seg_label}{v}"] = seg["stats"][k]
+            for k, v in SQUEEZE_KDJ_FIXED_BOOTSTRAP_LABELS_ZH.items():
+                row[f"{seg_label}{v}"] = seg["bootstrap"][k]
+            row[f"{seg_label}通過專案門檻(PF>1且bootstrap正報酬>80%)"] = seg["passes"]
+        for k in CAPITAL_CONSTRAINED_DIAGNOSTIC_KEYS:
+            row[f"全期間診斷_{SQUEEZE_KDJ_GRID_DIAG_LABELS_ZH[k]}"] = r["diagnostics"][k]
+        row["全期間診斷_實際掛單數"] = r["limit_skip"]["orders_placed"]
+        row["限價沒成交佔候選總數(%)"] = r["limit_skip"]["pct_of_candidates"]
+        row["限價沒成交佔實際掛單數(%)"] = r["limit_skip"]["pct_of_orders_placed"]
+        full = r["segments"]["full"]["stats"]
+        row["期末權益(NT$)"] = full["ending_equity_ntd"]
+        row["最大回撤佔起始資金(%)"] = full["max_drawdown_ntd"] / starting_capital * 100
+        row["最長連續虧損筆數"] = full["max_consecutive_losses"]
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def squeeze_kdj_fixed_yearly_frame(results: list) -> pd.DataFrame:
+    rows = []
+    for r in results:
+        for y in r["yearly"]:
+            rows.append({
+                "情境說明": r["label"], "年度(依出場日)": y["year"], "交易筆數": y["trade_count"],
+                "獲利因子PF": y["profit_factor"], "勝率(%)": y["win_rate"], "總損益(NT$)": y["total_pnl_ntd"],
+                "年內最大回撤(NT$)": y["max_drawdown_ntd"], "拿掉最大3筆後損益(NT$)": y["pnl_excluding_top3_ntd"],
+            })
+    return pd.DataFrame(rows, columns=["情境說明", "年度(依出場日)", "交易筆數", "獲利因子PF", "勝率(%)",
+                                       "總損益(NT$)", "年內最大回撤(NT$)", "拿掉最大3筆後損益(NT$)"])
+
+
+SQUEEZE_KDJ_FIXED_TRADE_COLUMNS_ZH = {
+    "code": "股票代號", "side": "方向", "entry_date": "進場日", "exit_date": "出場日",
+    "e_price": "進場成交價", "exit_price": "出場成交價", "exit_reason": "出場原因",
+    "lots": "口數", "pnl_ntd": "損益(NT$，已扣手續費)", "return_pct": "報酬率(相對合約價值)",
+    "hold_days": "持有天數",
+}
+
+
+def squeeze_kdj_fixed_trades_frame(results: list) -> pd.DataFrame:
+    cut = pd.Timestamp(SQUEEZE_KDJ_GRID_DATA_START)
+    rows = []
+    for r in results:
+        for t in r["trades"]:
+            row = {"情境說明": r["label"],
+                   "區段": "未見過" if pd.Timestamp(t["entry_date"]) < cut else "已見過"}
+            for k, v in SQUEEZE_KDJ_FIXED_TRADE_COLUMNS_ZH.items():
+                row[v] = t[k]
+            row["出場原因"] = SQUEEZE_KDJ_EXIT_REASON_LABELS_ZH.get(t["exit_reason"], t["exit_reason"])
+            row["方向"] = "多" if t["side"] == "long" else "空"
+            row["進場成交價"] = round(float(t["e_price"]), 4)
+            row["出場成交價"] = round(float(t["exit_price"]), 4)
+            row["損益(NT$，已扣手續費)"] = round(float(t["pnl_ntd"]), 2)
+            rows.append(row)
+    return pd.DataFrame(rows, columns=["情境說明", "區段", *SQUEEZE_KDJ_FIXED_TRADE_COLUMNS_ZH.values()])
+
+
+def _fmt_bootstrap_line(b: dict) -> str:
+    return (f"bootstrap 1000次重抽樣：平均總損益NT${b['mean']:,.0f}，5%~95%區間=[NT${b['p5']:,.0f}, "
+            f"NT${b['p95']:,.0f}]，正報酬比例={b['pct_positive']:.1f}%，p值={b['p_value']:.3f}，"
+            f"拿掉最大3筆後NT${b['pnl_excluding_top3_ntd']:,.0f}")
+
+
+def _squeeze_kdj_fixed_segment_verdict(seg: dict, segment_label: str) -> str:
+    stats = seg["stats"]
+    if stats["trade_count"] == 0:
+        return f"❌ {segment_label}沒有任何交易，無從驗證"
+    pf_ok = stats["profit_factor"] > 1.0
+    pf_txt = f"PF>1：{'✅' if pf_ok else '❌'}(PF={_fmt_pf(stats['profit_factor'])})"
+    return pf_txt + "；" + _squeeze_kdj_bootstrap_verdict(
+        seg["bootstrap"], subject=f"{segment_label}的結果", segment=segment_label,
+        total_pnl=stats["total_pnl_ntd"])
+
+
+SQUEEZE_KDJ_FIXED_VALIDATION_STANDARD_TEXT = (
+    "【驗證標準(白話)】\n"
+    "  1. 未見過區段(或OOS)的獲利因子PF>1：賺的總額 > 賠的總額。\n"
+    "  2. bootstrap：把這段的交易損益當成一袋籤，「放回抽樣」抽出跟原本一樣多筆、加總，重複1000次"
+    "(seed=42)，看這1000個「平行世界」裡有多少比例總損益>0，必須超過80%。\n"
+    "  3. 報告裡的p值這裡定義成「1 − 上面那個比例」(總損益<=0的比例)，所以「p<0.2」跟「>80%」是同一個"
+    "檢定換個說法，不是兩道獨立的關卡。\n"
+    "  這個檢定只回答一件事：「在這批交易已經發生的前提下，平均每筆交易是不是正的」。它沒有回答："
+    "(a) 這組設定是從1440組裡挑出來的——挑選本身造成的樂觀偏誤完全沒有被校正(多重比較)；"
+    "(b) 市場結構/行情型態改變(regime change)——bootstrap假設每筆交易獨立、來自同一個分布，"
+    "連續虧損成串出現的情況會被低估；"
+    "(c) 80%是寬鬆的門檻，學術上通常要求95%(相當於p<0.05)。\n"
+    "  所以就算通過，也只是「沒有被否定」，不是「已經證明有優勢」。"
+)
+
+SQUEEZE_KDJ_FIXED_CAVEATS_TEXT = (
+    "【誠實caveat】\n"
+    "  - 價格資料是標的「股票」的yfinance日K(未還原權值)，拿來代理「股票期貨」的價格：期貨跟現股之間的"
+    "基差(basis)、股票期貨本身的流動性/買賣價差都沒有模擬，股票期貨實際成交價可能跟這裡差很多，"
+    "尤其是冷門標的。\n"
+    "  - 標的清單是「今天」的股票期貨清單(taifex_universe.STOCK_FUTURES_UNIVERSE)：有倖存者偏差——"
+    "這些年下市/被剔除的股票不在裡面，而且很多股票在2018年根本還沒有股票期貨可以交易；"
+    "從2018年開始回測時，這個偏差比只跑近3年嚴重得多。\n"
+    "  - 進場假設在開盤(集合競價)就能用開盤價(或開盤價+1檔)成交：股票期貨開盤的流動性通常比現股差，"
+    "實際上未必成交在這個價位、也未必成交得到需要的口數。\n"
+    "  - 回測期間結束時還沒出場的部位不會被強制平倉、也不會被計入(最多影響最後20個交易日內進場的幾筆)。\n"
+    "  - 帳戶虧損不會讓回測停下來：保證金上限是用「起始資金」算的，權益就算跌破0也照樣繼續下單"
+    "(真實帳戶早就被追繳/斷頭)，所以期末權益、最大回撤要搭配起始資金一起看，不要只看PF。\n"
+    "  - 「已見過區段」的數字是在選這組設定時已經看過的資料上算的，必然偏樂觀，只能當對照，不能當實盤期待。"
+)
+
+
+def run_squeeze_kdj_fixed_mode(args, price_data, universe, is_calendar, oos_calendar, master_calendar):
+    """--squeeze-kdj-fixed模式：把使用者在1440組網格之後自己選定的單一設定
+    (SQUEEZE_KDJ_FIXED_SETTING：變體B、停損1.0/停利3.0倍ATR、最多3檔、最長20天、觸發K棒漲幅
+    排名、無濾網、top_n=3、ATR14)，分別用固定1口/2口 x 成交模型「理想開盤價成交」/「限價：前一根
+    收盤+1檔，超過不追；滑價1檔」共4個情境，各自在完整master_calendar上跑「一次連續」的回測。
+
+    為什麼不切IS/OOS：只有一組固定設定，沒有選拔要做，切分不會增加任何保護；連續跑一次才是
+    真實帳戶會走過的路徑(持倉/冷卻期/名額會延續)，見run_squeeze_kdj_fixed_backtests() docstring。
+    誠實度改用「進場日在SQUEEZE_KDJ_GRID_DATA_START(2023-10-06)之前/之後」切成未見過/已見過兩段：
+    網格跟挑設定時看過的只有2023-10-06之後的資料，之前的年份才是這組設定從來沒見過的——
+    這段的PF+bootstrap是整份報告最誠實的數字。回測起始日 >= 2023-10-06時沒有未見過區段，
+    summary會明確提醒把「回測起始日期」設成2018-01-01。
+
+    is_calendar/oos_calendar只是為了跟其他squeeze模式同一個呼叫形狀，這裡不使用(見上)。
+    跟其他squeeze模式一樣跳過完整6階段流程；--start/--end/--starting-capital/--max-stocks仍然有效。
+    輸出：squeeze_kdj_fixed_scenarios.csv(每情境一列)、squeeze_kdj_fixed_yearly.csv(情境x年度)、
+    squeeze_kdj_fixed_trades.csv(4個情境全部交易)、summary.txt(同時印在畫面上)。
+    """
+    print("=" * 100)
+    print("--squeeze-kdj-fixed模式：squeeze+KDJ固定設定(使用者選定)長歷史回測，4個情境(1口/2口 x 理想成交/限價1檔)")
+    print("=" * 100, flush=True)
+
+    starting_capital = args.starting_capital
+    results = run_squeeze_kdj_fixed_backtests(price_data, universe, starting_capital, master_calendar)
+
+    squeeze_kdj_fixed_scenarios_frame(results, starting_capital).to_csv(
+        os.path.join(RESULTS_DIR, "squeeze_kdj_fixed_scenarios.csv"), index=False, encoding="utf-8-sig")
+    squeeze_kdj_fixed_yearly_frame(results).to_csv(
+        os.path.join(RESULTS_DIR, "squeeze_kdj_fixed_yearly.csv"), index=False, encoding="utf-8-sig")
+    squeeze_kdj_fixed_trades_frame(results).to_csv(
+        os.path.join(RESULTS_DIR, "squeeze_kdj_fixed_trades.csv"), index=False, encoding="utf-8-sig")
+
+    cal_start = pd.Timestamp(master_calendar[0]) if len(master_calendar) else None
+    cal_end = pd.Timestamp(master_calendar[-1]) if len(master_calendar) else None
+    boundary = pd.Timestamp(SQUEEZE_KDJ_GRID_DATA_START)
+    has_unseen = cal_start is not None and cal_start < boundary
+
+    lines = [
+        "=" * 100,
+        "布林+Keltner擠壓+KDJ訊號 --squeeze-kdj-fixed模式(使用者選定的單一固定設定，長歷史連續回測)",
+        f"回測期間：{args.start} ~ {args.end}(實際交易日曆："
+        f"{cal_start.date() if cal_start is not None else '無'} ~ {cal_end.date() if cal_end is not None else '無'}，"
+        f"{len(master_calendar)}個交易日)　起始資金：NT${starting_capital:,.0f}　標的數：{len(universe)}",
+        f"固定設定：{describe_squeeze_kdj_fixed_setting()}",
+        "=" * 100,
+        "",
+        "ℹ️ 為什麼是「一次連續回測」、不切IS/OOS：這裡只有一組固定設定、沒有任何挑選，切IS/OOS不會多提供"
+        "任何保護；連續跑一次才是真實帳戶會走過的路徑(持倉、冷卻期、名額佔用自然延續)。",
+        f"ℹ️ 未見過/已見過的切法：1440組網格跟你挑這組設定時，看的是{SQUEEZE_KDJ_GRID_DATA_START}之後的資料"
+        f"(IS+OOS都看過)。所以「進場日<{SQUEEZE_KDJ_GRID_DATA_START}」的交易是這組設定從沒見過的"
+        "(★最誠實的數字★)；之後的交易是挑設定時已經看過的(偏樂觀，只當對照)。",
+    ]
+    if not has_unseen:
+        lines.append(
+            f"⚠️ 這次回測起始日({cal_start.date() if cal_start is not None else args.start})不早於"
+            f"{SQUEEZE_KDJ_GRID_DATA_START}，沒有任何「未見過區段」——下面全部數字都是在挑設定時看過的資料上算的，"
+            "偏樂觀、不能當驗證。請把GitHub Actions的「回測起始日期」(start_date)設成2018-01-01重跑一次。")
+    lines += ["", SQUEEZE_KDJ_FIXED_VALIDATION_STANDARD_TEXT, ""]
+
+    for n, r in enumerate(results, start=1):
+        segs = r["segments"]
+        lines.append("#" * 100)
+        lines.append(f"### 情境{n}：{r['label']} ###")
+        lines.append("#" * 100)
+        if has_unseen:
+            u = segs["unseen"]
+            lines.append(f"  ★ 未見過區段(進場日<{SQUEEZE_KDJ_GRID_DATA_START}) ← 這份報告最誠實的數字：")
+            lines.append(f"    {_fmt_stats_line(u['stats'])}")
+            lines.append(f"    {_fmt_bootstrap_line(u['bootstrap'])}")
+            lines.append(f"    判定：{_squeeze_kdj_fixed_segment_verdict(u, '未見過區段')}")
+        else:
+            lines.append("  ★ 未見過區段：無(回測起始日太晚，見上方提醒)")
+        s_ = segs["seen"]
+        lines.append(f"  已見過區段(進場日>={SQUEEZE_KDJ_GRID_DATA_START}，挑設定時看過 → 偏樂觀，只當對照)：")
+        lines.append(f"    {_fmt_stats_line(s_['stats'])}")
+        lines.append(f"    {_fmt_bootstrap_line(s_['bootstrap'])}")
+        f_ = segs["full"]
+        lines.append("  全期間(混合未見過+已見過)：")
+        lines.append(f"    {_fmt_stats_line(f_['stats'])}")
+        lines.append(f"    {_fmt_bootstrap_line(f_['bootstrap'])}")
+        lines.append(f"    判定(僅供參考，含已見過資料)：{_squeeze_kdj_fixed_segment_verdict(f_, '全期間')}")
+
+        lines.append("  逐年(依出場日)：")
+        if not r["yearly"]:
+            lines.append("    (沒有任何交易)")
+        for y in r["yearly"]:
+            tag = "未見過" if y["year"] < boundary.year else ("跨界" if y["year"] == boundary.year else "已見過")
+            lines.append(
+                f"    {y['year']}年[{tag}]：{y['trade_count']}筆, PF={_fmt_pf(y['profit_factor'])}, "
+                f"勝率={y['win_rate']:.1f}%, 總損益NT${y['total_pnl_ntd']:,.0f}, "
+                f"年內最大回撤NT${y['max_drawdown_ntd']:,.0f}, 拿掉最大3筆後NT${y['pnl_excluding_top3_ntd']:,.0f}")
+
+        diag = r["diagnostics"]
+        ls = r["limit_skip"]
+        lines.append(f"  [診斷，全期間] {_fmt_diag_line(diag)}")
+        if r["execution_model"] == "limit_1tick":
+            lines.append(f"    限價沒成交(開盤價>前一根收盤+1檔、不追價)：{diag['skipped_limit_not_filled']}次，"
+                         f"佔候選總數{ls['pct_of_candidates']:.1f}%、佔實際輪到要下單的{ls['orders_placed']}次"
+                         f"的{ls['pct_of_orders_placed']:.1f}%")
+        full = f_["stats"]
+        lines.append(
+            f"  [權益路徑，全期間] 期末權益NT${full['ending_equity_ntd']:,.0f}，最大回撤(高點到低點)"
+            f"NT${full['max_drawdown_ntd']:,.0f}(={full['max_drawdown_ntd'] / starting_capital * 100:.1f}%起始資金)，"
+            f"最長連續虧損{full['max_consecutive_losses']}筆")
+        lines.append("")
+
+    lines.append("【4個情境並排(★未見過區段為主)】")
+    for n, r in enumerate(results, start=1):
+        u, f_ = r["segments"]["unseen"], r["segments"]["full"]
+        unseen_txt = (f"未見過 {u['stats']['trade_count']}筆 PF={_fmt_pf(u['stats']['profit_factor'])} "
+                      f"損益NT${u['stats']['total_pnl_ntd']:,.0f} bootstrap正報酬{u['bootstrap']['pct_positive']:.1f}% "
+                      f"{'✅過門檻' if u['passes'] else '❌沒過門檻'}") if has_unseen else "未見過：無"
+        lines.append(f"  情境{n} {r['label']}：{unseen_txt}｜全期間 {f_['stats']['trade_count']}筆 "
+                     f"PF={_fmt_pf(f_['stats']['profit_factor'])} 損益NT${f_['stats']['total_pnl_ntd']:,.0f}")
+    lines.append("  (理想成交 vs 限價1檔的差距 = 真實下單方式要付出的代價；限價情境才是比較接近你實際操作的數字。)")
+    lines += ["", SQUEEZE_KDJ_FIXED_CAVEATS_TEXT, "",
+              "輸出：squeeze_kdj_fixed_scenarios.csv(每情境一列)、squeeze_kdj_fixed_yearly.csv(情境x年度)、"
+              "squeeze_kdj_fixed_trades.csv(全部交易)。"]
+
+    summary_text = "\n".join(lines)
+    print(summary_text)
+    summary_path = os.path.join(RESULTS_DIR, "summary.txt")
+    with open(summary_path, "w", encoding="utf-8") as f:
+        f.write(summary_text + "\n")
+    print(f"\n已輸出：{summary_path}")
+    return results
 
 
 def evaluate_combo(label, price_data, indicators_by_code, regime_series, is_calendar, oos_calendar,
@@ -2499,6 +2919,17 @@ def main():
                               "幾組跟多重比較警告。輸出squeeze_kdj_grid_all_combos.csv(中文欄名)+summary.txt。"
                               "跟--squeeze-kdj-only一樣跳過完整6階段流程；--start/--end/--starting-capital/"
                               "--max-stocks仍然有效(起始資金是真實帳戶規模，不是網格維度)")
+    parser.add_argument("--squeeze-kdj-fixed", action="store_true",
+                         help="squeeze+KDJ固定設定長歷史回測(--squeeze-kdj-fixed)：1440組網格之後使用者選定的"
+                              "單一設定(變體B停損1.0/停利3.0倍ATR、最多3檔、最長20天、觸發K棒漲幅排名、無濾網、"
+                              "top_n=3、ATR14)，跑固定1口/2口 x 成交模型(理想開盤價成交／限價：前一根收盤+1檔、"
+                              "開盤超過不追、進場與市價出場滑價1檔)共4個情境，每個情境在整段期間連續回測一次，"
+                              "依進場日切成「未見過(<2023-10-06，網格跟挑設定時沒看過)」跟「已見過」兩段，"
+                              "各自報告PF+bootstrap，另外逐年表/診斷/權益路徑。建議--start 2018-01-01 "
+                              "--max-stocks 0。輸出squeeze_kdj_fixed_scenarios.csv/squeeze_kdj_fixed_yearly.csv/"
+                              "squeeze_kdj_fixed_trades.csv+summary.txt。跟其他squeeze模式一樣跳過完整6階段流程；"
+                              "跟--squeeze-kdj-only/--squeeze-kdj-capital-constrained/--squeeze-kdj-grid互斥"
+                              "(main()依序檢查，那幾個若同時開啟會先執行並直接return)")
     parser.add_argument("--fixed-combo-walkforward-folds", type=int, default=0,
                          help="測試幾組「固定死不重新挑選」的候選規則(FIXED_WALKFORWARD_COMBO_VARIANTS，"
                               "基準+只改一個維度的變體)跨N個獨立、不重疊歷史區塊的表現，0代表不啟用(預設)。"
@@ -2589,6 +3020,10 @@ def main():
 
     if args.squeeze_kdj_grid:
         run_squeeze_kdj_grid_mode(args, price_data, universe, is_calendar, oos_calendar)
+        return
+
+    if args.squeeze_kdj_fixed:
+        run_squeeze_kdj_fixed_mode(args, price_data, universe, is_calendar, oos_calendar, master_calendar)
         return
 
     if args.use_trailing_stop:
