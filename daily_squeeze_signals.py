@@ -377,6 +377,56 @@ def render_markdown(result: dict) -> str:
     return "\n".join(lines)
 
 
+TELEGRAM_MAX_CHARS = 3900  # Telegram單則訊息上限4096字，留一點空間給結尾連結
+
+
+def render_telegram(result: dict, link: str = None) -> str:
+    """Telegram推播用的精簡純文字版(不用Markdown/HTML parse_mode，避免特殊字元跳脫問題)。
+    只放下單需要的數字；完整說明跟每日操作規則在latest.md(link)。內容跟render_markdown()
+    同一份result產生，數字完全一致。超過Telegram長度上限時截斷並提示看完整版。"""
+    as_of = result["as_of"]
+    sigs = result["signals"]
+    fresh = result["data_fresh"]
+    latest = result["latest_date"]
+    lines = [f"擠壓+KDJ 每日訊號 {fmt_date(as_of)}"]
+
+    if not fresh:
+        lines += [
+            "⚠️ 資料還沒更新到今天，這份清單不可信，不要下單。",
+            f"最新資料日期：{fmt_date(latest) if latest is not None else '無資料'}。"
+            "可能是資料源還沒更新或今天休市，請晚點到Actions手動重跑。",
+        ]
+    else:
+        n_actionable = sum(1 for r in sigs if not r["backtest_would_skip"])
+        if not sigs:
+            lines.append(f"✅ 今天沒有訊號，{fmt_date(result['entry_date'])} 不用下單。")
+        elif n_actionable == 0:
+            lines.append(f"✅ 今天{len(sigs)}檔訊號都是⛔(回測會略過)，{fmt_date(result['entry_date'])} 不用下單。")
+        else:
+            lines.append(f"📌 {len(sigs)}檔訊號(可下單{n_actionable}檔)，{fmt_date(result['entry_date'])} 開盤前掛單，"
+                         "依名次取到你的空位數為止；已持有/停損後10天內的跳過。")
+        for r in sigs:
+            name = f" {r['name']}" if r["name"] else ""
+            lines.append("")
+            if r["backtest_would_skip"]:
+                why = "保證金超過資金35%" if r["margin_over_cap"] else "ATR異常"
+                lines.append(f"{r['rank']}. {r['code']}{name} ⛔ 不要下({why})")
+                continue
+            lines.append(f"{r['rank']}. {r['code']}{name}｜{r['contract']}契約1口｜保證金約{r['margin_est_1lot']:,.0f}")
+            lines.append(f"限價買 {fmt_price(r['limit_price'])}(開盤高於此價不追)")
+            lines.append(f"若成交在{fmt_price(r['limit_price'])}：停損 {fmt_price(r['stop_if_fill_at_limit'])}"
+                         f"｜停利 {fmt_price(r['target_if_fill_at_limit'])}")
+            lines.append(f"實際成交價不同就重算：停損=成交價−{r['stop_dist']:.2f}，停利=成交價+{r['target_dist']:.2f}")
+            lines.append(f"最晚 {fmt_date(r['time_exit_date'])} 收盤前平倉(遇假日順延)")
+
+    footer_text = f"\n\n完整說明與操作規則：{link}" if link else ""
+    text = "\n".join(lines)
+    if len(text) + len(footer_text) > TELEGRAM_MAX_CHARS:
+        cut = TELEGRAM_MAX_CHARS - len(footer_text) - 40
+        text = text[:cut].rsplit("\n", 1)[0] + "\n…(訊號太多，其餘請看完整版)"
+    return text + footer_text
+
+
 def write_outputs(result: dict, output_dir: str) -> dict:
     os.makedirs(output_dir, exist_ok=True)
     md = render_markdown(result)
@@ -385,10 +435,13 @@ def write_outputs(result: dict, output_dir: str) -> dict:
         "latest": os.path.join(output_dir, "latest.md"),
         "md": os.path.join(output_dir, f"{day}.md"),
         "csv": os.path.join(output_dir, f"{day}.csv"),
+        "telegram": os.path.join(output_dir, "telegram.txt"),
     }
     for key in ("latest", "md"):
         with open(paths[key], "w", encoding="utf-8") as f:
             f.write(md)
+    with open(paths["telegram"], "w", encoding="utf-8") as f:
+        f.write(render_telegram(result, link=os.environ.get("SIGNALS_LINK")))
     signals_frame(result).to_csv(paths["csv"], index=False, encoding="utf-8-sig")
     summary_path = os.environ.get("GITHUB_STEP_SUMMARY")
     if summary_path:

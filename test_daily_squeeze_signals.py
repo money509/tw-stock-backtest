@@ -380,3 +380,56 @@ class TestWithoutScipy:
         assert proc.returncode == 0, proc.stderr
         assert "OK" in proc.stdout
         assert (tmp_path / "latest.md").exists()
+
+
+# ----------------------------------------------------------------------------
+def _result_with(rows, fresh=True, as_of="2026-10-05"):
+    as_of = pd.Timestamp(as_of)
+    return {"as_of": as_of, "capital": 200_000, "universe_size": 249, "downloaded": 249, "failed_codes": [],
+            "usable": 249, "stale_codes": [], "latest_date": as_of if fresh else as_of - pd.Timedelta(days=3),
+            "latest_source": "2330", "data_fresh": fresh, "signals": rows,
+            "entry_date": dss.next_business_day(as_of)}
+
+
+class TestTelegramMessage:
+    def _row(self, code, price, capital=200_000, rank=1):
+        row = dss.compute_signal_row(code, _single_stock_signal_df(price), capital=capital)
+        return {**row, "rank": rank}
+
+    def test_no_signal(self):
+        txt = dss.render_telegram(_result_with([]), link="https://example.com/latest.md")
+        assert "今天沒有訊號" in txt and "2026-10-06(二) 不用下單" in txt
+        assert txt.endswith("https://example.com/latest.md")
+
+    def test_stale_data_has_no_prices(self):
+        r = self._row("2330", 100.0)
+        txt = dss.render_telegram(_result_with([r], fresh=False))
+        assert "資料還沒更新到今天" in txt and "不要下單" in txt
+        assert "限價買" not in txt
+
+    def test_actionable_signal_numbers_match_markdown_row(self):
+        r = self._row("2330", 100.0)
+        txt = dss.render_telegram(_result_with([r]))
+        assert f"限價買 {dss.fmt_price(r['limit_price'])}" in txt
+        assert f"停損 {dss.fmt_price(r['stop_if_fill_at_limit'])}" in txt
+        assert f"停利 {dss.fmt_price(r['target_if_fill_at_limit'])}" in txt
+        assert "1檔訊號(可下單1檔)" in txt and "小型契約" in txt
+
+    def test_blocked_signal_says_do_not_trade(self):
+        r = self._row("1101", 300.0)  # 標準契約，保證金超過20萬x35%
+        txt = dss.render_telegram(_result_with([r]))
+        assert "⛔ 不要下(保證金超過資金35%)" in txt and "不用下單" in txt
+        assert "限價買" not in txt
+
+    def test_truncated_under_telegram_limit(self):
+        base = self._row("2330", 100.0)
+        rows = [{**base, "rank": i} for i in range(1, 80)]
+        txt = dss.render_telegram(_result_with(rows), link="https://example.com/latest.md")
+        assert len(txt) <= 4096
+        assert "其餘請看完整版" in txt and txt.endswith("https://example.com/latest.md")
+
+    def test_write_outputs_writes_telegram_file(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("SIGNALS_LINK", "https://example.com/x.md")
+        monkeypatch.delenv("GITHUB_STEP_SUMMARY", raising=False)
+        dss.write_outputs(_result_with([]), str(tmp_path))
+        assert (tmp_path / "telegram.txt").read_text(encoding="utf-8").endswith("https://example.com/x.md")
