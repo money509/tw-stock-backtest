@@ -813,6 +813,104 @@ def run_squeeze_kdj_exit_style_comparison(price_data: dict, universe: dict, star
     return pd.DataFrame(rows)
 
 
+SQUEEZE_KDJ_VARIANT_LABELS = {
+    "A": "變體A(原規則：前K棒低點停損+K跌破80停利)",
+    "B": "變體B(沿用ATR框架：停損1.0x ATR/停利2.0x ATR)",
+}
+
+
+def run_squeeze_kdj_exit_style_comparison_is_oos(price_data: dict, universe: dict, starting_capital: float,
+                                                  is_calendar, oos_calendar, lots: int = 2) -> dict:
+    """
+    run_squeeze_kdj_exit_style_comparison()的IS/OOS + bootstrap版本——這份比較是這個檔案
+    裡最後一個還沒套用專案自己整套驗證方法論(70/30 IS/OOS切分 + OOS的1000次bootstrap重抽樣，
+    見evaluate_combo())的地方，之前只跑過全樣本、沒切IS/OOS，曾經看到變體之一PF=1.84、
+    總損益+NT$518萬這種好看的數字，但完全沒驗證過是不是過擬合/運氣——這個repo別的地方已經
+    示範過好看的全樣本/IS數字換到OOS可能完全不是那回事(例如momentum_breakout 6階段流程
+    IS PF=1.41但OOS只有0.48)，所以在對這個數字做任何進一步調整之前，第一件事是先老實驗證，
+    不是直接拿來优化。
+
+    做法：跟run_squeeze_kdj_exit_style_comparison()一樣，對universe每檔股票各自獨立模擬出
+    變體A/B的完整交易列表(不重新模擬兩次)，但接下來不是直接summarize_mr()全樣本，而是
+    把每一筆交易依entry_date是否早於OOS切分點(is_calendar/oos_calendar的分界，即
+    oos_calendar[0])分成IS/OOS兩組——因為這個函式本身不經過
+    run_momentum_breakout_backtest()/master_calendar逐日迴圈那條路徑(直接呼叫
+    squeeze_kdj_signal.simulate_variant_a_trades/simulate_variant_b_trades，一次性算出
+    整段期間的交易列表)，沒有「只給IS那段calendar去跑」這個選項，退而求其次用交易的
+    entry_date直接切，等價於「如果IS calendar到哪天為止，只保留在那之前進場的交易」，
+    不會有用到未來資料的問題(訊號計算本身只看當天以前的OHLCV，分組動作是在交易模擬完成
+    之後才做，不影響訊號本身)。
+
+    IS/OOS統計都用summarize_mr()，OOS再額外跑bootstrap_resample_pnl()
+    (n_resamples=1000, seed=42，跟evaluate_combo()同一套慣例)+summarize_bootstrap()+
+    bootstrap_p_value()+pnl_excluding_top_n_trades()。回傳格式比照evaluate_combo()，
+    方便呼叫端用同一套印法：{"A": {"label":..., "IS":..., "OOS":..., "bootstrap":...,
+    "oos_trades":...}, "B": {...}}。
+
+    誠實caveat(沿用自run_squeeze_kdj_exit_style_comparison()，這裡的IS/OOS/bootstrap
+    驗證並沒有改變這一點)：這個比較刻意不經過資金/部位管理(沒有top_n排名、沒有同時
+    持倉上限)，universe裡每一檔股票的每一個訊號都視為獨立成交，這是為了單純比較「這個
+    進場/出場邏輯本身好不好」，但代表這裡的PF/損益數字比真實帳戶(資金有限、不可能
+    同時吃下所有訊號)能拿到的數字樂觀——IS/OOS+bootstrap驗證回答的是「這套進場/出場邏輯
+    方向上是否穩健」，不是「我的帳戶實際能拿到的PF」，不要把這裡的OOS數字直接當成
+    實盤可以期待的報酬。
+    """
+    is_cutoff = oos_calendar[0] if len(oos_calendar) > 0 else None
+    is_trades = {"A": [], "B": []}
+    oos_trades = {"A": [], "B": []}
+
+    for code in universe:
+        df = price_data.get(code)
+        if df is None or len(df) < 60:
+            continue
+        features = compute_squeeze_kdj_features(df)
+        raw_a = simulate_variant_a_trades(df, features)
+        raw_b = simulate_variant_b_trades(df, features, atr_period=14, atr_stop_mult=1.0, atr_target_mult=2.0)
+        costed_a = _cost_squeeze_kdj_trades(raw_a, code, lots=lots)
+        costed_b = _cost_squeeze_kdj_trades(raw_b, code, lots=lots)
+        for key, costed in (("A", costed_a), ("B", costed_b)):
+            for t in costed:
+                bucket = oos_trades[key] if (is_cutoff is not None and t["entry_date"] >= is_cutoff) else is_trades[key]
+                bucket.append(t)
+
+    results = {}
+    for key, label in SQUEEZE_KDJ_VARIANT_LABELS.items():
+        is_stats = summarize_mr(is_trades[key], starting_capital)
+        oos_stats = summarize_mr(oos_trades[key], starting_capital)
+        boot_results = bootstrap_resample_pnl(oos_trades[key], n_resamples=1000, seed=42)
+        boot_stats = summarize_bootstrap(boot_results)
+        results[key] = {
+            "label": label, "IS": is_stats, "OOS": oos_stats,
+            "bootstrap": {
+                **boot_stats,
+                "p_value": bootstrap_p_value(boot_results),
+                "pnl_excluding_top3_ntd": pnl_excluding_top_n_trades(oos_trades[key], n=3),
+            },
+            "oos_trades": oos_trades[key],
+        }
+    return results
+
+
+def _squeeze_kdj_is_oos_results_to_df(results: dict) -> pd.DataFrame:
+    """把run_squeeze_kdj_exit_style_comparison_is_oos()的回傳dict整理成一張長格式的
+    DataFrame，方便寫成單一個CSV：每個變體各兩列(IS/OOS)的基本統計，另外加一列
+    OOS bootstrap的彙整統計(mean/p5/p95/pct_positive/p_value/拿掉最大3筆後損益)。"""
+    rows = []
+    for r in results.values():
+        for split_name in ("IS", "OOS"):
+            stats = r[split_name]
+            rows.append({"variant": r["label"], "split": split_name, **stats})
+        b = r["bootstrap"]
+        rows.append({
+            "variant": r["label"], "split": "OOS_bootstrap(1000次重抽樣)",
+            "trade_count": len(r["oos_trades"]),
+            "bootstrap_mean_ntd": b["mean"], "bootstrap_p5_ntd": b["p5"], "bootstrap_p95_ntd": b["p95"],
+            "bootstrap_pct_positive": b["pct_positive"], "bootstrap_p_value": b["p_value"],
+            "pnl_excluding_top3_ntd": b["pnl_excluding_top3_ntd"],
+        })
+    return pd.DataFrame(rows)
+
+
 def evaluate_combo(label, price_data, indicators_by_code, regime_series, is_calendar, oos_calendar,
                     starting_capital, hold_days, signal_weights, gate_kwargs, atr_stop_mult,
                     trailing_atr_mult, use_trailing_stop, extra_kwargs, execution_kwargs):
@@ -1790,13 +1888,28 @@ def main():
             )
 
     print(f"\n[新增階段] 布林+Keltner擠壓+KDJ訊號：變體A(原規則) vs 變體B(沿用ATR框架) ...")
-    squeeze_kdj_exit_df = run_squeeze_kdj_exit_style_comparison(price_data, universe, args.starting_capital)
-    squeeze_kdj_exit_df.to_csv(os.path.join(RESULTS_DIR, "squeeze_kdj_exit_comparison.csv"),
+    print("  ⚠️ 這是這個檔案最後一個補上IS/OOS+bootstrap驗證的比較，之前只跑過全樣本、"
+          "沒有分IS/OOS，之前一次好看的全樣本數字(PF=1.84、損益+NT$518萬)完全沒驗證過"
+          "是不是過擬合——先驗證再談優化，見run_squeeze_kdj_exit_style_comparison_is_oos() "
+          "docstring")
+    squeeze_kdj_results = run_squeeze_kdj_exit_style_comparison_is_oos(
+        price_data, universe, args.starting_capital, is_calendar, oos_calendar,
+    )
+    squeeze_kdj_exit_df = _squeeze_kdj_is_oos_results_to_df(squeeze_kdj_results)
+    squeeze_kdj_exit_df.to_csv(os.path.join(RESULTS_DIR, "squeeze_kdj_is_oos.csv"),
                                 index=False, encoding="utf-8-sig")
-    for _, r in squeeze_kdj_exit_df.iterrows():
-        print(f"  [{r['variant']}] {r['trade_count']}筆, PF={_fmt_pf(r['profit_factor'])}, "
-              f"勝率={r['win_rate']:.1f}%, 平均持有{r['avg_hold_days']:.1f}天, "
-              f"總損益={r['total_pnl_ntd']:,.0f}")
+    for r in squeeze_kdj_results.values():
+        print(f"  [{r['label']}]")
+        print(f"    IS  -> {r['IS']['trade_count']}筆, PF={_fmt_pf(r['IS']['profit_factor'])}, "
+              f"平均持有{r['IS']['avg_hold_days']:.1f}天, 損益={r['IS']['total_pnl_ntd']:,.0f}")
+        print(f"    OOS -> {r['OOS']['trade_count']}筆, PF={_fmt_pf(r['OOS']['profit_factor'])}, "
+              f"平均持有{r['OOS']['avg_hold_days']:.1f}天, 損益={r['OOS']['total_pnl_ntd']:,.0f}")
+        b = r["bootstrap"]
+        print(f"    bootstrap：正報酬比例={b['pct_positive']:.1f}%, p值={b['p_value']:.3f}, "
+              f"拿掉最大3筆後損益={b['pnl_excluding_top3_ntd']:,.0f}")
+    print("  ⚠️ 以上全程不經過資金/部位管理(每個訊號都視為獨立成交，沒有top_n排名、沒有"
+          "同時持倉上限)，PF/損益數字比真實帳戶能拿到的樂觀——這組驗證回答的是「進場/出場"
+          "邏輯方向上是否穩健」，不是「我的帳戶實際能拿到的PF」")
 
     walkforward_df = None
     if args.walkforward_folds > 0:
@@ -2063,16 +2176,32 @@ def main():
                 )
 
     summary_lines.append(f"\n--- 布林+Keltner擠壓+KDJ訊號：變體A(原規則) vs 變體B(沿用ATR框架) ---")
-    summary_lines.append("  (這個比較跟上面各階段獨立，直接用全部下載期間的資料，"
-                          "不分IS/OOS，只做多方，見squeeze_kdj_signal.py模組docstring)")
-    header_sk = f"{'出場變體':<46}{'交易數':>8}{'PF':>8}{'勝率%':>8}{'平均持有天':>10}{'總損益NT$':>14}"
-    summary_lines.append(header_sk)
-    summary_lines.append("-" * len(header_sk))
-    for _, r in squeeze_kdj_exit_df.iterrows():
+    summary_lines.append("  (這個比較跟上面各階段獨立，只做多方，見squeeze_kdj_signal.py模組docstring；"
+                          "本輪新增IS/OOS切分+OOS bootstrap穩健性檢查，取代之前只跑全樣本、"
+                          "沒驗證過是不是過擬合的版本)")
+    for r in squeeze_kdj_results.values():
+        summary_lines.append(f"\n  [{r['label']}]")
+        for split_name in ["IS", "OOS"]:
+            stats = r[split_name]
+            split_full = "樣本內(IS)" if split_name == "IS" else "樣本外(OOS) ← 較誠實的參考依據"
+            summary_lines.append(
+                f"    {split_full}: {stats['trade_count']}筆, PF={_fmt_pf(stats['profit_factor'])}, "
+                f"勝率={stats['win_rate']:.1f}%, 平均持有{stats['avg_hold_days']:.1f}天, "
+                f"總損益NT${stats['total_pnl_ntd']:,.0f}, "
+                f"最大回撤NT${stats['max_drawdown_ntd']:,.0f}, 最大連續虧損{stats['max_consecutive_losses']}筆"
+            )
+        b = r["bootstrap"]
         summary_lines.append(
-            f"{r['variant']:<46}{r['trade_count']:>8}{_fmt_pf(r['profit_factor']):>8}"
-            f"{r['win_rate']:>8.1f}{r['avg_hold_days']:>10.1f}{r['total_pnl_ntd']:>14,.0f}"
+            f"    [穩健性] OOS bootstrap 1000次重抽樣：平均總損益NT${b['mean']:,.0f}，"
+            f"5%~95%區間=[NT${b['p5']:,.0f}, NT${b['p95']:,.0f}]，"
+            f"正報酬比例={b['pct_positive']:.1f}%，p值={b['p_value']:.3f}，"
+            f"拿掉最大3筆交易後總損益NT${b['pnl_excluding_top3_ntd']:,.0f}"
         )
+    summary_lines.append(
+        "  ⚠️ 以上全程不經過資金/部位管理(每個訊號都視為獨立成交，沒有top_n排名、沒有同時"
+        "持倉上限)，PF/損益數字比真實帳戶能拿到的樂觀——這組驗證回答的是「進場/出場邏輯"
+        "方向上是否穩健」，不是「我的帳戶實際能拿到的PF」"
+    )
 
     summary_lines.append(
         "\n判讀方式：先看單一訊號拆解，PF明顯>1且交易筆數夠多的訊號才代表真的有預測力；"

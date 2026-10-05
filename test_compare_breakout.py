@@ -278,7 +278,7 @@ class TestSimpleComboCliModeSkipsFullPipeline:
             "run_signal_ablation", "run_signal_combo_comparison", "run_gate_comparison",
             "run_atr_sensitivity_grid", "run_exit_style_comparison",
             "run_walkforward_validation", "run_fixed_combo_walkforward",
-            "run_squeeze_kdj_exit_style_comparison", "run_multi_period_validation",
+            "run_squeeze_kdj_exit_style_comparison", "run_squeeze_kdj_exit_style_comparison_is_oos", "run_multi_period_validation",
         ]
 
         def _boom(name):
@@ -414,7 +414,7 @@ class TestComboSearchCliModeSkipsFullPipeline:
             "run_signal_combo_comparison", "run_gate_comparison",
             "run_atr_sensitivity_grid", "run_exit_style_comparison",
             "run_walkforward_validation", "run_fixed_combo_walkforward",
-            "run_squeeze_kdj_exit_style_comparison", "run_multi_period_validation",
+            "run_squeeze_kdj_exit_style_comparison", "run_squeeze_kdj_exit_style_comparison_is_oos", "run_multi_period_validation",
         ]
 
         def _boom(name):
@@ -559,3 +559,102 @@ class TestComboSearchCliModeSkipsFullPipeline:
             f"--with-chip-confirm開啟時，候選2(全部混搭)的訊號權重應該包含籌碼相關訊號，"
             f"實際權重名單：{list(all_signals_weights)}"
         )
+
+
+class TestRunSqueezeKdjExitStyleComparisonIsOos:
+    """run_squeeze_kdj_exit_style_comparison_is_oos()：這是補上IS/OOS切分+bootstrap
+    穩健性檢查之前，squeeze+KDJ訊號比較唯一還沒套用專案標準驗證方法論的地方(之前只跑
+    全樣本，沒有分IS/OOS、沒有bootstrap)。這裡不走真正的BB/KC/KDJ訊號計算(跟訊號本身
+    邏輯無關)，直接monkeypatch simulate_variant_a_trades/simulate_variant_b_trades回傳
+    一組entry_date已知的合成交易，單純驗證：(a) IS/OOS切分真的依entry_date跟切分點正確
+    分組(IS側全部早於切分點、OOS側全部不早於切分點)，(b) bootstrap統計量確實算出來、
+    兩個變體都有。全程合成資料，不呼叫任何下載函式。"""
+
+    def _make_price_df(self, n=120, start="2020-01-01"):
+        idx = pd.date_range(start, periods=n, freq="B")
+        closes = pd.Series(np.linspace(100, 120, n), index=idx, dtype=float)
+        return pd.DataFrame({
+            "Open": closes, "High": closes * 1.01, "Low": closes * 0.99, "Close": closes,
+            "Volume": pd.Series(1000.0, index=idx),
+        }, index=idx)
+
+    def _patch_fixed_trades(self, monkeypatch, df, before_dates, after_dates):
+        """讓每一檔股票、兩個變體都回傳同一組固定交易：before_dates那些entry_date在切分點
+        之前，after_dates在切分點(含)之後，出場日固定隔一天、出場價固定小賺一點，確保
+        pnl_ntd不會剛好是0(bootstrap/PF計算才有意義)。"""
+        all_dates = list(before_dates) + list(after_dates)
+
+        def _fixed_trades(*args, **kwargs):
+            trades = []
+            for d in all_dates:
+                pos = df.index.get_loc(d)
+                exit_pos = min(pos + 1, len(df) - 1)
+                trades.append({
+                    "entry_date": d, "entry_price": 100.0,
+                    "exit_date": df.index[exit_pos], "exit_price": 101.0,
+                    "exit_reason": "target", "hold_days": 1,
+                })
+            return trades
+
+        monkeypatch.setattr(cb, "compute_squeeze_kdj_features", lambda df, *a, **k: df)
+        monkeypatch.setattr(cb, "simulate_variant_a_trades", _fixed_trades)
+        monkeypatch.setattr(cb, "simulate_variant_b_trades", _fixed_trades)
+
+    def test_trades_split_by_entry_date_relative_to_cutoff(self, monkeypatch):
+        df = self._make_price_df()
+        universe = {"1101": {}, "1102": {}}
+        price_data = {code: df for code in universe}
+
+        is_calendar, oos_calendar = cb.split_is_oos(df.index, is_ratio=0.7)
+        cutoff = oos_calendar[0]
+        before_dates = [d for d in df.index if d < cutoff][:3]
+        after_dates = [d for d in df.index if d >= cutoff][:3]
+        assert before_dates and after_dates
+
+        self._patch_fixed_trades(monkeypatch, df, before_dates, after_dates)
+
+        results = cb.run_squeeze_kdj_exit_style_comparison_is_oos(
+            price_data, universe, starting_capital=1_000_000,
+            is_calendar=is_calendar, oos_calendar=oos_calendar, lots=1,
+        )
+
+        assert set(results.keys()) == {"A", "B"}
+        for key in ("A", "B"):
+            r = results[key]
+            # 每檔股票各貢獻一份before/after交易，universe有2檔，所以IS/OOS各應有
+            # len(before_dates)*2 / len(after_dates)*2 筆交易。
+            assert r["IS"]["trade_count"] == len(before_dates) * len(universe)
+            assert r["OOS"]["trade_count"] == len(after_dates) * len(universe)
+            for t in r["oos_trades"]:
+                assert t["entry_date"] >= cutoff, (
+                    f"OOS側交易entry_date={t['entry_date']}不該早於切分點{cutoff}"
+                )
+
+    def test_bootstrap_stats_present_for_both_variants(self, monkeypatch):
+        df = self._make_price_df()
+        universe = {"1101": {}, "1102": {}}
+        price_data = {code: df for code in universe}
+
+        is_calendar, oos_calendar = cb.split_is_oos(df.index, is_ratio=0.7)
+        cutoff = oos_calendar[0]
+        before_dates = [d for d in df.index if d < cutoff][:3]
+        after_dates = [d for d in df.index if d >= cutoff][:5]
+
+        self._patch_fixed_trades(monkeypatch, df, before_dates, after_dates)
+
+        results = cb.run_squeeze_kdj_exit_style_comparison_is_oos(
+            price_data, universe, starting_capital=1_000_000,
+            is_calendar=is_calendar, oos_calendar=oos_calendar, lots=1,
+        )
+
+        expected_bootstrap_keys = {"mean", "p5", "p95", "pct_positive", "p_value", "pnl_excluding_top3_ntd"}
+        for key in ("A", "B"):
+            b = results[key]["bootstrap"]
+            assert expected_bootstrap_keys.issubset(b.keys())
+            # OOS有交易、且每筆pnl都同號(全部小賺)，bootstrap重抽樣的結果應該全部一致地為正。
+            assert b["pct_positive"] == 100.0
+            assert b["p_value"] == 0.0
+
+        df_out = cb._squeeze_kdj_is_oos_results_to_df(results)
+        assert set(df_out["variant"]) == set(cb.SQUEEZE_KDJ_VARIANT_LABELS.values())
+        assert "OOS_bootstrap(1000次重抽樣)" in set(df_out["split"])
