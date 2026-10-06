@@ -144,7 +144,7 @@ import os
 import numpy as np
 import pandas as pd
 
-from data_loader import load_price_data
+from data_loader import load_price_data, load_index_series
 from taifex_universe import STOCK_FUTURES_UNIVERSE
 from momentum_breakout_engine import (
     run_momentum_breakout_backtest, BREAKOUT_SIGNAL_NAMES, CHIP_DEPENDENT_SIGNALS,
@@ -1227,7 +1227,13 @@ SQUEEZE_KDJ_RANKING_RULE_LABELS = {
     "trigger_return": "觸發K棒當天漲幅",
     "volume_ratio": "觸發K棒當天量比(當日量/20日均量)",
 }
-SQUEEZE_KDJ_ENTRY_FILTER_LABELS = {None: "無", "above_ma60": "觸發K棒收盤站上60日均線"}
+SQUEEZE_KDJ_ENTRY_FILTER_LABELS = {
+    None: "無", "above_ma60": "觸發K棒收盤站上60日均線",
+    # 以下三個是--squeeze-kdj-filters用的，網格模式不會用到
+    "market_ma60": "大盤(加權指數)收盤在60日均線(季線)之上",
+    "stock_ma120": "個股收盤在自己的120日均線(半年線)之上",
+    "market_ma60_and_stock_ma120": "大盤在季線上 且 個股在半年線上",
+}
 
 # 上一輪真實GitHub Actions執行--squeeze-kdj-capital-constrained(預設設定：
 # max_concurrent_positions=3、固定2口、最長60天、觸發K棒漲幅排名、無濾網、起始資金NT$200k、
@@ -1525,6 +1531,8 @@ SQUEEZE_KDJ_GRID_DIAG_LABELS_ZH = {
     "skipped_single_margin_cap": "單筆保證金上限略過",
     "skipped_total_margin_cap": "總保證金上限略過",
     "skipped_limit_not_filled": "限價1檔沒成交略過",
+    "skipped_filter_market": "濾網細項_大盤不在季線上",
+    "skipped_filter_stock_trend": "濾網細項_個股不在半年線上",
 }
 SQUEEZE_KDJ_GRID_STAT_LABELS_ZH = {
     "trade_count": "交易筆數", "profit_factor": "獲利因子PF", "win_rate": "勝率(%)",
@@ -2146,6 +2154,546 @@ def run_squeeze_kdj_fixed_mode(args, price_data, universe, is_calendar, oos_cale
         f.write(summary_text + "\n")
     print(f"\n已輸出：{summary_path}")
     return results
+
+
+# ============================================================================
+# --squeeze-kdj-filters：事先登錄(pre-registered)的4個進場濾網小測試
+#
+# 背景：使用者實盤測試中的固定設定(SQUEEZE_KDJ_FIXED_SETTING)在2018-01-01起的長回測是賠錢的
+# (PF約0.70，2018、2022兩個空頭年最差)，訊號又很多(每月約17個、一半因為沒名額被略過)，所以想
+# 「挑比較好的訊號」。為了不重蹈1440組網格的過度擬合，這裡只測「事先寫死」的4個變體，挑選規則、
+# 期間切分、通過標準全部在看結果之前就定好(寫在下面常數跟summary.txt最前面)，程式照規則機械式執行：
+#   1. 每個變體在挑選期(2018-01-01~2022-12-31)跟驗證期(2023-01-01~結束)各自獨立、從空帳戶重跑一次
+#      (跟evaluate_combo()同一個慣例：各段只用自己那一段的交易日曆，持倉不跨段延續)；
+#   2. 只看挑選期：挑選期交易筆數>=60的變體裡，挑選期PF最高的勝出(PF同分比挑選期總損益)；
+#   3. 選定之後才看驗證期：驗證期PF>1、驗證期bootstrap正報酬比例>80%、驗證期PF比F0(不加濾網)高，
+#      三個全部成立才算「通過」。
+# ============================================================================
+
+SQUEEZE_KDJ_FILTER_VARIANTS = (
+    # (代號, 英文短名, entry_filter, 白話說明)
+    ("F0", "none", None,
+     "不加濾網(基準)：跟目前實盤用的設定完全一樣"),
+    ("F1", "market", "market_ma60",
+     "大盤濾網：觸發K棒那天(t日)加權指數收盤 > 指數60日均線(季線)才進場；"
+     "t日指數沒開盤(假日不一致)用最後一根<=t的指數K棒；t+1日的指數不影響決定(無lookahead)"),
+    ("F2", "stock_trend", "stock_ma120",
+     "個股趨勢濾網：t日這檔股票收盤 > 自己的120日均線(半年線)才進場；均線暖身期一律擋掉"),
+    ("F3", "both", "market_ma60_and_stock_ma120",
+     "F1且F2：大盤在季線上、個股也在半年線上，兩個都要成立"),
+)
+# 為什麼是這4個(事先說明，不是看結果之後才找理由)：長回測最差的2018、2022都是大盤空頭年，
+# F1直接測「大盤空頭時不做」；F2測「只做長期趨勢還向上的股票的回檔」(抄底訊號常常抄到長期下跌股)；
+# F3是兩者都要。季線(60日)/半年線(120日)是台股最常用的兩條均線，沒有掃描其他天數，避免又變成網格。
+
+SQUEEZE_KDJ_FILTER_TRAIN_START = "2018-01-01"
+SQUEEZE_KDJ_FILTER_TRAIN_END = "2022-12-31"
+SQUEEZE_KDJ_FILTER_TEST_START = "2023-01-01"
+SQUEEZE_KDJ_FILTER_MIN_TRAIN_TRADES = 60
+SQUEEZE_KDJ_FILTER_MAX_POSITIONS = 2              # 使用者實際打算的最多同時持倉數(用來挑選)
+SQUEEZE_KDJ_FILTER_SENSITIVITY_MAX_POSITIONS = 1  # 只當敏感度對照，不用來挑選
+SQUEEZE_KDJ_FILTER_LOTS = 1
+SQUEEZE_KDJ_FILTER_EXECUTION_MODEL = "limit_1tick"
+SQUEEZE_KDJ_FILTER_TOP_N = 3
+SQUEEZE_KDJ_FILTER_LATEST_VALID_START = "2018-06-30"  # --start晚於這天 → 挑選期不完整，測試無效
+SQUEEZE_KDJ_FILTER_MIN_TRAIN_DAYS = 730               # 挑選期日曆跨度 < 2年 → 測試無效
+SQUEEZE_KDJ_FILTER_LOOKBACK_DAYS = 200
+# 往前多抓200個日曆天(約137個交易日)：大盤60日均線、個股120日均線、BB/KC/ATR在回測第一天就已經暖身好，
+# 不會讓F1/F2/F3在2018上半年因為「均線還沒算出來」被機械式擋掉(那會讓挑選期的比較對濾網不公平)。
+SQUEEZE_KDJ_FILTER_INDEX_CANDIDATES = (
+    ("^TWII", "台灣加權指數(^TWII)"),
+    ("0050.TW", "元大台灣50(0050.TW)，加權指數的代理"),
+)
+SQUEEZE_KDJ_FILTER_PERIODS = (("train", "挑選期"), ("test", "驗證期"))
+
+
+def squeeze_kdj_filter_variant_label(vid: str) -> str:
+    for v, name, _, desc in SQUEEZE_KDJ_FILTER_VARIANTS:
+        if v == vid:
+            return f"{v}({name})"
+    raise KeyError(vid)
+
+
+def describe_squeeze_kdj_filter_execution() -> str:
+    s = SQUEEZE_KDJ_FIXED_SETTING
+    return (f"變體B固定ATR(停損{s['atr_stop_mult']:.1f}倍ATR／停利{s['atr_target_mult']:.1f}倍ATR，"
+            f"ATR{s['atr_period']}天)｜最長持有{s['max_hold_days']}天｜同日多檔排名："
+            f"{SQUEEZE_KDJ_RANKING_RULE_LABELS[s['ranking_rule']]}(top_n={SQUEEZE_KDJ_FILTER_TOP_N})"
+            f"｜固定{SQUEEZE_KDJ_FILTER_LOTS}口｜最多同時持有{SQUEEZE_KDJ_FILTER_MAX_POSITIONS}檔"
+            f"(另跑{SQUEEZE_KDJ_FILTER_SENSITIVITY_MAX_POSITIONS}檔當敏感度對照)"
+            f"｜成交模型：{SQUEEZE_KDJ_EXECUTION_MODEL_LABELS[SQUEEZE_KDJ_FILTER_EXECUTION_MODEL]}｜百分比滑價0")
+
+
+def split_squeeze_kdj_filter_periods(master_calendar):
+    """把這次執行的完整交易日曆切成(挑選期, 驗證期)：挑選期 = 2018-01-01~2022-12-31，
+    驗證期 = 2023-01-01之後；兩段都只取master_calendar裡實際有的日子。"""
+    cal = pd.DatetimeIndex(master_calendar)
+    train = cal[(cal >= pd.Timestamp(SQUEEZE_KDJ_FILTER_TRAIN_START)) & (cal <= pd.Timestamp(SQUEEZE_KDJ_FILTER_TRAIN_END))]
+    test = cal[cal >= pd.Timestamp(SQUEEZE_KDJ_FILTER_TEST_START)]
+    return train, test
+
+
+def squeeze_kdj_filter_validity_warnings(run_start, train_calendar, test_calendar) -> list:
+    """回傳「這次測試無效」的警告句子(空list = 期間設定OK)。"""
+    warnings = []
+    if pd.Timestamp(run_start) > pd.Timestamp(SQUEEZE_KDJ_FILTER_LATEST_VALID_START):
+        warnings.append(f"回測起始日{pd.Timestamp(run_start).date()}晚於{SQUEEZE_KDJ_FILTER_LATEST_VALID_START}，"
+                        f"挑選期({SQUEEZE_KDJ_FILTER_TRAIN_START}~{SQUEEZE_KDJ_FILTER_TRAIN_END})不完整")
+    span = (train_calendar[-1] - train_calendar[0]).days if len(train_calendar) >= 2 else 0
+    if span < SQUEEZE_KDJ_FILTER_MIN_TRAIN_DAYS:
+        warnings.append(f"挑選期實際只有{span}個日曆天的資料(需要至少2年)")
+    if len(test_calendar) == 0:
+        warnings.append(f"沒有任何{SQUEEZE_KDJ_FILTER_TEST_START}之後的交易日，驗證期是空的")
+    return warnings
+
+
+def load_squeeze_kdj_market_index(run_start: str, end: str, price_data: dict, refresh: bool = False) -> dict:
+    """
+    大盤濾網(F1/F3)用的指數收盤價。依序嘗試：^TWII(加權指數) → 0050.TW → price_data裡的2330收盤價。
+    從run_start往前多抓SQUEEZE_KDJ_FILTER_LOOKBACK_DAYS個日曆天，讓60日均線在第一天就算得出來；
+    end跟股價資料一樣是exclusive。某個代號下載失敗/沒資料/涵蓋期間不夠(第一根K棒晚於run_start
+    超過10天、或最後一根早於end超過15天)就換下一個。
+    回傳 {"series": pd.Series, "symbol", "label", "is_twii": bool, "attempts": [說明...], "warning": str或None}。
+    """
+    lookback_start = (pd.Timestamp(run_start) - pd.Timedelta(days=SQUEEZE_KDJ_FILTER_LOOKBACK_DAYS)).date().isoformat()
+    need_first = pd.Timestamp(run_start) + pd.Timedelta(days=10)
+    need_last = pd.Timestamp(end) - pd.Timedelta(days=15)
+    attempts = []
+    for symbol, label in SQUEEZE_KDJ_FILTER_INDEX_CANDIDATES:
+        try:
+            s = load_index_series(symbol, lookback_start, end, refresh=refresh)
+        except Exception as e:  # 保險：load_index_series本身已經吞掉下載例外
+            attempts.append(f"{symbol}：下載發生例外({e})")
+            continue
+        s = pd.Series(s, dtype=float).dropna() if s is not None else pd.Series(dtype=float)
+        if s.empty:
+            attempts.append(f"{symbol}：沒有抓到任何資料")
+            continue
+        if s.index[0] > need_first or s.index[-1] < need_last:
+            attempts.append(f"{symbol}：資料涵蓋{s.index[0].date()}~{s.index[-1].date()}，不夠涵蓋回測期間")
+            continue
+        attempts.append(f"{symbol}：成功({len(s)}根K棒，{s.index[0].date()}~{s.index[-1].date()})")
+        warning = None if symbol == "^TWII" else (
+            f"⚠️ 大盤濾網用的不是加權指數^TWII，而是{label}——0050跟加權指數走勢非常接近，但不是同一個東西，"
+            "季線上/下的判斷在接近均線的日子可能不一樣。")
+        return {"series": s, "symbol": symbol, "label": label, "is_twii": symbol == "^TWII",
+                "attempts": attempts, "warning": warning}
+
+    df = price_data.get("2330")
+    s = df["Close"].astype(float).dropna() if df is not None else pd.Series(dtype=float)
+    if s.empty:
+        raise RuntimeError("大盤濾網需要的指數資料(^TWII/0050.TW/2330)全部抓不到，無法執行--squeeze-kdj-filters")
+    attempts.append(f"2330(台積電)：改用股價資料裡的收盤價({len(s)}根K棒)")
+    return {"series": s, "symbol": "2330", "label": "台積電(2330)收盤價，加權指數的粗略代理", "is_twii": False,
+            "attempts": attempts,
+            "warning": "⚠️⚠️ 大盤濾網用的是台積電(2330)自己的收盤價當大盤代理(^TWII跟0050.TW都抓不到)——台積電佔加權指數"
+                       "權重很大但不等於大盤，F1/F3的「大盤在季線上」其實是「台積電在季線上」，結果要打折看。"}
+
+
+def _squeeze_kdj_filter_period_stats(trades: list, starting_capital: float, calendar, diag: dict) -> dict:
+    stats = summarize_mr(trades, starting_capital)
+    wins = [t["pnl_ntd"] for t in trades if t["pnl_ntd"] > 0]
+    losses = [t["pnl_ntd"] for t in trades if t["pnl_ntd"] < 0]
+    cal = pd.DatetimeIndex(calendar)
+    months = ((cal[-1] - cal[0]).days + 1) / 30.4375 if len(cal) else 0.0
+    return {
+        "stats": stats,
+        "avg_win_ntd": float(np.mean(wins)) if wins else 0.0,
+        "avg_loss_ntd": float(np.mean(losses)) if losses else 0.0,
+        "bootstrap": _squeeze_kdj_fixed_bootstrap(trades),
+        "months": months,
+        "trades_per_month": len(trades) / months if months > 0 else 0.0,
+        "candidates_per_month": diag["candidates_total"] / months if months > 0 else 0.0,
+        "calendar_start": cal[0] if len(cal) else None,
+        "calendar_end": cal[-1] if len(cal) else None,
+        "trading_days": len(cal),
+        "trades": trades, "diagnostics": diag,
+    }
+
+
+def run_squeeze_kdj_filter_backtests(price_data: dict, universe: dict, starting_capital: float,
+                                      master_calendar, market_series: pd.Series,
+                                      max_positions_list=(SQUEEZE_KDJ_FILTER_MAX_POSITIONS,
+                                                          SQUEEZE_KDJ_FILTER_SENSITIVITY_MAX_POSITIONS)) -> dict:
+    """
+    --squeeze-kdj-filters的計算核心(不寫檔，方便測試)。對每個最多持倉數 x 4個變體 x 2個期間，
+    各自在該期間的交易日曆上獨立跑一次資金受限回測(從空帳戶開始)。
+    BB/KC/KDJ狀態機與回測查表陣列只算一次、全部共用(期間切分只影響逐日迴圈走哪些日子)。
+    回傳 {max_pos: {variant_id: {"train": {...}, "test": {...}}}}，每段的dict見_squeeze_kdj_filter_period_stats()。
+    """
+    s = SQUEEZE_KDJ_FIXED_SETTING
+    train_cal, test_cal = split_squeeze_kdj_filter_periods(master_calendar)
+    calendars = {"train": train_cal, "test": test_cal}
+    features_by_code = precompute_squeeze_kdj_features_by_code(price_data, universe)
+    precomputed = precompute_squeeze_kdj_backtest_arrays(price_data, features_by_code, atr_period=s["atr_period"])
+    out = {}
+    for max_pos in max_positions_list:
+        out[max_pos] = {}
+        for vid, _, entry_filter, _ in SQUEEZE_KDJ_FILTER_VARIANTS:
+            out[max_pos][vid] = {}
+            for period, _ in SQUEEZE_KDJ_FILTER_PERIODS:
+                cal = calendars[period]
+                trades, diag = run_squeeze_kdj_capital_constrained_backtest(
+                    price_data=price_data, universe=universe, master_calendar=cal,
+                    starting_capital=starting_capital, variant=s["variant"], lots=SQUEEZE_KDJ_FILTER_LOTS,
+                    top_n=SQUEEZE_KDJ_FILTER_TOP_N, max_concurrent_positions=max_pos,
+                    atr_stop_mult=s["atr_stop_mult"], atr_target_mult=s["atr_target_mult"],
+                    atr_period=s["atr_period"], max_hold_days=s["max_hold_days"],
+                    ranking_rule=s["ranking_rule"], entry_filter=entry_filter,
+                    features_by_code=features_by_code, precomputed=precomputed, return_diagnostics=True,
+                    execution_model=SQUEEZE_KDJ_FILTER_EXECUTION_MODEL, market_series=market_series,
+                )
+                out[max_pos][vid][period] = _squeeze_kdj_filter_period_stats(trades, starting_capital, cal, diag)
+    return out
+
+
+def select_squeeze_kdj_filter_variant(train_stats_by_variant: dict,
+                                      min_trades: int = SQUEEZE_KDJ_FILTER_MIN_TRAIN_TRADES):
+    """
+    事先登錄的挑選規則，輸入「只有挑選期」的summarize_mr()統計({變體代號: stats})——函式根本拿不到
+    驗證期的數字，結構上保證不會偷看。挑選期交易筆數>=min_trades的變體裡，挑選期PF最高者勝出；
+    PF同分比挑選期總損益；兩者都同分時取SQUEEZE_KDJ_FILTER_VARIANTS裡排前面的(F0優先，保守)。
+    回傳 (勝出代號或None, 白話說明)。
+    """
+    order = [v[0] for v in SQUEEZE_KDJ_FILTER_VARIANTS]
+    eligible = [vid for vid in order if vid in train_stats_by_variant
+                and train_stats_by_variant[vid]["trade_count"] >= min_trades]
+    if not eligible:
+        return None, f"沒有任何變體在挑選期有>={min_trades}筆交易，依事先登錄的規則無法挑選"
+    best = eligible[0]
+    for vid in eligible[1:]:
+        a, b = train_stats_by_variant[vid], train_stats_by_variant[best]
+        if (a["profit_factor"], a["total_pnl_ntd"]) > (b["profit_factor"], b["total_pnl_ntd"]):
+            best = vid
+    excluded = [vid for vid in order if vid in train_stats_by_variant and vid not in eligible]
+    reason = (f"符合資格(挑選期>={min_trades}筆)的變體：{'、'.join(eligible)}"
+              + (f"；筆數不足被排除：{'、'.join(excluded)}" if excluded else "")
+              + f"；其中挑選期PF最高的是{best}"
+              f"(PF={_fmt_pf(train_stats_by_variant[best]['profit_factor'])})")
+    return best, reason
+
+
+def squeeze_kdj_filter_verdict(selected, test_by_variant: dict) -> dict:
+    """
+    事先登錄的通過標準(只對選出的那一個變體判定)：驗證期PF>1、驗證期bootstrap正報酬比例>80%、
+    驗證期PF比F0高，三個都成立才「通過」。test_by_variant：{代號: _squeeze_kdj_filter_period_stats()}。
+    回傳 {"passed": bool, "checks": [(說明, 是否成立)], "text": 白話結論}。
+    """
+    if selected is None:
+        return {"passed": False, "checks": [],
+                "text": "❌ 不通過：挑選期沒有任何變體符合資格，沒有東西可以驗證"}
+    seg = test_by_variant[selected]
+    f0 = test_by_variant["F0"]
+    pf = seg["stats"]["profit_factor"]
+    pct = seg["bootstrap"]["pct_positive"]
+    f0_pf = f0["stats"]["profit_factor"]
+    checks = [
+        (f"驗證期PF>1(實際PF={_fmt_pf(pf)}，{seg['stats']['trade_count']}筆)",
+         seg["stats"]["trade_count"] > 0 and pf > 1.0),
+        (f"驗證期bootstrap正報酬比例>{SQUEEZE_KDJ_BOOTSTRAP_PASS_PCT_POSITIVE:.0f}%(實際{pct:.1f}%，"
+         f"p={seg['bootstrap']['p_value']:.3f})",
+         pct > SQUEEZE_KDJ_BOOTSTRAP_PASS_PCT_POSITIVE),
+        (f"驗證期PF勝過F0不加濾網(選出的{_fmt_pf(pf)} vs F0的{_fmt_pf(f0_pf)})"
+         + ("——選出的就是F0本身，這條不可能成立" if selected == "F0" else ""),
+         selected != "F0" and pf > f0_pf),
+    ]
+    passed = all(ok for _, ok in checks)
+    failed = [txt for txt, ok in checks if not ok]
+    if passed:
+        text = f"✅ 通過：{squeeze_kdj_filter_variant_label(selected)}三個條件全部成立"
+    elif selected == "F0":
+        text = ("❌ 不通過：挑選期PF最高的是F0(不加濾網)——3個濾網在挑選期都沒有勝過不過濾，"
+                "依事先登錄的規則，這次的結論是「不採用任何濾網」。"
+                + ("另外F0本身在驗證期也沒過：" + "；".join(t for t in failed[:-1]) if failed[:-1] else ""))
+    else:
+        text = (f"❌ 不通過：{squeeze_kdj_filter_variant_label(selected)}沒有成立的條件：" + "；".join(failed))
+    return {"passed": passed, "checks": checks, "text": text}
+
+
+def squeeze_kdj_filter_improvement_table(by_variant: dict) -> list:
+    """「兩段都變好」檢查：每個濾網(F1~F3)跟F0比，勝率跟PF在挑選期、驗證期是不是都比較好。"""
+    rows = []
+    for vid, _, _, _ in SQUEEZE_KDJ_FILTER_VARIANTS[1:]:
+        row = {"variant": vid}
+        for period, _ in SQUEEZE_KDJ_FILTER_PERIODS:
+            s, b = by_variant[vid][period]["stats"], by_variant["F0"][period]["stats"]
+            row[f"{period}_win_rate_better"] = s["trade_count"] > 0 and s["win_rate"] > b["win_rate"]
+            row[f"{period}_pf_better"] = s["trade_count"] > 0 and s["profit_factor"] > b["profit_factor"]
+        row["both_periods_better"] = all(row[f"{p}_{m}_better"] for p, _ in SQUEEZE_KDJ_FILTER_PERIODS
+                                         for m in ("win_rate", "pf"))
+        rows.append(row)
+    return rows
+
+
+SQUEEZE_KDJ_FILTER_PERIOD_LABELS = dict(SQUEEZE_KDJ_FILTER_PERIODS)
+
+
+def _filter_variant_desc(vid: str) -> str:
+    return next(desc for v, _, _, desc in SQUEEZE_KDJ_FILTER_VARIANTS if v == vid)
+
+
+def _filter_variant_entry_filter(vid: str):
+    return next(f for v, _, f, _ in SQUEEZE_KDJ_FILTER_VARIANTS if v == vid)
+
+
+def squeeze_kdj_filters_summary_frame(results: dict, selected, index_info: dict) -> pd.DataFrame:
+    """squeeze_kdj_filters_summary.csv：變體 x 期間 x 最多持倉數，每列一組回測。"""
+    rows = []
+    for max_pos, by_variant in results.items():
+        purpose = "主要(用來挑選)" if max_pos == SQUEEZE_KDJ_FILTER_MAX_POSITIONS else "敏感度對照(不用來挑選)"
+        for vid, name, entry_filter, _ in SQUEEZE_KDJ_FILTER_VARIANTS:
+            for period, period_label in SQUEEZE_KDJ_FILTER_PERIODS:
+                seg = by_variant[vid][period]
+                st, b = seg["stats"], seg["bootstrap"]
+                row = {
+                    "最多同時持倉數": max_pos, "用途": purpose, "變體代號": vid, "變體名稱": name,
+                    "進場濾網": SQUEEZE_KDJ_ENTRY_FILTER_LABELS[entry_filter], "期間": period_label,
+                    "期間起": seg["calendar_start"].date().isoformat() if seg["calendar_start"] is not None else "",
+                    "期間迄": seg["calendar_end"].date().isoformat() if seg["calendar_end"] is not None else "",
+                    "交易日數": seg["trading_days"],
+                    "交易筆數": st["trade_count"], "每月交易筆數": seg["trades_per_month"],
+                    "每月候選訊號數": seg["candidates_per_month"],
+                    "勝率(%)": st["win_rate"], "獲利因子PF": st["profit_factor"], "總損益(NT$)": st["total_pnl_ntd"],
+                    "平均獲利(NT$/筆)": seg["avg_win_ntd"], "平均虧損(NT$/筆)": seg["avg_loss_ntd"],
+                    "最大回撤(NT$)": st["max_drawdown_ntd"], "拿掉最大3筆後損益(NT$)": b["pnl_excluding_top3_ntd"],
+                    "平均持有天數": st["avg_hold_days"], "最大連續虧損筆數": st["max_consecutive_losses"],
+                }
+                for k, v in SQUEEZE_KDJ_FIXED_BOOTSTRAP_LABELS_ZH.items():
+                    row[v] = b[k]
+                for k in CAPITAL_CONSTRAINED_DIAGNOSTIC_KEYS:
+                    row[f"診斷_{SQUEEZE_KDJ_GRID_DIAG_LABELS_ZH[k]}"] = seg["diagnostics"][k]
+                row["被挑選規則選中"] = bool(max_pos == SQUEEZE_KDJ_FILTER_MAX_POSITIONS and vid == selected)
+                row["大盤指數來源"] = index_info["label"]
+                rows.append(row)
+    return pd.DataFrame(rows)
+
+
+SQUEEZE_KDJ_FILTER_YEARLY_COLUMNS = ["最多同時持倉數", "變體代號", "變體名稱", "期間", "年度(依出場日)", "交易筆數",
+                                     "獲利因子PF", "勝率(%)", "總損益(NT$)", "年內最大回撤(NT$)", "拿掉最大3筆後損益(NT$)"]
+
+
+def _squeeze_kdj_filter_yearly(by_variant_vid: dict, starting_capital: float) -> list:
+    """一個變體(某最多持倉數)的逐年表：挑選期、驗證期兩段的交易各自依出場年分組(兩段各自獨立回測，
+    挑選期的交易出場日一定 <= 2022-12-31，不會跟驗證期同一年混在一起)。"""
+    rows = []
+    for period, period_label in SQUEEZE_KDJ_FILTER_PERIODS:
+        for y in squeeze_kdj_yearly_table(by_variant_vid[period]["trades"], starting_capital):
+            rows.append({**y, "period": period_label})
+    return rows
+
+
+def squeeze_kdj_filters_yearly_frame(results: dict, starting_capital: float) -> pd.DataFrame:
+    rows = []
+    for max_pos, by_variant in results.items():
+        for vid, name, _, _ in SQUEEZE_KDJ_FILTER_VARIANTS:
+            for y in _squeeze_kdj_filter_yearly(by_variant[vid], starting_capital):
+                rows.append({
+                    "最多同時持倉數": max_pos, "變體代號": vid, "變體名稱": name, "期間": y["period"],
+                    "年度(依出場日)": y["year"], "交易筆數": y["trade_count"], "獲利因子PF": y["profit_factor"],
+                    "勝率(%)": y["win_rate"], "總損益(NT$)": y["total_pnl_ntd"],
+                    "年內最大回撤(NT$)": y["max_drawdown_ntd"], "拿掉最大3筆後損益(NT$)": y["pnl_excluding_top3_ntd"],
+                })
+    return pd.DataFrame(rows, columns=SQUEEZE_KDJ_FILTER_YEARLY_COLUMNS)
+
+
+def squeeze_kdj_filters_trades_frame(results: dict) -> pd.DataFrame:
+    rows = []
+    for max_pos, by_variant in results.items():
+        for vid, name, _, _ in SQUEEZE_KDJ_FILTER_VARIANTS:
+            for period, period_label in SQUEEZE_KDJ_FILTER_PERIODS:
+                for t in by_variant[vid][period]["trades"]:
+                    row = {"最多同時持倉數": max_pos, "變體代號": vid, "變體名稱": name, "期間": period_label}
+                    for k, v in SQUEEZE_KDJ_FIXED_TRADE_COLUMNS_ZH.items():
+                        row[v] = t[k]
+                    row["出場原因"] = SQUEEZE_KDJ_EXIT_REASON_LABELS_ZH.get(t["exit_reason"], t["exit_reason"])
+                    row["方向"] = "多" if t["side"] == "long" else "空"
+                    row["進場成交價"] = round(float(t["e_price"]), 4)
+                    row["出場成交價"] = round(float(t["exit_price"]), 4)
+                    row["損益(NT$，已扣手續費)"] = round(float(t["pnl_ntd"]), 2)
+                    rows.append(row)
+    return pd.DataFrame(rows, columns=["最多同時持倉數", "變體代號", "變體名稱", "期間",
+                                       *SQUEEZE_KDJ_FIXED_TRADE_COLUMNS_ZH.values()])
+
+
+def _fmt_filter_seg_line(seg: dict) -> str:
+    st, b = seg["stats"], seg["bootstrap"]
+    return (f"{st['trade_count']}筆(每月{seg['trades_per_month']:.1f}筆), 勝率={st['win_rate']:.1f}%, "
+            f"PF={_fmt_pf(st['profit_factor'])}, 總損益NT${st['total_pnl_ntd']:,.0f}, "
+            f"平均獲利NT${seg['avg_win_ntd']:,.0f}/平均虧損NT${seg['avg_loss_ntd']:,.0f}, "
+            f"最大回撤NT${st['max_drawdown_ntd']:,.0f}, 拿掉最大3筆後NT${b['pnl_excluding_top3_ntd']:,.0f}, "
+            f"bootstrap正報酬{b['pct_positive']:.1f}%(p={b['p_value']:.3f})")
+
+
+def _fmt_filter_diag_line(diag: dict) -> str:
+    return (f"候選{diag['candidates_total']}個：濾網擋掉{diag['skipped_entry_filter']}"
+            f"(細項：大盤不在季線上{diag['skipped_filter_market']}、個股不在半年線上{diag['skipped_filter_stock_trend']})，"
+            f"名額已滿沒輪到{diag['skipped_no_slot']}，限價1檔沒成交{diag['skipped_limit_not_filled']}，"
+            f"停損無效{diag['skipped_invalid_stop']}，單筆保證金上限{diag['skipped_single_margin_cap']}，"
+            f"總保證金上限{diag['skipped_total_margin_cap']}")
+
+
+def _fmt_table_row(vid, seg_train, seg_test) -> str:
+    def cell(seg):
+        st = seg["stats"]
+        return (f"{st['trade_count']:>5}筆 勝率{st['win_rate']:>5.1f}% PF{_fmt_pf(st['profit_factor']):>6} "
+                f"損益{st['total_pnl_ntd']:>12,.0f} boot正{seg['bootstrap']['pct_positive']:>5.1f}%")
+    return f"  {squeeze_kdj_filter_variant_label(vid):<16}｜挑選期 {cell(seg_train)}｜驗證期 {cell(seg_test)}"
+
+
+SQUEEZE_KDJ_FILTER_CAVEATS_TEXT = (
+    "【誠實caveat】\n"
+    "  - 驗證期(2023-01-01之後)跟「挑基本設定」用過的資料重疊：B停損1.0/停利3.0倍ATR、最多3檔、最長20天這組"
+    "基本設定，是看過2023-10-06之後的1440組網格結果才選的，所以驗證期對「全部4個變體」都偏樂觀——"
+    "這份報告裡「濾網之間的比較」(大家都同樣偏樂觀)比「驗證期PF的絕對水準」可信。\n"
+    "  - 4個變體仍然是多重比較：就算濾網完全沒用，4個裡面挑挑選期最好的那個，驗證期也有一定機率剛好"
+    "比F0好。4個比1440個好很多，但不是0。\n"
+    "  - 倖存者偏差：標的清單是「今天」的股票期貨清單，這些年下市/被剔除的不在裡面，"
+    "很多股票2018年還沒有股票期貨。\n"
+    "  - 價格是標的「股票」的yfinance日K(未還原權值)，拿來代理股票期貨：基差、期貨本身的流動性/買賣價差都沒有模擬。\n"
+    "  - 大盤濾網用的指數來源見上方(^TWII以外的都是代理，判斷會有誤差)。\n"
+    "  - 各段是獨立重跑(從空帳戶開始)：段尾還沒出場的部位不計入，段首不會有前一段遺留的持倉。\n"
+    "  - bootstrap假設每筆交易獨立，空頭年連續虧損成串出現的風險會被低估；80%是寬鬆門檻。"
+)
+
+
+def run_squeeze_kdj_filters_mode(args, price_data, universe, master_calendar):
+    """
+    --squeeze-kdj-filters模式：事先登錄的4個進場濾網(F0不過濾/F1大盤季線/F2個股半年線/F3兩者)小測試，
+    見SQUEEZE_KDJ_FILTER_VARIANTS上方說明。執行設定固定成使用者實盤打算的：1口、最多2檔、限價1檔、
+    top_n=3、SQUEEZE_KDJ_FIXED_SETTING的出場；另外最多1檔當敏感度對照(不參與挑選)。
+    master_calendar：這次執行的交易日曆(main()已經切掉往前多抓的暖身資料，從--start開始)。
+    輸出squeeze_kdj_filters_summary.csv/squeeze_kdj_filters_yearly.csv/squeeze_kdj_filters_trades.csv
+    +summary.txt(同時印在畫面上)。跟其他squeeze模式一樣跳過完整6階段流程。
+    """
+    print("=" * 100)
+    print("--squeeze-kdj-filters模式：squeeze+KDJ事先登錄的4個進場濾網測試(F0~F3)")
+    print("=" * 100, flush=True)
+    starting_capital = args.starting_capital
+
+    index_info = load_squeeze_kdj_market_index(args.start, args.end, price_data, refresh=getattr(args, "refresh", False))
+    print(f"大盤濾網指數來源：{index_info['label']}")
+    if index_info["warning"]:
+        print(index_info["warning"])
+
+    train_cal, test_cal = split_squeeze_kdj_filter_periods(master_calendar)
+    validity = squeeze_kdj_filter_validity_warnings(args.start, train_cal, test_cal)
+
+    results = run_squeeze_kdj_filter_backtests(price_data, universe, starting_capital, master_calendar,
+                                               index_info["series"])
+    main_res = results[SQUEEZE_KDJ_FILTER_MAX_POSITIONS]
+    selected, selection_reason = select_squeeze_kdj_filter_variant(
+        {vid: main_res[vid]["train"]["stats"] for vid in main_res})
+    verdict = squeeze_kdj_filter_verdict(selected, {vid: main_res[vid]["test"] for vid in main_res})
+    improvements = squeeze_kdj_filter_improvement_table(main_res)
+
+    squeeze_kdj_filters_summary_frame(results, selected, index_info).to_csv(
+        os.path.join(RESULTS_DIR, "squeeze_kdj_filters_summary.csv"), index=False, encoding="utf-8-sig")
+    squeeze_kdj_filters_yearly_frame(results, starting_capital).to_csv(
+        os.path.join(RESULTS_DIR, "squeeze_kdj_filters_yearly.csv"), index=False, encoding="utf-8-sig")
+    squeeze_kdj_filters_trades_frame(results).to_csv(
+        os.path.join(RESULTS_DIR, "squeeze_kdj_filters_trades.csv"), index=False, encoding="utf-8-sig")
+
+    cal = pd.DatetimeIndex(master_calendar)
+    lines = [
+        "=" * 100,
+        "布林+Keltner擠壓+KDJ訊號 --squeeze-kdj-filters模式(事先登錄的4個進場濾網小測試)",
+        f"回測期間：{args.start} ~ {args.end}(實際交易日曆：{cal[0].date() if len(cal) else '無'} ~ "
+        f"{cal[-1].date() if len(cal) else '無'}，{len(cal)}個交易日)　起始資金：NT${starting_capital:,.0f}"
+        f"　標的數：{len(universe)}",
+        f"固定執行設定(4個變體完全相同)：{describe_squeeze_kdj_filter_execution()}",
+        f"大盤濾網指數來源：{index_info['label']}(嘗試順序：{'；'.join(index_info['attempts'])})",
+        "=" * 100,
+    ]
+    if validity:
+        lines += [
+            "",
+            "!" * 100,
+            "⚠️⚠️⚠️ 這次測試無效 ⚠️⚠️⚠️：" + "；".join(validity) + "。",
+            "請把GitHub Actions的「回測起始日期」(start_date)設成2018-01-01、掃描股票數量(max_stocks)設成0重跑。"
+            "下面的數字只能看看，不能拿來決定要不要加濾網。",
+            "!" * 100,
+        ]
+    if index_info["warning"]:
+        lines += ["", index_info["warning"]]
+
+    lines += [
+        "",
+        "【事先登錄的規則(在看任何結果之前就定好，程式機械式執行，不會因為結果改規則)】",
+        "  4個變體(只有這4個，沒有其他參數)：",
+        *[f"    {vid}({name})：{desc}" for vid, name, _, desc in SQUEEZE_KDJ_FILTER_VARIANTS],
+        f"  期間：挑選期 {SQUEEZE_KDJ_FILTER_TRAIN_START}~{SQUEEZE_KDJ_FILTER_TRAIN_END}"
+        f"(實際{len(train_cal)}個交易日)；驗證期 {SQUEEZE_KDJ_FILTER_TEST_START}~結束(實際{len(test_cal)}個交易日)。"
+        "兩段各自從空帳戶獨立重跑一次。",
+        f"  挑選規則：只看挑選期、最多同時持有{SQUEEZE_KDJ_FILTER_MAX_POSITIONS}檔的結果。挑選期交易筆數"
+        f">={SQUEEZE_KDJ_FILTER_MIN_TRAIN_TRADES}的變體裡，挑選期PF最高者勝出(同分比挑選期總損益)。"
+        "選定之後才看驗證期。",
+        f"  通過標準(只判定選出的那一個)：驗證期PF>1 且 驗證期bootstrap(1000次、seed=42)正報酬比例>"
+        f"{SQUEEZE_KDJ_BOOTSTRAP_PASS_PCT_POSITIVE:.0f}% 且 驗證期PF比F0高。三個都成立才算「通過」。",
+        f"  最多同時持有{SQUEEZE_KDJ_FILTER_SENSITIVITY_MAX_POSITIONS}檔的結果只當敏感度對照，不參與挑選。",
+        "",
+        "#" * 100,
+        "【挑選結果與判定】",
+        "#" * 100,
+        f"  挑選(只看挑選期)：{selection_reason}",
+        f"  → 選出：{squeeze_kdj_filter_variant_label(selected) if selected else '無'}",
+    ]
+    if selected:
+        lines.append(f"    挑選期：{_fmt_filter_seg_line(main_res[selected]['train'])}")
+        lines.append(f"    驗證期：{_fmt_filter_seg_line(main_res[selected]['test'])}")
+        lines.append(f"    F0驗證期(對照)：{_fmt_filter_seg_line(main_res['F0']['test'])}")
+    lines.append("  判定條件：")
+    for txt, ok in verdict["checks"]:
+        lines.append(f"    {'✅' if ok else '❌'} {txt}")
+    lines.append(f"  ★ 結論：{verdict['text']}")
+    lines.append("")
+    lines.append("【兩段都變好？每個濾網跟F0比(勝率、PF；挑選期、驗證期)】")
+    for r in improvements:
+        def mark(b):
+            return "✅" if b else "❌"
+        lines.append(
+            f"  {squeeze_kdj_filter_variant_label(r['variant']):<16}：挑選期 勝率{mark(r['train_win_rate_better'])} "
+            f"PF{mark(r['train_pf_better'])}｜驗證期 勝率{mark(r['test_win_rate_better'])} PF{mark(r['test_pf_better'])}"
+            f"｜{'兩段都變好' if r['both_periods_better'] else '沒有兩段都變好'}")
+    lines.append("  (「兩段都變好」只是一致性檢查，不取代上面的事先登錄挑選規則。)")
+
+    for max_pos, title in ((SQUEEZE_KDJ_FILTER_MAX_POSITIONS, "主要：最多同時持有2檔(用來挑選)"),
+                           (SQUEEZE_KDJ_FILTER_SENSITIVITY_MAX_POSITIONS, "敏感度對照：最多同時持有1檔(不用來挑選)")):
+        lines += ["", f"【並排總表｜{title}】"]
+        for vid, _, _, _ in SQUEEZE_KDJ_FILTER_VARIANTS:
+            lines.append(_fmt_table_row(vid, results[max_pos][vid]["train"], results[max_pos][vid]["test"]))
+
+    lines += ["", "【各變體明細｜最多同時持有2檔】"]
+    for vid, name, entry_filter, desc in SQUEEZE_KDJ_FILTER_VARIANTS:
+        r = main_res[vid]
+        lines.append("-" * 100)
+        lines.append(f"### {vid}({name})：{desc}{'  ← 挑選規則選中' if vid == selected else ''}")
+        for period, period_label in SQUEEZE_KDJ_FILTER_PERIODS:
+            seg = r[period]
+            lines.append(f"  {period_label}：{_fmt_filter_seg_line(seg)}")
+            lines.append(f"    bootstrap 5%~95%區間=[NT${seg['bootstrap']['p5']:,.0f}, NT${seg['bootstrap']['p95']:,.0f}]"
+                         f"，每月候選訊號{seg['candidates_per_month']:.1f}個")
+            lines.append(f"    [診斷] {_fmt_filter_diag_line(seg['diagnostics'])}")
+        lines.append("  逐年(依出場日)：")
+        yearly = _squeeze_kdj_filter_yearly(r, starting_capital)
+        if not yearly:
+            lines.append("    (沒有任何交易)")
+        for y in yearly:
+            lines.append(f"    {y['year']}年[{y['period']}]：{y['trade_count']}筆, PF={_fmt_pf(y['profit_factor'])}, "
+                         f"勝率={y['win_rate']:.1f}%, 總損益NT${y['total_pnl_ntd']:,.0f}, "
+                         f"年內最大回撤NT${y['max_drawdown_ntd']:,.0f}, 拿掉最大3筆後NT${y['pnl_excluding_top3_ntd']:,.0f}")
+
+    lines += ["", SQUEEZE_KDJ_FILTER_CAVEATS_TEXT, "",
+              "輸出：squeeze_kdj_filters_summary.csv(變體x期間x最多持倉數)、squeeze_kdj_filters_yearly.csv(逐年)、"
+              "squeeze_kdj_filters_trades.csv(全部交易)。"]
+
+    summary_text = "\n".join(lines)
+    print(summary_text)
+    summary_path = os.path.join(RESULTS_DIR, "summary.txt")
+    with open(summary_path, "w", encoding="utf-8") as f:
+        f.write(summary_text + "\n")
+    print(f"\n已輸出：{summary_path}")
+    return {"results": results, "selected": selected, "verdict": verdict, "improvements": improvements,
+            "index_info": index_info, "validity_warnings": validity}
 
 
 def evaluate_combo(label, price_data, indicators_by_code, regime_series, is_calendar, oos_calendar,
@@ -2930,6 +3478,16 @@ def main():
                               "squeeze_kdj_fixed_trades.csv+summary.txt。跟其他squeeze模式一樣跳過完整6階段流程；"
                               "跟--squeeze-kdj-only/--squeeze-kdj-capital-constrained/--squeeze-kdj-grid互斥"
                               "(main()依序檢查，那幾個若同時開啟會先執行並直接return)")
+    parser.add_argument("--squeeze-kdj-filters", action="store_true",
+                         help="squeeze+KDJ事先登錄的4個進場濾網小測試(--squeeze-kdj-filters)：F0不加濾網/"
+                              "F1大盤(加權指數^TWII)收盤在60日均線上/F2個股收盤在120日均線上/F3兩者皆是，"
+                              "執行設定固定為1口、最多同時持有2檔(另跑1檔當敏感度對照)、限價1檔、top_n=3、"
+                              "固定設定的出場。挑選期2018-01-01~2022-12-31、驗證期2023-01-01之後各自獨立重跑；"
+                              "只用挑選期PF(筆數>=60)挑一個，再看驗證期PF>1、bootstrap正報酬>80%、PF勝過F0。"
+                              "必須--start 2018-01-01(晚於2018-06會警告測試無效)，建議--max-stocks 0。"
+                              "股價跟指數都會往前多抓200個日曆天當均線暖身。輸出squeeze_kdj_filters_summary.csv/"
+                              "squeeze_kdj_filters_yearly.csv/squeeze_kdj_filters_trades.csv+summary.txt。"
+                              "跟其他squeeze模式互斥(main()依序檢查，前面的若同時開啟會先執行並直接return)")
     parser.add_argument("--fixed-combo-walkforward-folds", type=int, default=0,
                          help="測試幾組「固定死不重新挑選」的候選規則(FIXED_WALKFORWARD_COMBO_VARIANTS，"
                               "基準+只改一個維度的變體)跨N個獨立、不重疊歷史區塊的表現，0代表不啟用(預設)。"
@@ -2949,8 +3507,15 @@ def main():
         if INDEX_PROXY_CODE not in universe:
             universe[INDEX_PROXY_CODE] = STOCK_FUTURES_UNIVERSE[INDEX_PROXY_CODE]
 
-    print(f"下載/讀取歷史資料 ({args.start} ~ {args.end})，共 {len(universe)} 檔標的 ...")
-    price_data = load_price_data(universe, args.start, args.end, refresh=args.refresh)
+    # --squeeze-kdj-filters：股價往前多抓SQUEEZE_KDJ_FILTER_LOOKBACK_DAYS個日曆天當均線/BB/KC/ATR暖身
+    # (個股120日均線在回測第一天就算得出來)，交易日曆之後再切回從--start開始。其他模式完全不變。
+    load_start = args.start
+    if args.squeeze_kdj_filters:
+        load_start = (pd.Timestamp(args.start) - pd.Timedelta(days=SQUEEZE_KDJ_FILTER_LOOKBACK_DAYS)).date().isoformat()
+        print(f"--squeeze-kdj-filters：股價從{load_start}開始下載(比--start多{SQUEEZE_KDJ_FILTER_LOOKBACK_DAYS}"
+              f"個日曆天，當均線暖身用，不會被拿來交易)")
+    print(f"下載/讀取歷史資料 ({load_start} ~ {args.end})，共 {len(universe)} 檔標的 ...")
+    price_data = load_price_data(universe, load_start, args.end, refresh=args.refresh)
     print(f"成功取得 {len(price_data)} / {len(universe)} 檔股票的資料")
 
     if INDEX_PROXY_CODE not in price_data:
@@ -3024,6 +3589,11 @@ def main():
 
     if args.squeeze_kdj_fixed:
         run_squeeze_kdj_fixed_mode(args, price_data, universe, is_calendar, oos_calendar, master_calendar)
+        return
+
+    if args.squeeze_kdj_filters:
+        run_squeeze_kdj_filters_mode(args, price_data, universe,
+                                     master_calendar[master_calendar >= pd.Timestamp(args.start)])
         return
 
     if args.use_trailing_stop:

@@ -137,6 +137,56 @@ def load_price_data(whitelist: dict, start: str, end: str, refresh: bool = False
     return price_data
 
 
+def load_index_series(symbol: str, start: str, end: str, refresh: bool = False,
+                      cache_dir: str = None) -> pd.Series:
+    """
+    下載單一yfinance代號(例如加權指數"^TWII"、元大台灣50"0050.TW")的日收盤價，回傳
+    pd.Series(Close，日期索引，已丟掉收盤價NaN的列、已排序)。跟load_price_data()不同：
+    代號原封不動傳給yfinance(不套.TW/.TWO後綴邏輯)；同樣用start/end當快取key、end不含當天
+    (yfinance的end本來就是exclusive)。抓不到資料或整個失敗時回傳空的Series(不丟例外)，
+    讓呼叫端決定要不要換備援代理。
+    """
+    cache_dir = CACHE_DIR if cache_dir is None else cache_dir
+    os.makedirs(cache_dir, exist_ok=True)
+    safe = "".join(ch if ch.isalnum() else "_" for ch in symbol)
+    cache_path = os.path.join(cache_dir, f"INDEX_{safe}_{start}_{end}.csv")
+    if not refresh and os.path.exists(cache_path):
+        try:
+            cached = pd.read_csv(cache_path, index_col=0, parse_dates=True)
+            s = cached["Close"].astype(float).dropna().sort_index()
+            if not s.empty:
+                return s
+        except Exception:
+            pass
+
+    raw = None
+    for attempt in range(2):
+        try:
+            raw = yf.download(tickers=symbol, start=start, end=end, interval="1d",
+                              progress=False, auto_adjust=False, threads=False)
+            break
+        except Exception as e:
+            print(f"  下載{symbol}第{attempt+1}次發生例外: {e}", flush=True)
+            raw = None
+            time.sleep(3)
+    if raw is None or raw.empty:
+        return pd.Series(dtype=float)
+
+    close = raw["Close"]
+    if isinstance(close, pd.DataFrame):  # 新版yfinance單一代號也可能回傳MultiIndex欄位
+        close = close[symbol] if symbol in close.columns else close.iloc[:, 0]
+    close = pd.to_numeric(close, errors="coerce").dropna().sort_index()
+    idx = pd.DatetimeIndex(close.index)
+    if idx.tz is not None:
+        idx = idx.tz_localize(None)
+    close.index = idx
+    close = close[~close.index.duplicated(keep="last")]
+    close.name = "Close"
+    if not close.empty:
+        close.to_frame().to_csv(cache_path)
+    return close
+
+
 def build_master_calendar(price_data: dict, reference_code: str = "2330") -> pd.DatetimeIndex:
     """
     用一檔流動性最好、幾乎天天有交易的股票 (預設台積電) 的日期序列，

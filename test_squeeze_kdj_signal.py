@@ -1432,3 +1432,237 @@ class TestExecutionModelOpenMatchesLegacy:
                 continue
             assert t["e_price"] >= o["e_price"] - 1e-9
         assert set(diag) == set(CAPITAL_CONSTRAINED_DIAGNOSTIC_KEYS)
+
+
+# ============================================================================
+# --squeeze-kdj-filters：大盤季線(market_ma60)/個股半年線(stock_ma120)/兩者(market_ma60_and_stock_ma120)濾網
+# ============================================================================
+from squeeze_kdj_signal import (
+    squeeze_kdj_entry_filter_flags, squeeze_kdj_entry_filter_allows, _market_ok_by_code,
+)
+
+
+def _flat_with_trigger_close(n, t, close_t, price=100.0, start="2020-01-02"):
+    """全程收盤=price(開=price、高低±1)，只有t那天收盤=close_t。"""
+    idx = pd.date_range(start, periods=n, freq="B")
+    closes = pd.Series(price, index=idx, dtype=float)
+    closes.iloc[t] = close_t
+    opens = pd.Series(price, index=idx, dtype=float)
+    return pd.DataFrame({"Open": opens, "High": np.maximum(opens, closes) + 1.0,
+                         "Low": np.minimum(opens, closes) - 1.0, "Close": closes}, index=idx)
+
+
+def _run_filter(df, features, entry_filter, market_series=None, **kw):
+    return run_squeeze_kdj_capital_constrained_backtest(
+        {"1101": df}, {"1101": {}}, df.index, 1_000_000, variant="A", max_concurrent_positions=1, top_n=1,
+        features_by_code={"1101": features}, max_hold_days=3, entry_filter=entry_filter,
+        market_series=market_series, return_diagnostics=True, **kw)
+
+
+class TestMarketMa60Filter:
+    N, T = 100, 80  # 觸發K棒t=80 → t+1=81開盤進場
+
+    def _market(self, idx, value_t, value_t1, drop_t=False, drop_values_at=None):
+        m = pd.Series(100.0, index=idx)
+        m.iloc[self.T] = value_t
+        m.iloc[self.T + 1] = value_t1
+        if drop_t:
+            m = m.drop(idx[self.T])
+        return m
+
+    def test_blocks_when_index_below_ma60_on_trigger_day_even_if_next_day_soars(self):
+        df = _flat_with_trigger_close(self.N, self.T, 100.0)
+        features = _make_fixed_features(df, entry_idx=self.T, prior_low=1.0)
+        market = self._market(df.index, value_t=90.0, value_t1=500.0)
+        trades, diag = _run_filter(df, features, "market_ma60", market)
+        assert trades == []
+        assert diag["skipped_entry_filter"] == 1 and diag["skipped_filter_market"] == 1
+        assert diag["skipped_filter_stock_trend"] == 0
+
+    def test_allows_when_index_above_ma60_on_trigger_day_even_if_next_day_crashes(self):
+        df = _flat_with_trigger_close(self.N, self.T, 100.0)
+        features = _make_fixed_features(df, entry_idx=self.T, prior_low=1.0)
+        market = self._market(df.index, value_t=110.0, value_t1=1.0)
+        trades, diag = _run_filter(df, features, "market_ma60", market)
+        assert len(trades) == 1 and trades[0]["entry_date"] == df.index[self.T + 1]
+        assert diag["skipped_entry_filter"] == 0
+
+    def test_index_values_after_trigger_day_never_change_decision(self):
+        df = _flat_with_trigger_close(self.N, self.T, 100.0)
+        features = _make_fixed_features(df, entry_idx=self.T, prior_low=1.0)
+        base = self._market(df.index, value_t=110.0, value_t1=110.0)
+        for later in (1.0, 1e6):
+            m = base.copy()
+            m.iloc[self.T + 1:] = later
+            trades, _ = _run_filter(df, features, "market_ma60", m)
+            assert len(trades) == 1
+
+    def test_index_holiday_on_trigger_day_uses_last_bar_before(self):
+        df = _flat_with_trigger_close(self.N, self.T, 100.0)
+        features = _make_fixed_features(df, entry_idx=self.T, prior_low=1.0)
+        # 指數在t沒有K棒；t-1在季線上、t+1崩跌 → 用t-1 → 放行
+        m = pd.Series(100.0, index=df.index)
+        m.iloc[self.T - 1] = 110.0
+        m.iloc[self.T + 1] = 1.0
+        m = m.drop(df.index[self.T])
+        trades, _ = _run_filter(df, features, "market_ma60", m)
+        assert len(trades) == 1
+        # 反過來：t-1在季線下、t沒有K棒、t+1暴漲 → 用t-1 → 擋掉
+        m2 = pd.Series(100.0, index=df.index)
+        m2.iloc[self.T - 1] = 90.0
+        m2.iloc[self.T + 1] = 500.0
+        m2 = m2.drop(df.index[self.T])
+        trades2, diag2 = _run_filter(df, features, "market_ma60", m2)
+        assert trades2 == [] and diag2["skipped_filter_market"] == 1
+
+    def test_index_ma60_warmup_blocks(self):
+        df = _flat_with_trigger_close(self.N, self.T, 100.0)
+        features = _make_fixed_features(df, entry_idx=self.T, prior_low=1.0)
+        m = pd.Series(np.linspace(50, 200, 40), index=df.index[self.T - 39:self.T + 1])  # 只有40根，季線算不出來
+        trades, _ = _run_filter(df, features, "market_ma60", m)
+        assert trades == []
+
+    def test_nan_index_rows_are_dropped_not_poisoning_the_ma(self):
+        df = _flat_with_trigger_close(self.N, self.T, 100.0)
+        features = _make_fixed_features(df, entry_idx=self.T, prior_low=1.0)
+        m = self._market(df.index, value_t=110.0, value_t1=110.0)
+        m.iloc[self.T - 5] = np.nan  # 不丟掉的話，含這列的60日均線全部是NaN → 會被誤擋
+        trades, _ = _run_filter(df, features, "market_ma60", m)
+        assert len(trades) == 1
+
+    def test_requires_market_series(self):
+        df = _flat_with_trigger_close(self.N, self.T, 100.0)
+        features = _make_fixed_features(df, entry_idx=self.T, prior_low=1.0)
+        for f in ("market_ma60", "market_ma60_and_stock_ma120"):
+            with pytest.raises(ValueError):
+                _run_filter(df, features, f, None)
+        # 個股濾網不需要大盤
+        _run_filter(df, features, "stock_ma120", None)
+
+
+class TestStockMa120Filter:
+    N = 200
+
+    def test_blocks_below_and_allows_above_own_ma120(self):
+        t = 150
+        for close_t, expect in ((110.0, 1), (90.0, 0)):
+            df = _flat_with_trigger_close(self.N, t, close_t)
+            features = _make_fixed_features(df, entry_idx=t, prior_low=1.0)
+            trades, diag = _run_filter(df, features, "stock_ma120")
+            assert len(trades) == expect
+            assert diag["skipped_filter_stock_trend"] == 1 - expect
+            assert diag["skipped_filter_market"] == 0
+
+    def test_prices_after_trigger_day_never_change_decision(self):
+        t = 150
+        for close_t, expect in ((110.0, 1), (90.0, 0)):
+            for later in (1.0, 1000.0):
+                df = _flat_with_trigger_close(self.N, t, close_t)
+                df.iloc[t + 1:, df.columns.get_loc("Close")] = later
+                df["High"] = df[["Open", "Close"]].max(axis=1) + 1.0
+                df["Low"] = df[["Open", "Close"]].min(axis=1) - 0.5
+                features = _make_fixed_features(df, entry_idx=t, prior_low=0.01)
+                trades, _ = _run_filter(df, features, "stock_ma120")
+                assert len(trades) == expect
+
+    def test_ma120_warmup_blocks_then_first_full_window_allows(self):
+        df = _flat_with_trigger_close(self.N, 118, 110.0)  # t=118：只有119根，120日均線算不出來
+        features = _make_fixed_features(df, entry_idx=118, prior_low=1.0)
+        trades, _ = _run_filter(df, features, "stock_ma120")
+        assert trades == []
+        df = _flat_with_trigger_close(self.N, 119, 110.0)  # t=119：剛好120根
+        features = _make_fixed_features(df, entry_idx=119, prior_low=1.0)
+        trades, _ = _run_filter(df, features, "stock_ma120")
+        assert len(trades) == 1
+
+
+class TestBothFilter:
+    def test_requires_both_conditions(self):
+        t = 150
+        cases = [  # (個股t收盤, 大盤t值, 預期筆數, 大盤細項, 個股細項)
+            (110.0, 110.0, 1, 0, 0),
+            (110.0, 90.0, 0, 1, 0),
+            (90.0, 110.0, 0, 0, 1),
+            (90.0, 90.0, 0, 1, 1),  # 兩個都不成立：細項各記1次，合計只記1次
+        ]
+        for close_t, mkt_t, expect, n_mkt, n_stock in cases:
+            df = _flat_with_trigger_close(200, t, close_t)
+            features = _make_fixed_features(df, entry_idx=t, prior_low=1.0)
+            m = pd.Series(100.0, index=df.index)
+            m.iloc[t] = mkt_t
+            trades, diag = _run_filter(df, features, "market_ma60_and_stock_ma120", m)
+            assert len(trades) == expect
+            assert diag["skipped_entry_filter"] == 1 - expect
+            assert diag["skipped_filter_market"] == n_mkt and diag["skipped_filter_stock_trend"] == n_stock
+
+
+class TestNoFilterUnaffectedByMarketSeries:
+    @pytest.mark.parametrize("scenario", _SNAPSHOT_SCENARIOS[:4])
+    def test_filter_none_with_market_series_identical_to_legacy(self, scenario):
+        seed, variant, mcp, lots, capital, slip, top_n, hold, cal = scenario
+        price_data, universe, idx = _make_synthetic_market(seed=seed)
+        calendar = {"full": idx, "is": idx[:280], "oos": idx[280:]}[cal]
+        features_by_code = precompute_squeeze_kdj_features_by_code(price_data, universe)
+        kwargs = dict(variant=variant, lots=lots, top_n=top_n, max_concurrent_positions=mcp,
+                      max_hold_days=hold, slippage_pct=slip, features_by_code=features_by_code)
+        legacy = _legacy_capital_constrained_backtest(price_data, universe, calendar, capital, **kwargs)
+        market = pd.Series(np.random.default_rng(9).lognormal(0, 0.1, len(idx)).cumprod() * 10000, index=idx)
+        new, diag = run_squeeze_kdj_capital_constrained_backtest(
+            price_data, universe, calendar, capital, entry_filter=None, market_series=market,
+            return_diagnostics=True, **kwargs)
+        assert len(legacy) > 0
+        assert new == legacy
+        assert diag["skipped_entry_filter"] == diag["skipped_filter_market"] == diag["skipped_filter_stock_trend"] == 0
+
+
+class TestPureFilterFunctionMatchesBacktestArrays:
+    def test_scanner_function_agrees_with_backtest_alignment(self):
+        """每日掃描要用的純函式(squeeze_kdj_entry_filter_flags)跟回測裡向量化、shift(1)對齊的版本，
+        對每一個「觸發K棒t → 進場列t+1」的判斷必須完全一致(含指數缺日、個股NaN列)。"""
+        price_data, universe, idx = _make_synthetic_market(n_stocks=4, n_days=300, seed=11)
+        code0 = list(price_data)[0]
+        price_data[code0].iloc[150, price_data[code0].columns.get_loc("Close")] = np.nan  # 個股NaN列
+        rng = np.random.default_rng(1)
+        market = pd.Series(10000 * np.exp(np.cumsum(rng.normal(0, 0.01, len(idx)))), index=idx)
+        market = market.drop(idx[rng.choice(np.arange(70, 290), size=15, replace=False)])  # 指數缺日
+        market.iloc[100] = np.nan
+        features_by_code = precompute_squeeze_kdj_features_by_code(price_data, universe)
+        pre = precompute_squeeze_kdj_backtest_arrays(price_data, features_by_code)
+        market_ok = _market_ok_by_code(pre["per_code"], market)
+        checked = 0
+        for code, arrs in pre["per_code"].items():
+            dates = arrs["dates"]
+            for i in list(range(1, len(dates), 7)) + [151, 152]:
+                t = dates[i - 1]
+                flags = squeeze_kdj_entry_filter_flags(price_data[code]["Close"], market, t)
+                assert flags["market_ok"] == bool(market_ok[code][i]), (code, t)
+                assert flags["stock_trend_ok"] == bool(arrs["above_ma120"][i]), (code, t)
+                checked += 1
+        assert checked > 100
+        # 兩種結果都有出現，比對才有意義
+        assert any(market_ok[code0]) and not all(market_ok[code0])
+        assert any(pre["per_code"][code0]["above_ma120"]) and not all(pre["per_code"][code0]["above_ma120"][130:])
+
+    def test_pure_function_ignores_data_after_trigger_date(self):
+        df = _flat_with_trigger_close(200, 150, 110.0)
+        market = pd.Series(100.0, index=df.index)
+        market.iloc[150] = 110.0
+        t = df.index[150]
+        base = squeeze_kdj_entry_filter_flags(df["Close"], market, t)
+        df2, m2 = df.copy(), market.copy()
+        df2.iloc[151:, df2.columns.get_loc("Close")] = 1.0
+        m2.iloc[151:] = 1.0
+        assert squeeze_kdj_entry_filter_flags(df2["Close"], m2, t) == base == {"market_ok": True, "stock_trend_ok": True}
+
+    def test_allows_wrapper(self):
+        df = _flat_with_trigger_close(200, 150, 110.0)
+        market = pd.Series(100.0, index=df.index)
+        market.iloc[150] = 90.0
+        t = df.index[150]
+        assert squeeze_kdj_entry_filter_allows(None, df["Close"], None, t) is True
+        assert squeeze_kdj_entry_filter_allows("stock_ma120", df["Close"], None, t) is True
+        assert squeeze_kdj_entry_filter_allows("market_ma60", df["Close"], market, t) is False
+        assert squeeze_kdj_entry_filter_allows("market_ma60", df["Close"], None, t) is False
+        assert squeeze_kdj_entry_filter_allows("market_ma60_and_stock_ma120", df["Close"], market, t) is False
+        with pytest.raises(ValueError):
+            squeeze_kdj_entry_filter_allows("above_ma60", df["Close"], market, t)

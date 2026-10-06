@@ -1403,3 +1403,306 @@ class TestSqueezeKdjFixedVerdictWording:
         assert "拿掉未見過區段最大3筆" in cb._squeeze_kdj_fixed_segment_verdict(winning, "未見過區段")
         empty = {"stats": {"trade_count": 0, "profit_factor": 0.0, "total_pnl_ntd": 0.0}, "bootstrap": b}
         assert "沒有任何交易" in cb._squeeze_kdj_fixed_segment_verdict(empty, "未見過區段")
+
+
+# ============================================================================
+# --squeeze-kdj-filters：事先登錄的4個進場濾網小測試
+# ============================================================================
+def _stats(n, pf, pnl=None, win_rate=50.0):
+    return {"trade_count": n, "profit_factor": pf, "total_pnl_ntd": pnl if pnl is not None else (pf - 1) * 1000,
+            "win_rate": win_rate}
+
+
+def _make_pf_trades(n, pf, year):
+    """n筆、一半賺一半賠，PF剛好=pf(獲利每筆100*pf、虧損每筆-100)，進出場都在year年。"""
+    trades = []
+    base = pd.Timestamp(f"{year}-01-05")
+    for k in range(n):
+        d = base + pd.Timedelta(days=k % 300)
+        pnl = 100.0 * pf if k % 2 == 0 else -100.0
+        trades.append(_fixed_trade(d, d + pd.Timedelta(days=2), pnl, code="1101"))
+    return trades
+
+
+def _index_series(start="2017-01-02", end="2026-10-05", seed=5):
+    idx = pd.bdate_range(start, end)
+    rng = np.random.default_rng(seed)
+    return pd.Series(10000 * np.exp(np.cumsum(rng.normal(0.0002, 0.01, len(idx)))), index=idx)
+
+
+class TestSqueezeKdjFiltersSelectionRule:
+    def test_variants_are_exactly_the_four_preregistered(self):
+        assert [v[0] for v in cb.SQUEEZE_KDJ_FILTER_VARIANTS] == ["F0", "F1", "F2", "F3"]
+        assert [v[2] for v in cb.SQUEEZE_KDJ_FILTER_VARIANTS] == [
+            None, "market_ma60", "stock_ma120", "market_ma60_and_stock_ma120"]
+        assert cb.SQUEEZE_KDJ_FILTER_MIN_TRAIN_TRADES == 60
+        assert cb.SQUEEZE_KDJ_FILTER_MAX_POSITIONS == 2 and cb.SQUEEZE_KDJ_FILTER_SENSITIVITY_MAX_POSITIONS == 1
+
+    def test_highest_train_pf_among_eligible(self):
+        sel, reason = cb.select_squeeze_kdj_filter_variant({
+            "F0": _stats(100, 0.8), "F1": _stats(100, 1.1), "F2": _stats(60, 1.3), "F3": _stats(59, 9.0)})
+        assert sel == "F2"
+        assert "F3" in reason and "排除" in reason
+
+    def test_tie_on_pf_breaks_by_train_total_pnl(self):
+        sel, _ = cb.select_squeeze_kdj_filter_variant({
+            "F0": _stats(100, 1.2, pnl=500), "F1": _stats(100, 1.2, pnl=900), "F2": _stats(100, 1.2, pnl=100),
+            "F3": _stats(100, 1.0)})
+        assert sel == "F1"
+
+    def test_none_eligible(self):
+        sel, reason = cb.select_squeeze_kdj_filter_variant({v: _stats(10, 2.0) for v in ("F0", "F1", "F2", "F3")})
+        assert sel is None and "無法挑選" in reason
+
+    def _test_seg(self, n, pf, pct):
+        return {"stats": _stats(n, pf), "bootstrap": {"pct_positive": pct, "p_value": 1 - pct / 100}}
+
+    def test_verdict_pass_and_each_failure(self):
+        f0 = self._test_seg(50, 0.9, 30.0)
+        v = cb.squeeze_kdj_filter_verdict("F1", {"F0": f0, "F1": self._test_seg(40, 1.5, 90.0)})
+        assert v["passed"] and v["text"].startswith("✅")
+        v = cb.squeeze_kdj_filter_verdict("F1", {"F0": f0, "F1": self._test_seg(40, 1.5, 70.0)})
+        assert not v["passed"] and "bootstrap" in v["text"] and "PF>1" not in v["text"]
+        v = cb.squeeze_kdj_filter_verdict("F1", {"F0": self._test_seg(50, 2.0, 99.0), "F1": self._test_seg(40, 1.5, 90.0)})
+        assert not v["passed"] and "勝過F0" in v["text"]
+        v = cb.squeeze_kdj_filter_verdict("F1", {"F0": f0, "F1": self._test_seg(40, 0.7, 10.0)})
+        assert not v["passed"] and "PF>1" in v["text"] and "bootstrap" in v["text"]
+
+    def test_verdict_when_f0_selected_never_passes(self):
+        seg = self._test_seg(50, 2.0, 99.0)
+        v = cb.squeeze_kdj_filter_verdict("F0", {"F0": seg})
+        assert not v["passed"] and "不採用任何濾網" in v["text"]
+        assert cb.squeeze_kdj_filter_verdict(None, {"F0": seg})["passed"] is False
+
+    def test_improvement_table_both_periods(self):
+        def seg(wr, pf):
+            return {"stats": {"trade_count": 10, "win_rate": wr, "profit_factor": pf}}
+        by = {"F0": {"train": seg(40, 0.8), "test": seg(45, 1.0)},
+              "F1": {"train": seg(42, 0.9), "test": seg(46, 1.1)},   # 兩段都變好
+              "F2": {"train": seg(42, 0.9), "test": seg(44, 1.1)},   # 驗證期勝率變差
+              "F3": {"train": seg(30, 0.5), "test": seg(50, 2.0)}}
+        rows = {r["variant"]: r for r in cb.squeeze_kdj_filter_improvement_table(by)}
+        assert rows["F1"]["both_periods_better"] is True
+        assert rows["F2"]["both_periods_better"] is False and rows["F2"]["test_pf_better"] is True
+        assert rows["F3"]["both_periods_better"] is False
+        assert set(rows) == {"F1", "F2", "F3"}
+
+    def test_periods_split_and_validity_warning(self):
+        cal = pd.bdate_range("2018-01-01", "2026-10-05")
+        train, test = cb.split_squeeze_kdj_filter_periods(cal)
+        assert train[0] == pd.Timestamp("2018-01-01") and train[-1] == pd.Timestamp("2022-12-30")
+        assert test[0] == pd.Timestamp("2023-01-02")
+        assert cb.squeeze_kdj_filter_validity_warnings("2018-01-01", train, test) == []
+        late = cal[cal >= "2021-03-01"]
+        tr, te = cb.split_squeeze_kdj_filter_periods(late)
+        w = cb.squeeze_kdj_filter_validity_warnings("2021-03-01", tr, te)
+        assert len(w) == 2 and "2018-06-30" in w[0] and "2年" in w[1]
+        w = cb.squeeze_kdj_filter_validity_warnings("2018-07-02", *cb.split_squeeze_kdj_filter_periods(cal[cal >= "2018-07-02"]))
+        assert len(w) == 1
+
+
+class TestSqueezeKdjFiltersIndexFallback:
+    def _patch(self, monkeypatch, behaviour):
+        calls = []
+
+        def _fake(symbol, start, end, refresh=False, cache_dir=None):
+            calls.append((symbol, start, end))
+            b = behaviour.get(symbol)
+            if isinstance(b, Exception):
+                raise b
+            return b if b is not None else pd.Series(dtype=float)
+        monkeypatch.setattr(cb, "load_index_series", _fake)
+        return calls
+
+    def _price_data(self):
+        idx = pd.bdate_range("2017-06-15", "2026-10-05")
+        return {"2330": pd.DataFrame({"Close": np.linspace(200, 1000, len(idx))}, index=idx)}
+
+    def test_twii_used_when_available_with_lookback(self, monkeypatch):
+        calls = self._patch(monkeypatch, {"^TWII": _index_series()})
+        info = cb.load_squeeze_kdj_market_index("2018-01-01", "2026-10-06", self._price_data())
+        assert info["symbol"] == "^TWII" and info["is_twii"] and info["warning"] is None
+        assert calls == [("^TWII", "2017-06-15", "2026-10-06")]  # 往前多抓200個日曆天、end原樣(exclusive)
+
+    def test_falls_back_to_0050_then_2330_with_warnings(self, monkeypatch):
+        calls = self._patch(monkeypatch, {"^TWII": pd.Series(dtype=float), "0050.TW": _index_series(seed=1)})
+        info = cb.load_squeeze_kdj_market_index("2018-01-01", "2026-10-06", self._price_data())
+        assert info["symbol"] == "0050.TW" and not info["is_twii"]
+        assert "不是加權指數^TWII" in info["warning"]
+        assert [c[0] for c in calls] == ["^TWII", "0050.TW"]
+
+        calls = self._patch(monkeypatch, {"^TWII": RuntimeError("boom"), "0050.TW": None})
+        info = cb.load_squeeze_kdj_market_index("2018-01-01", "2026-10-06", self._price_data())
+        assert info["symbol"] == "2330" and "台積電" in info["warning"]
+        assert len(info["attempts"]) == 3
+
+    def test_insufficient_coverage_falls_back(self, monkeypatch):
+        self._patch(monkeypatch, {"^TWII": _index_series(start="2021-01-04"), "0050.TW": _index_series(seed=2)})
+        info = cb.load_squeeze_kdj_market_index("2018-01-01", "2026-10-06", self._price_data())
+        assert info["symbol"] == "0050.TW"
+        assert "不夠涵蓋" in info["attempts"][0]
+
+    def test_nothing_at_all_raises(self, monkeypatch):
+        self._patch(monkeypatch, {})
+        with pytest.raises(RuntimeError):
+            cb.load_squeeze_kdj_market_index("2018-01-01", "2026-10-06", {})
+
+
+def _filters_args(start="2018-01-01", end="2026-10-06"):
+    return argparse.Namespace(start=start, end=end, starting_capital=1_000_000, refresh=False)
+
+
+class TestSqueezeKdjFiltersModeSelectionIgnoresTest:
+    def _run(self, monkeypatch, tmp_path, test_pf):
+        """假回測：挑選期F2是符合資格裡PF最高(F3 PF更高但只有50筆)；驗證期的數字由test_pf決定。"""
+        train_spec = {None: (100, 0.8), "market_ma60": (100, 1.1), "stock_ma120": (100, 1.3),
+                      "market_ma60_and_stock_ma120": (50, 3.0)}
+        calls = []
+
+        def _fake_backtest(**kw):
+            calls.append(kw)
+            cal = kw["master_calendar"]
+            if cal[0] < pd.Timestamp("2023-01-01"):
+                n, pf = train_spec[kw["entry_filter"]]
+                trades = _make_pf_trades(n, pf, 2019)
+            else:
+                n, pf = 80, test_pf[kw["entry_filter"]]
+                trades = _make_pf_trades(n, pf, 2024)
+            return trades, dict.fromkeys(cb.CAPITAL_CONSTRAINED_DIAGNOSTIC_KEYS, 0)
+        monkeypatch.setattr(cb, "run_squeeze_kdj_capital_constrained_backtest", _fake_backtest)
+        monkeypatch.setattr(cb, "load_index_series", lambda *a, **k: _index_series())
+        monkeypatch.setattr(cb, "RESULTS_DIR", str(tmp_path))
+        codes = ["1101", "2330"]
+        price_data, idx = _make_regime_switching_market(codes, start="2018-01-01", n_days=2300)
+        universe = {c: STOCK_FUTURES_UNIVERSE[c] for c in codes}
+        out = cb.run_squeeze_kdj_filters_mode(_filters_args(), price_data, universe, idx)
+        return out, calls
+
+    def test_selection_uses_train_only(self, monkeypatch, tmp_path):
+        # 驗證期F1遠遠最好、F2最差 → 照樣選F2(挑選規則不看驗證期)，判定不通過
+        out, calls = self._run(monkeypatch, tmp_path, {None: 1.0, "market_ma60": 5.0, "stock_ma120": 0.5,
+                                                       "market_ma60_and_stock_ma120": 4.0})
+        assert out["selected"] == "F2"
+        assert not out["verdict"]["passed"]
+        assert len(calls) == 16  # 2種最多持倉數 x 4變體 x 2期間
+        for kw in calls:
+            assert kw["lots"] == 1 and kw["top_n"] == 3 and kw["execution_model"] == "limit_1tick"
+            assert kw["variant"] == "B" and kw["atr_stop_mult"] == 1.0 and kw["atr_target_mult"] == 3.0
+            assert kw["max_hold_days"] == 20 and kw["atr_period"] == 14 and kw["ranking_rule"] == "trigger_return"
+            assert kw["max_concurrent_positions"] in (1, 2) and "slippage_pct" not in kw
+            assert kw["market_series"] is not None
+        # 每段都是獨立重跑：日曆只含自己那一段
+        train_cals = [kw["master_calendar"] for kw in calls if kw["master_calendar"][0] < pd.Timestamp("2023-01-01")]
+        assert all(c[-1] <= pd.Timestamp("2022-12-31") for c in train_cals)
+        # 換一組驗證期(F2變成最好)，選擇不變、判定通過
+        out2, _ = self._run(monkeypatch, tmp_path, {None: 1.0, "market_ma60": 0.5, "stock_ma120": 3.0,
+                                                    "market_ma60_and_stock_ma120": 0.5})
+        assert out2["selected"] == "F2"
+        assert out2["verdict"]["passed"]
+        summary = (tmp_path / "summary.txt").read_text(encoding="utf-8")
+        assert "✅ 通過" in summary
+
+
+class TestSqueezeKdjFiltersCliMode:
+    def test_skips_full_pipeline_writes_outputs_without_scipy(self, monkeypatch, tmp_path):
+        import data_loader
+        import chip_data_loader
+        monkeypatch.setitem(sys.modules, "scipy", None)
+        monkeypatch.setitem(sys.modules, "scipy.stats", None)
+
+        codes = list(STOCK_FUTURES_UNIVERSE)[:12]
+        price_data, idx = _make_regime_switching_market(codes + ["2330"], start="2017-06-15", n_days=1950, seed=3)
+        load_calls = []
+
+        def _fake_load(universe, start, end, refresh=False):
+            load_calls.append((start, end))
+            return price_data
+        monkeypatch.setattr(cb, "load_price_data", _fake_load)
+        index_calls = []
+
+        def _fake_index(symbol, start, end, refresh=False, cache_dir=None):
+            index_calls.append((symbol, start, end))
+            return _index_series(start="2017-06-15", end="2025-12-31")
+        monkeypatch.setattr(cb, "load_index_series", _fake_index)
+
+        def _boom(*args, **kwargs):
+            raise AssertionError("--squeeze-kdj-filters模式不該直接呼叫資料下載函式")
+        monkeypatch.setattr(data_loader, "load_price_data", _boom)
+        monkeypatch.setattr(data_loader, "load_index_series", _boom)
+        monkeypatch.setattr(chip_data_loader, "load_chip_data", _boom)
+        TestSqueezeKdjFixedCliMode()._patch_heavy_stages_to_explode(monkeypatch)
+        monkeypatch.setattr(cb, "run_squeeze_kdj_fixed_mode", _boom)
+        monkeypatch.setattr(cb, "RESULTS_DIR", str(tmp_path))
+
+        mode_calls = []
+        real_mode = cb.run_squeeze_kdj_filters_mode
+
+        def _spy(*args, **kwargs):
+            mode_calls.append(args)
+            return real_mode(*args, **kwargs)
+        monkeypatch.setattr(cb, "run_squeeze_kdj_filters_mode", _spy)
+
+        argv = ["compare_breakout.py", "--squeeze-kdj-filters", "--max-stocks", "12",
+                "--start", "2018-01-01", "--end", "2024-11-15", "--starting-capital", "1000000"]
+        monkeypatch.setattr(sys, "argv", argv)
+        cb.main()
+
+        assert load_calls == [("2017-06-15", "2024-11-15")]  # 股價往前多抓200個日曆天
+        assert index_calls[0] == ("^TWII", "2017-06-15", "2024-11-15")
+        assert len(mode_calls) == 1
+        cal = mode_calls[0][3]
+        assert cal[0] >= pd.Timestamp("2018-01-01")  # 暖身資料不拿來交易
+        assert cal.equals(idx[idx >= pd.Timestamp("2018-01-01")])
+
+        summ = pd.read_csv(tmp_path / "squeeze_kdj_filters_summary.csv", encoding="utf-8-sig")
+        assert len(summ) == 16
+        for col in ("最多同時持倉數", "用途", "變體代號", "期間", "交易筆數", "每月交易筆數", "勝率(%)", "獲利因子PF",
+                    "總損益(NT$)", "平均獲利(NT$/筆)", "平均虧損(NT$/筆)", "最大回撤(NT$)", "拿掉最大3筆後損益(NT$)",
+                    "bootstrap正報酬比例(%)", "bootstrap p值", "診斷_進場濾網擋掉", "診斷_濾網細項_大盤不在季線上",
+                    "診斷_濾網細項_個股不在半年線上", "診斷_名額已滿沒輪到", "被挑選規則選中", "大盤指數來源"):
+            assert col in summ.columns, col
+        assert set(summ["期間"]) == {"挑選期", "驗證期"}
+        assert set(summ["最多同時持倉數"]) == {1, 2}
+        assert summ["被挑選規則選中"].sum() <= 1
+        assert (summ.loc[summ["變體代號"] == "F0", "診斷_進場濾網擋掉"] == 0).all()
+        assert (summ.loc[summ["變體代號"] == "F1", "診斷_濾網細項_個股不在半年線上"] == 0).all()
+        assert (summ.loc[summ["變體代號"] == "F2", "診斷_濾網細項_大盤不在季線上"] == 0).all()
+        assert summ.loc[summ["變體代號"] == "F3", "診斷_進場濾網擋掉"].sum() > 0
+        assert summ["交易筆數"].sum() > 0, "合成資料要有交易，測試才有意義"
+        # 同一批候選時，F3(兩個條件都要)擋掉的數量不會少於F1或F2單獨擋掉的
+        for (mp, per), g in summ.groupby(["最多同時持倉數", "期間"]):
+            blocked = dict(zip(g["變體代號"], g["診斷_進場濾網擋掉"]))
+            cands = dict(zip(g["變體代號"], g["診斷_候選總數"]))
+            if cands["F0"] == cands["F3"]:
+                assert blocked["F3"] >= max(blocked["F1"], blocked["F2"])
+
+        yearly = pd.read_csv(tmp_path / "squeeze_kdj_filters_yearly.csv", encoding="utf-8-sig")
+        assert list(yearly.columns) == cb.SQUEEZE_KDJ_FILTER_YEARLY_COLUMNS
+        assert set(yearly.loc[yearly["期間"] == "挑選期", "年度(依出場日)"]) <= {2018, 2019, 2020, 2021, 2022}
+        assert set(yearly.loc[yearly["期間"] == "驗證期", "年度(依出場日)"]) <= {2023, 2024}
+        trades = pd.read_csv(tmp_path / "squeeze_kdj_filters_trades.csv", encoding="utf-8-sig")
+        assert len(trades) == summ["交易筆數"].sum()
+        assert "股票代號" in trades.columns and "損益(NT$，已扣手續費)" in trades.columns
+        assert (pd.to_datetime(trades["進場日"]) >= pd.Timestamp("2018-01-01")).all()
+
+        summary = (tmp_path / "summary.txt").read_text(encoding="utf-8")
+        assert "--squeeze-kdj-filters模式" in summary
+        assert summary.index("【事先登錄的規則") < summary.index("【挑選結果與判定】") < summary.index("【並排總表")
+        assert "結論：" in summary and "兩段都變好" in summary
+        assert "敏感度對照" in summary and "台灣加權指數(^TWII)" in summary
+        assert "多重比較" in summary and "倖存者偏差" in summary and "偏樂觀" in summary
+        assert "這次測試無效" not in summary
+        assert "[階段0]" not in summary
+
+    def test_invalid_start_prints_big_warning(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(cb, "RESULTS_DIR", str(tmp_path))
+        monkeypatch.setattr(cb, "load_index_series", lambda *a, **k: pd.Series(dtype=float))  # 一路退到2330
+        codes = ["1101", "2330"]
+        price_data, idx = _make_regime_switching_market(codes, start="2021-06-01", n_days=600)
+        universe = {c: STOCK_FUTURES_UNIVERSE[c] for c in codes}
+        out = cb.run_squeeze_kdj_filters_mode(_filters_args(start="2021-06-01", end="2023-09-01"),
+                                              price_data, universe, idx)
+        summary = (tmp_path / "summary.txt").read_text(encoding="utf-8")
+        assert "這次測試無效" in summary and "2018-01-01" in summary
+        assert summary.index("這次測試無效") < summary.index("【挑選結果與判定】")
+        assert out["index_info"]["symbol"] == "2330" and "台積電" in summary

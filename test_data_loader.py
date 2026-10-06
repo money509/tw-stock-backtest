@@ -156,6 +156,48 @@ class TestLoadPriceData(unittest.TestCase):
         self.assertEqual(price_data, {})
 
 
+class TestLoadIndexSeries(unittest.TestCase):
+    """--squeeze-kdj-filters的大盤指數下載：代號原封不動(不套.TW)、自己的快取檔、丟掉NaN收盤、失敗回傳空Series。"""
+
+    def setUp(self):
+        self.tmp_dir = tempfile.mkdtemp()
+        self._orig_cache_dir = dl.CACHE_DIR
+        dl.CACHE_DIR = self.tmp_dir
+
+    def tearDown(self):
+        dl.CACHE_DIR = self._orig_cache_dir
+        shutil.rmtree(self.tmp_dir, ignore_errors=True)
+
+    def _fake(self, multi=True):
+        idx = pd.date_range("2026-01-02", periods=5, freq="B", tz="Asia/Taipei")
+        close = [100.0, np.nan, 102.0, 103.0, 104.0]
+        df = pd.DataFrame({"Open": close, "High": close, "Low": close, "Close": close, "Volume": 1.0}, index=idx)
+        if multi:
+            df.columns = pd.MultiIndex.from_product([df.columns, ["^TWII"]])
+        return df
+
+    def test_downloads_raw_symbol_drops_nan_and_caches(self):
+        for multi in (True, False):
+            shutil.rmtree(self.tmp_dir, ignore_errors=True)
+            with patch.object(dl.yf, "download", return_value=self._fake(multi)) as mock_download:
+                s = dl.load_index_series("^TWII", "2025-06-01", "2026-01-10")
+            self.assertEqual(mock_download.call_args.kwargs["tickers"], "^TWII")
+            self.assertEqual(mock_download.call_args.kwargs["end"], "2026-01-10")
+            self.assertEqual(list(s.values), [100.0, 102.0, 103.0, 104.0])
+            self.assertIsNone(s.index.tz)
+            self.assertTrue(os.path.exists(os.path.join(self.tmp_dir, "INDEX__TWII_2025-06-01_2026-01-10.csv")))
+            with patch.object(dl.yf, "download", side_effect=AssertionError("有快取不該再下載")):
+                cached = dl.load_index_series("^TWII", "2025-06-01", "2026-01-10")
+            self.assertEqual(list(cached.values), list(s.values))
+
+    def test_failure_returns_empty_series(self):
+        with patch.object(dl.yf, "download", side_effect=RuntimeError("boom")), patch.object(dl.time, "sleep"):
+            s = dl.load_index_series("^TWII", "2025-06-01", "2026-01-10")
+        self.assertTrue(s.empty)
+        with patch.object(dl.yf, "download", return_value=pd.DataFrame()):
+            self.assertTrue(dl.load_index_series("0050.TW", "2025-06-01", "2026-01-10").empty)
+
+
 class TestBuildMasterCalendar(unittest.TestCase):
     def test_uses_reference_code_when_present(self):
         idx_2330 = pd.date_range("2026-01-01", periods=5)

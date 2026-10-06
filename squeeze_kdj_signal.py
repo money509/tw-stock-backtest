@@ -377,6 +377,9 @@ def simulate_variant_b_trades(df: pd.DataFrame, features: pd.DataFrame,
 # (precompute_squeeze_kdj_backtest_arrays)。預設參數下的交易結果跟重構前逐筆完全相同。
 # 再後續(--squeeze-kdj-fixed)新增、預設關閉的選項：成交模型execution_model="limit_1tick"
 # (限價=觸發K棒收盤+1檔、開盤超過限價不追；進場/市價型出場各多付1檔滑價，見taiwan_tick_size())。
+# 再後續(--squeeze-kdj-filters)新增、預設關閉的選項：entry_filter="market_ma60"(大盤在季線上)/
+# "stock_ma120"(個股在半年線上)/"market_ma60_and_stock_ma120"(兩者皆是)，以及給大盤濾網用的
+# market_series參數；判斷邏輯另外拆成純函式squeeze_kdj_entry_filter_allows()，每日掃描之後可以直接接。
 # ============================================================================
 
 MAX_HOLD_DAYS_CAPITAL_CONSTRAINED_DEFAULT = 60
@@ -473,21 +476,133 @@ def _process_squeeze_kdj_variant_a_day(position: dict, row, k_today: float, date
 
 VALID_CAPITAL_CONSTRAINED_VARIANTS = ("A", "B", "B_trail")
 VALID_RANKING_RULES = ("trigger_return", "volume_ratio")
-VALID_ENTRY_FILTERS = (None, "above_ma60")
+VALID_ENTRY_FILTERS = (None, "above_ma60", "market_ma60", "stock_ma120", "market_ma60_and_stock_ma120")
 VOLUME_RATIO_WINDOW = 20  # 量比 = 當日成交量 / 20日均量，跟momentum_breakout_engine的VolumeRatio同一個定義
 ENTRY_FILTER_MA_PERIOD = 60  # above_ma60濾網用的均線天數，跟momentum_breakout_engine的MA60同一個定義
+# --squeeze-kdj-filters新增的兩個濾網(事先定死，不是掃描出來的參數)：
+MARKET_REGIME_MA_PERIOD = 60   # 大盤(加權指數)收盤 > 60日均線(季線)才算多頭環境
+STOCK_TREND_MA_PERIOD = 120    # 個股收盤 > 120日均線(半年線)才算個股本身在長期上升趨勢
+# 哪些entry_filter需要大盤條件 / 個股半年線條件(market_ma60_and_stock_ma120兩個都要)
+_FILTERS_NEEDING_MARKET = ("market_ma60", "market_ma60_and_stock_ma120")
+_FILTERS_NEEDING_STOCK_TREND = ("stock_ma120", "market_ma60_and_stock_ma120")
 
 # 診斷計數器的key，固定順序，方便呼叫端(compare_breakout.py網格模式)直接攤成CSV欄位。
 CAPITAL_CONSTRAINED_DIAGNOSTIC_KEYS = (
     "candidates_total",            # 當天觸發、且沒有被「持倉中/冷卻期」排除的候選總數
-    "skipped_entry_filter",        # 被進場濾網(entry_filter)擋掉
+    "skipped_entry_filter",        # 被進場濾網(entry_filter)擋掉(全部濾網原因合計，每個候選最多算1次)
     "skipped_no_slot",             # 名額已滿(或排名在top_n截斷之外)，根本沒輪到
     "skipped_invalid_stop",        # 停損價算不出來(ATR是NaN/<=0、PriorLow是NaN、風險部位下停損距離<=0)
     "skipped_risk_lots_lt1",       # 風險預算反推口數 < 1口
     "skipped_single_margin_cap",   # 單筆保證金超過starting_capital的35%
     "skipped_total_margin_cap",    # 加上這筆之後總保證金超過整體上限
     "skipped_limit_not_filled",    # execution_model="limit_1tick"：進場日開盤價高於限價(前一根收盤+1檔)，不追價略過
+    # 以下兩個是skipped_entry_filter的「原因細項」(--squeeze-kdj-filters新增，其他濾網永遠是0)：
+    # 被擋掉的候選裡，大盤條件不成立的有幾個 / 個股半年線條件不成立的有幾個。
+    # market_ma60_and_stock_ma120時同一個候選兩個條件可能都不成立，會兩邊各記1次，
+    # 所以兩個細項相加可能 > skipped_entry_filter(合計那個每個候選只記1次)。
+    "skipped_filter_market",
+    "skipped_filter_stock_trend",
 )
+
+
+# ----------------------------------------------------------------------------
+# 大盤多空 / 個股半年線濾網的純函式(回測跟之後的每日掃描共用同一個定義)
+# ----------------------------------------------------------------------------
+def _clean_close(close: pd.Series) -> pd.Series:
+    """收盤價序列：丟掉NaN、日期排序、去掉重複日期(保留最後一筆)。"""
+    s = pd.Series(close, dtype=float).dropna()
+    s.index = pd.DatetimeIndex(s.index)
+    s = s[~s.index.duplicated(keep="last")].sort_index()
+    return s
+
+
+def compute_above_ma_flag(close: pd.Series, period: int) -> pd.Series:
+    """
+    每一天「收盤 > 含當天在內的period日簡單均線」的布林序列(索引 = 有效收盤價的日期)。
+    NaN收盤價的列先丟掉再算均線(yfinance偶爾回傳價格是NaN的列，不丟的話一個NaN會讓之後
+    period天的均線全部變NaN)；均線暖身期(前period-1天)均線是NaN，比較結果是False——保守處理：
+    資料不足時不假設站上均線。只用到「當天以前(含當天)」的資料，沒有lookahead。
+    """
+    s = _clean_close(close)
+    ma = s.rolling(period).mean()
+    return (s > ma).fillna(False).astype(bool)
+
+
+def compute_market_regime_flag(market_close: pd.Series,
+                               period: int = MARKET_REGIME_MA_PERIOD) -> pd.Series:
+    """大盤多頭環境旗標：加權指數(或代理)收盤 > period日均線(預設60日季線)。見compute_above_ma_flag()。"""
+    return compute_above_ma_flag(market_close, period)
+
+
+def _flag_as_of(flag: pd.Series, date) -> bool:
+    """flag在「date當天或之前最後一筆」的值；date之前完全沒有資料時回傳False。
+    (大盤指數跟個股的交易日不完全一致時，用最後一根 <= date 的指數K棒，不偷看date之後)"""
+    if flag is None or len(flag) == 0:
+        return False
+    sub = flag.loc[:pd.Timestamp(date)]
+    if len(sub) == 0:
+        return False
+    return bool(sub.iloc[-1])
+
+
+def squeeze_kdj_entry_filter_flags(stock_close: pd.Series, market_close, trigger_date) -> dict:
+    """
+    給定一檔股票的收盤價序列、大盤收盤價序列(可為None)、觸發K棒日期t，回傳：
+      {"market_ok": 大盤在t(或t之前最後一根指數K棒)收盤 > 60日均線,
+       "stock_trend_ok": 這檔股票t日收盤 > 自己的120日均線}
+    只使用 <= t 的資料(傳進來的序列就算多了t之後的列也不會被看到)。market_close是None時
+    market_ok=False(沒有大盤資料就不假設是多頭)。t那天這檔股票沒有有效收盤價時stock_trend_ok=False。
+    這是給daily_squeeze_signals.py之後一行接上用的純函式；回測裡的向量化版本
+    (precompute_squeeze_kdj_backtest_arrays()的above_ma120、_market_ok_by_code())跟這裡同一個定義，
+    test_squeeze_kdj_signal.py有逐日比對兩者一致。
+    """
+    t = pd.Timestamp(trigger_date)
+    stock = _clean_close(stock_close)
+    stock = stock.loc[:t]
+    stock_flag = compute_above_ma_flag(stock, STOCK_TREND_MA_PERIOD)
+    stock_ok = bool(len(stock_flag) > 0 and stock_flag.index[-1] == t and stock_flag.iloc[-1])
+    if market_close is None:
+        market_ok = False
+    else:
+        market = _clean_close(market_close).loc[:t]
+        market_ok = _flag_as_of(compute_market_regime_flag(market), t)
+    return {"market_ok": market_ok, "stock_trend_ok": stock_ok}
+
+
+def squeeze_kdj_entry_filter_allows(entry_filter, stock_close: pd.Series, market_close, trigger_date) -> bool:
+    """
+    每日掃描用的一行版本：這個觸發訊號(觸發K棒日期trigger_date)在entry_filter下會不會被放行。
+    entry_filter：None(不過濾)/"market_ma60"/"stock_ma120"/"market_ma60_and_stock_ma120"。
+    ("above_ma60"是網格模式的舊濾網，這裡不支援，丟ValueError，避免默默放行。)
+    例：daily_squeeze_signals.compute_signal_row()裡加一行
+        if not squeeze_kdj_entry_filter_allows(FILTER, df["Close"], market_close, df.index[-1]): return None
+    """
+    if entry_filter is None:
+        return True
+    if entry_filter not in _FILTERS_NEEDING_MARKET + _FILTERS_NEEDING_STOCK_TREND:
+        raise ValueError(f"squeeze_kdj_entry_filter_allows()不支援entry_filter={entry_filter!r}")
+    flags = squeeze_kdj_entry_filter_flags(stock_close, market_close, trigger_date)
+    if entry_filter in _FILTERS_NEEDING_MARKET and not flags["market_ok"]:
+        return False
+    if entry_filter in _FILTERS_NEEDING_STOCK_TREND and not flags["stock_trend_ok"]:
+        return False
+    return True
+
+
+def _market_ok_by_code(per_code: dict, market_series: pd.Series) -> dict:
+    """
+    回測用：把大盤多頭旗標對齊到每一檔股票的列上，跟其他訊號欄位同一個shift(1)慣例——
+    第d列 = 「這檔股票d的前一根K棒(觸發K棒t)那天，大盤(t當天或之前最後一根指數K棒)是否在季線上」。
+    指數沒有t那天的K棒(假日不一致)時，用最後一根 <= t 的指數K棒(reindex的ffill)；
+    t早於指數第一根K棒時是False。只用 <= t 的指數資料，t+1(進場日)的指數不影響決定。
+    """
+    flag = compute_market_regime_flag(market_series)
+    out = {}
+    for code, arrs in per_code.items():
+        idx = arrs["dates"]
+        aligned = flag.reindex(pd.DatetimeIndex(idx), method="ffill")
+        out[code] = aligned.fillna(False).astype(bool).shift(1).fillna(False).astype(bool).to_numpy()
+    return out
 
 # ----------------------------------------------------------------------------
 # 成交模型(execution_model)：tick(最小升降單位)滑價 + 限價不追價
@@ -611,6 +726,10 @@ def precompute_squeeze_kdj_backtest_arrays(price_data: dict, features_by_code: d
 
         ma = close.rolling(ENTRY_FILTER_MA_PERIOD).mean()
         above_ma = (close > ma).shift(1).fillna(False).astype(bool).to_numpy()
+        # --squeeze-kdj-filters的個股半年線濾網：t日收盤 > 自己的120日均線(NaN收盤列先丟掉再算均線，
+        # 見compute_above_ma_flag())，一樣shift(1)對齊到進場日那一列；暖身期/NaN列一律False(擋掉)。
+        above_ma120 = (compute_above_ma_flag(close, STOCK_TREND_MA_PERIOD)
+                       .reindex(index).fillna(False).astype(bool).shift(1).fillna(False).astype(bool).to_numpy())
         # 觸發K棒(t日)的收盤價，一樣shift(1)對齊到進場日(t+1)那一列：execution_model="limit_1tick"
         # 的限價 = 這個價格 + 1檔(使用者在t日收盤後決定、掛t+1日的限價單，只看得到t日收盤)。
         trigger_close = close.shift(1).to_numpy(dtype=float)
@@ -641,6 +760,7 @@ def precompute_squeeze_kdj_backtest_arrays(price_data: dict, features_by_code: d
             "trigger_strength": trigger_strength,
             "volume_ratio": volume_ratio,
             "above_ma60": above_ma,
+            "above_ma120": above_ma120,
             "atr": atr,
             "trigger_close": trigger_close,
         }
@@ -678,7 +798,8 @@ def run_squeeze_kdj_capital_constrained_backtest(price_data: dict, universe: dic
                                                    entry_filter: str = None,
                                                    return_diagnostics: bool = False,
                                                    precomputed: dict = None,
-                                                   execution_model: str = "open"):
+                                                   execution_model: str = "open",
+                                                   market_series: pd.Series = None):
     """
     擠壓+KDJ訊號的「資金/部位受限版」完整day-by-day walk-forward回測，只做多方
     (見模組docstring)。跟run_squeeze_kdj_exit_style_comparison()/
@@ -719,6 +840,16 @@ def run_squeeze_kdj_capital_constrained_backtest(price_data: dict, universe: dic
         無lookahead；均線暖身期一律擋掉)。濾網在排名之前套用，被擋掉的候選不會佔用
         排名/top_n的位置。這跟原始「抄底反彈」訊號的精神其實有點矛盾(跌破布林下軌的
         股票多半不在季線上)，是網格裡「順大勢才抄底」這個假設的測試，不預設會比較好。
+      以下三個是--squeeze-kdj-filters新增(事先定死的4個變體之一，見compare_breakout.py
+      SQUEEZE_KDJ_FILTER_VARIANTS)，一樣在排名之前套用、被擋掉的記在skipped_entry_filter
+      (另外依原因記在skipped_filter_market/skipped_filter_stock_trend)：
+      "market_ma60"：大盤多頭——觸發K棒當天(t日)加權指數收盤 > 指數自己的60日均線。需要
+        market_series(指數收盤價，日期索引)；t日指數沒有K棒時用最後一根 <= t 的指數K棒；
+        對齊方式見_market_ok_by_code()(同樣shift(1)，t+1日的指數不影響決定)。
+      "stock_ma120"：個股長期趨勢——t日這檔股票收盤 > 自己的120日均線(半年線)，暖身期擋掉。
+      "market_ma60_and_stock_ma120"：兩個條件都要成立。
+    market_series：只有上面兩個需要大盤的濾網會讀；其他濾網(含None)傳了也完全不影響結果。
+      需要大盤的濾網沒有給market_series時丟ValueError(不默默當成全部放行或全部擋掉)。
 
     出場規則(跟上面變體A/B完全一致，只是逐日判斷)：
       variant="B"：進場當下記錄的ATR(atr_period天，預設14天——對齊
@@ -832,6 +963,10 @@ def run_squeeze_kdj_capital_constrained_backtest(price_data: dict, universe: dic
         raise ValueError(f"ranking_rule必須是{VALID_RANKING_RULES}其中之一，收到{ranking_rule!r}")
     if entry_filter not in VALID_ENTRY_FILTERS:
         raise ValueError(f"entry_filter必須是{VALID_ENTRY_FILTERS}其中之一，收到{entry_filter!r}")
+    needs_market = entry_filter in _FILTERS_NEEDING_MARKET
+    needs_stock_trend = entry_filter in _FILTERS_NEEDING_STOCK_TREND
+    if needs_market and market_series is None:
+        raise ValueError(f"entry_filter={entry_filter!r}需要大盤指數收盤價market_series，沒有給")
     if execution_model not in VALID_EXECUTION_MODELS:
         raise ValueError(f"execution_model必須是{VALID_EXECUTION_MODELS}其中之一，收到{execution_model!r}")
     limit_1tick = execution_model == "limit_1tick"
@@ -851,6 +986,7 @@ def run_squeeze_kdj_capital_constrained_backtest(price_data: dict, universe: dic
     uses_atr = variant in ("B", "B_trail")
     trail_mult = trailing_atr_mult if trailing_atr_mult is not None else atr_stop_mult
     rank_key_name = "trigger_strength" if ranking_rule == "trigger_return" else "volume_ratio"
+    market_ok_by_code = _market_ok_by_code(per_code, market_series) if needs_market else None
 
     effective_total_margin_cap_ratio = None
     if max_concurrent_positions > 1:
@@ -919,6 +1055,14 @@ def run_squeeze_kdj_capital_constrained_backtest(price_data: dict, universe: dic
             if entry_filter == "above_ma60" and not arrs["above_ma60"][i]:
                 diag["skipped_entry_filter"] += 1
                 continue
+            if needs_market or needs_stock_trend:
+                market_fail = needs_market and not market_ok_by_code[code][i]
+                stock_fail = needs_stock_trend and not arrs["above_ma120"][i]
+                if market_fail or stock_fail:
+                    diag["skipped_entry_filter"] += 1
+                    diag["skipped_filter_market"] += int(market_fail)
+                    diag["skipped_filter_stock_trend"] += int(stock_fail)
+                    continue
             rank_value = arrs[rank_key_name][i]
             if np.isnan(rank_value):
                 rank_value = -np.inf  # 只有volume_ratio可能是NaN(trigger_strength是NaN的事件早就被排除)
