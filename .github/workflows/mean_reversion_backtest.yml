@@ -87,6 +87,10 @@ on:
         description: 'squeeze+KDJ固定設定長歷史回測(--squeeze-kdj-fixed)：1440組網格(squeeze_kdj_grid)沒有選出通過驗證的設定之後，你自己選定的那一組——變體B固定ATR停損1.0倍/停利3.0倍、最多同時持有3檔、最長持有20天、同日多檔用觸發K棒漲幅排名、無進場濾網、top_n=3、ATR14天——拉長歷史重新檢驗。一共跑4個情境：固定1口/固定2口 x 成交模型(①理想成交：隔天開盤價成交、無滑價；②限價：用訊號那天的收盤價+1檔掛限價單，隔天開盤價超過限價就不追、等下一個訊號，有成交時進場多付1檔滑價(但不超過限價)，停損/跳空停損/持有到期強制平倉這類市價出場也多付1檔，固定價位停利是掛好的限價單不加滑價；1檔的大小依台股升降單位級距，股票期貨比照標的股票)。每個情境在整段期間連續回測一次(只有一組固定設定、沒有挑選，不需要切IS/OOS；連續跑才是真實帳戶的路徑)，再依進場日切成兩段：進場日早於2023-10-06的是「未見過區段」(網格跟你挑設定時完全沒看過的年份，這是報告裡最誠實的數字，會單獨做bootstrap 1000次並判定有沒有過專案門檻：PF>1且bootstrap正報酬比例>80%)，2023-10-06之後的是「已見過區段」(偏樂觀，只當對照)；另外輸出逐年表(交易筆數/PF/勝率/損益/年內最大回撤/拿掉最大3筆後損益)、診斷計數(含限價沒成交被略過幾次、佔多少比例)、權益路徑(期末權益/最大回撤金額與佔起始資金比例/最長連續虧損筆數)。⚠️請搭配「回測起始日期」(start_date)=2018-01-01、掃描股票數量(max_stocks)=0(全部標的)執行；起始日期留空(預設最近3年)會沒有未見過區段，summary會提醒你重跑。輸出squeeze_kdj_fixed_scenarios.csv/squeeze_kdj_fixed_yearly.csv/squeeze_kdj_fixed_trades.csv(中文欄名)+summary.txt。開啟後，上面max_stocks/starting_capital/start_date/end_date仍然有效，其餘跟訊號/門檻/突破窗口/出場配置自動搜尋相關的選項在這裡不適用；跟squeeze_kdj_only/squeeze_kdj_capital_constrained/squeeze_kdj_grid互斥(main()依序檢查，那幾個若同時開啟會先執行並直接return，這個選項就不會執行)。從2018年開始要下載約8.75年x全部標的的日K，第一次執行(沒有快取)下載會比3年多花幾分鐘，回測本身只要幾十秒，遠低於步驟150分鐘上限'
         required: false
         default: 'false'
+      squeeze_kdj_filters:
+        description: 'squeeze+KDJ進場濾網小測試(--squeeze-kdj-filters)：你目前實盤的固定設定在2018年起的長回測是賠的(PF約0.70，2018、2022空頭年最差)，訊號又多到一半排不到名額，所以測「加一個濾網挑比較好的訊號」有沒有用。為了不重蹈1440組網格過度擬合的覆轍，只測事先寫死的4個變體：F0不加濾網(基準)、F1大盤濾網(觸發K棒那天加權指數^TWII收盤在60日均線/季線之上才進場)、F2個股趨勢濾網(那檔股票收盤在自己120日均線/半年線之上才進場)、F3兩個都要。執行設定固定成你實際打算的：1口、最多同時持有2檔(另外跑1檔當敏感度對照，不參與挑選)、限價1檔不追價、top_n=3、出場沿用固定設定(B停損1.0/停利3.0倍ATR、ATR14、最長20天)。規則事先定好：挑選期2018-01-01~2022-12-31、驗證期2023-01-01之後各自獨立重跑；只看挑選期，交易筆數>=60的變體裡挑PF最高的一個；選定後才看驗證期，驗證期PF>1、bootstrap正報酬比例>80%、PF比F0高，三個都成立才算通過；另外列出每個濾網跟F0比「勝率、PF在兩段是不是都變好」。⚠️請搭配「回測起始日期」(start_date)=2018-01-01、掃描股票數量(max_stocks)=0執行，起始日期晚於2018-06會在summary最上面警告這次測試無效。指數抓不到^TWII時依序改用0050.TW、台積電2330當代理並明確警告。股價跟指數會往前多抓200個日曆天當均線暖身(第一次執行會重新下載一次股價)。輸出squeeze_kdj_filters_summary.csv/squeeze_kdj_filters_yearly.csv/squeeze_kdj_filters_trades.csv(中文欄名)+summary.txt。跟squeeze_kdj_only/squeeze_kdj_capital_constrained/squeeze_kdj_grid/squeeze_kdj_fixed互斥(main()依序檢查，那幾個若同時開啟會先執行並直接return，這個選項就不會執行)'
+        required: false
+        default: 'false'
 
 jobs:
   backtest:
@@ -174,6 +178,9 @@ jobs:
           fi
           if [ "${{ github.event.inputs.squeeze_kdj_fixed }}" = "true" ]; then
             ARGS="$ARGS --squeeze-kdj-fixed"
+          fi
+          if [ "${{ github.event.inputs.squeeze_kdj_filters }}" = "true" ]; then
+            ARGS="$ARGS --squeeze-kdj-filters"
           fi
           python compare_breakout.py $ARGS
 
