@@ -61,6 +61,7 @@ jobs:
         env:
           AS_OF: ${{ github.event.inputs.as_of }}
           CAPITAL: ${{ github.event.inputs.capital }}
+          SIGNALS_LINK: ${{ github.server_url }}/${{ github.repository }}/blob/${{ github.ref_name }}/signals/latest.md
         run: |
           ARGS="--output-dir signals"
           if [ -n "$AS_OF" ]; then
@@ -70,6 +71,31 @@ jobs:
             ARGS="$ARGS --capital $CAPITAL"
           fi
           python daily_squeeze_signals.py $ARGS
+
+      # Telegram推播：需要在repo的 Settings → Secrets and variables → Actions 新增兩個secret：
+      #   TELEGRAM_BOT_TOKEN(@BotFather給的機器人金鑰)、TELEGRAM_CHAT_ID(你的聊天ID)。
+      # 沒設定時這一步直接略過，不影響掃描本身。訊息用純文字送出(不設parse_mode)，避免特殊字元出錯。
+      # 放在commit之前：就算之後commit/push失敗，推播一樣已經送出。
+      - name: Send Telegram message
+        continue-on-error: true
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          if [ -z "$TELEGRAM_BOT_TOKEN" ] || [ -z "$TELEGRAM_CHAT_ID" ]; then
+            echo "沒有設定TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID，略過Telegram推播"
+            exit 0
+          fi
+          RESP=$(curl -sS -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
+            --data-urlencode "text@signals/telegram.txt" \
+            --data-urlencode "disable_web_page_preview=true")
+          if echo "$RESP" | grep -q '"ok":true'; then
+            echo "Telegram推播成功"
+          else
+            echo "Telegram推播失敗(Telegram回應)：$RESP"
+            exit 1
+          fi
 
       - name: Commit signals back to repo
         env:
