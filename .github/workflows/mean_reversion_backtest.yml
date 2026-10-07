@@ -82,6 +82,7 @@ on:
           stops = 事先登錄的停損寬度N1~N3/S1~S3小測試(--squeeze-kdj-stops，start_date必須2018-01-01、max_stocks設0)
           exits = 以N2為基準的出場方式E0~E4小測試(--squeeze-kdj-exits，start_date必須2018-01-01、max_stocks設0)
           stop_target_grid = 停損1.0/1.5/2.0 x 停利2.0/3.0/4.0倍ATR的3x3穩健度地圖+高原檢查(--squeeze-kdj-stop-target-grid，start_date必須2018-01-01、max_stocks設0)
+          execution = 不追價的代價：進場成交方式X0收盤+1檔(目前習慣)/X1收盤+2檔/X2收盤x1.01/X3開盤全買 x 基準B2(停利3.0倍、2檔)/B1(停利4.0倍、1檔)+開盤跳空分組(--squeeze-kdj-execution，start_date必須2018-01-01、max_stocks設0)
         required: false
         type: choice
         default: 'none'
@@ -95,8 +96,9 @@ on:
           - stops
           - exits
           - stop_target_grid
+          - execution
       commission_per_lot_side:
-        description: '每口單邊手續費(新台幣)：進場、出場各付一次，預設50代表一口來回100元；如果你的50元已經是來回，請填25。目前只有squeeze_mode=stops/exits/stop_target_grid使用，其他模式仍是舊假設200元/口/單邊'
+        description: '每口單邊手續費(新台幣)：進場、出場各付一次，預設50代表一口來回100元；如果你的50元已經是來回，請填25。目前只有squeeze_mode=stops/exits/stop_target_grid/execution使用，其他模式仍是舊假設200元/口/單邊'
         required: false
         default: '50'
 
@@ -185,6 +187,7 @@ jobs:
             stops) ARGS="$ARGS --squeeze-kdj-stops" ;;
             exits) ARGS="$ARGS --squeeze-kdj-exits" ;;
             stop_target_grid) ARGS="$ARGS --squeeze-kdj-stop-target-grid" ;;
+            execution) ARGS="$ARGS --squeeze-kdj-execution" ;;
             *) echo "未知的squeeze_mode：${{ github.event.inputs.squeeze_mode }}"; exit 1 ;;
           esac
           if [ -n "${{ github.event.inputs.commission_per_lot_side }}" ]; then
