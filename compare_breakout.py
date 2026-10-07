@@ -132,6 +132,7 @@ compare_breakout.py
     python3 compare_breakout.py --use-trailing-stop --walkforward-folds 3
     python3 compare_breakout.py --squeeze-kdj-grid --max-stocks 50   # squeeze+KDJ混搭網格(1440組，只用IS選贏家)
     python3 compare_breakout.py --squeeze-kdj-fixed --start 2018-01-01 --max-stocks 0   # 選定的固定設定長歷史+限價1檔成交
+    python3 compare_breakout.py --squeeze-kdj-stop-target-grid --start 2018-01-01 --max-stocks 0   # 停損x停利3x3穩健度地圖
 
 ⚠️ 誠實揭露：跟 mean_reversion_engine.py 共用的已知限制(結算日近似、大盤氛圍濾網用0050
 代理、跌停鎖死/注意股處置股未實作、倖存者偏差、保證金追繳/強制斷頭沒有完整模擬)在這裡
@@ -3695,6 +3696,492 @@ def run_squeeze_kdj_exits_mode(args, price_data, universe, master_calendar):
             "validity_warnings": validity, "commission_per_lot_side": commission, "futures_tax_rate": tax_rate}
 
 
+# ============================================================================
+# --squeeze-kdj-stop-target-grid：事先登錄(pre-registered)的「停損 x 停利」3x3穩健度地圖
+#
+# 背景：--squeeze-kdj-stops在真實資料(249檔、2018-01~2026-10、1口、最多2檔、限價1檔、手續費50元/口/單邊
+# +期交稅)選出N2(停損1.5倍ATR／停利3.0倍ATR、不加濾網)，兩段都贏過目前實盤的N1(1.0/3.0)；
+# --squeeze-kdj-exits只動N2的停利(2.25倍/4.5倍)，結果各自在一段變好、另一段變差。
+# 使用者想把停損跟停利「一起」動。這裡刻意把它當成「穩健度地圖」而不是找最佳格：
+# 一個值得信任的設定應該坐落在一片「兩段都好」的高原上，而不是一座四周都很差的孤峰。
+#   1. 3x3格子(停損1.0/1.5/2.0倍ATR x 停利2.0/3.0/4.0倍ATR)，事先寫死，沒有其他參數；
+#      其餘設定跟--squeeze-kdj-stops完全相同(變體B、不加濾網、ATR14、最長20天、觸發K棒漲幅排名、top_n=3、
+#      1口、最多2檔+1檔敏感度對照、限價1檔、使用者手續費/期交稅)；
+#   2. 挑選期(2018-01-01~2022-12-31)、驗證期(2023-01-01~結束)各自從空帳戶獨立重跑；
+#   3. 挑選規則：只看挑選期、最多2檔：挑選期交易筆數>=60的格子裡挑選期PF最高者(同分比挑選期總損益，
+#      再同分依「停損由小到大、再停利由小到大」的順序)；
+#   4. 通過標準(只判定選出的那格)：驗證期PF>1、驗證期bootstrap正報酬>80%、驗證期PF比G15_30(=N2)高；
+#   5. 高原檢查(也是事先登錄)：每格算「自己+上下左右存在的鄰格」的平均PF(挑選期、驗證期各一個)，
+#      自己的PF跟鄰域平均PF在兩段都>1的格子才算「在高原上」——最多2檔、最多1檔各算一次。
+# 這張圖跟之前的模式有重疊：G10_30=N1(目前實盤)、G15_30=N2=E0、G20_30=N3；累計在同一份資料上已經比較了
+# 約25個變體(濾網4+停損6+出場5+這次9)，多重比較的問題越來越大，最有用的讀法是「地圖的形狀」，不是最好那一格。
+# ============================================================================
+
+SQUEEZE_KDJ_ST_GRID_STOP_MULTS = (1.0, 1.5, 2.0)    # 列(由上到下)
+SQUEEZE_KDJ_ST_GRID_TARGET_MULTS = (2.0, 3.0, 4.0)  # 欄(由左到右)
+SQUEEZE_KDJ_ST_GRID_BASELINE = "G15_30"   # =N2，通過標準的比較基準
+SQUEEZE_KDJ_ST_GRID_LIVE = "G10_30"       # =N1，目前實盤設定
+SQUEEZE_KDJ_ST_GRID_PRIOR_NAMES = {"G10_30": "N1(目前實盤)", "G15_30": "N2=E0", "G20_30": "N3"}
+SQUEEZE_KDJ_ST_GRID_CUMULATIVE_VARIANTS = 4 + 6 + 5 + 9  # 濾網+停損+出場+這次
+
+
+def squeeze_kdj_stop_target_cell_id(stop_mult: float, target_mult: float) -> str:
+    """G{停損x10}_{停利x10}，例如停損1.0、停利2.0 → G10_20。"""
+    return f"G{int(round(stop_mult * 10))}_{int(round(target_mult * 10))}"
+
+
+SQUEEZE_KDJ_ST_GRID_CELLS = tuple(
+    (squeeze_kdj_stop_target_cell_id(s, t), s, t)
+    for s in SQUEEZE_KDJ_ST_GRID_STOP_MULTS for t in SQUEEZE_KDJ_ST_GRID_TARGET_MULTS)
+SQUEEZE_KDJ_ST_GRID_SELECTABLE = tuple(c[0] for c in SQUEEZE_KDJ_ST_GRID_CELLS)  # 順序 = 同分時的優先順序
+
+
+def _squeeze_kdj_st_cell(cid: str) -> tuple:
+    for c in SQUEEZE_KDJ_ST_GRID_CELLS:
+        if c[0] == cid:
+            return c
+    raise KeyError(cid)
+
+
+def squeeze_kdj_stop_target_cell_name(cid: str) -> str:
+    _, s, t = _squeeze_kdj_st_cell(cid)
+    return f"stop{s:.1f}_target{t:.1f}"
+
+
+def squeeze_kdj_stop_target_cell_label(cid: str) -> str:
+    _, s, t = _squeeze_kdj_st_cell(cid)
+    tag = {SQUEEZE_KDJ_ST_GRID_BASELINE: ",基準N2", SQUEEZE_KDJ_ST_GRID_LIVE: ",實盤"}.get(cid, "")
+    return f"{cid}(停損{s:.1f}/停利{t:.1f}{tag})"
+
+
+def squeeze_kdj_stop_target_neighbors(cid: str) -> list:
+    """上下左右「存在」的鄰格(角落2個、邊3個、中間4個)，順序：上、下、左、右。"""
+    _, s, t = _squeeze_kdj_st_cell(cid)
+    i, j = SQUEEZE_KDJ_ST_GRID_STOP_MULTS.index(s), SQUEEZE_KDJ_ST_GRID_TARGET_MULTS.index(t)
+    out = []
+    for di, dj in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+        ii, jj = i + di, j + dj
+        if 0 <= ii < len(SQUEEZE_KDJ_ST_GRID_STOP_MULTS) and 0 <= jj < len(SQUEEZE_KDJ_ST_GRID_TARGET_MULTS):
+            out.append(squeeze_kdj_stop_target_cell_id(SQUEEZE_KDJ_ST_GRID_STOP_MULTS[ii],
+                                                       SQUEEZE_KDJ_ST_GRID_TARGET_MULTS[jj]))
+    return out
+
+
+def squeeze_kdj_stop_target_plateau(pf_by_cell: dict) -> dict:
+    """
+    事先登錄的高原檢查。pf_by_cell：{格子代號: {"train": 挑選期PF, "test": 驗證期PF}}(9格都要有)。
+    每格的鄰域 = 自己 + 上下左右存在的鄰格(角落共3格、邊共4格、中間共5格)，鄰域平均PF = 這些格子PF的
+    算術平均(某格PF是inf——只有賺沒有賠——平均也會是inf，照樣算>1)。
+    「在高原上」= 自己的PF>1 且 鄰域平均PF>1，挑選期、驗證期兩段都要成立。
+    回傳 {格子代號: {"neighbors", "n_cells", "own_train", "own_test", "nbhd_train", "nbhd_test", "plateau"}}。
+    """
+    out = {}
+    for cid in SQUEEZE_KDJ_ST_GRID_SELECTABLE:
+        nb = squeeze_kdj_stop_target_neighbors(cid)
+        members = [cid] + nb
+        row = {"neighbors": nb, "n_cells": len(members)}
+        for period in ("train", "test"):
+            row[f"own_{period}"] = float(pf_by_cell[cid][period])
+            row[f"nbhd_{period}"] = float(np.mean([float(pf_by_cell[m][period]) for m in members]))
+        row["plateau"] = all(row[f"{k}_{p}"] > 1.0 for k in ("own", "nbhd") for p in ("train", "test"))
+        out[cid] = row
+    return out
+
+
+def _squeeze_kdj_st_plateau_from_results(by_cell: dict) -> dict:
+    return squeeze_kdj_stop_target_plateau(
+        {cid: {p: by_cell[cid][p]["stats"]["profit_factor"] for p in ("train", "test")}
+         for cid in SQUEEZE_KDJ_ST_GRID_SELECTABLE})
+
+
+def run_squeeze_kdj_stop_target_grid_backtests(price_data: dict, universe: dict, starting_capital: float,
+                                               master_calendar, commission_per_lot_side: float,
+                                               futures_tax_rate: float,
+                                               max_positions_list=(SQUEEZE_KDJ_FILTER_MAX_POSITIONS,
+                                                                   SQUEEZE_KDJ_FILTER_SENSITIVITY_MAX_POSITIONS),
+                                               cell_ids=None, features_by_code: dict = None,
+                                               precomputed: dict = None) -> dict:
+    """--squeeze-kdj-stop-target-grid的計算核心(不寫檔，方便測試)：跟--squeeze-kdj-stops/--squeeze-kdj-exits
+    同一個共用迴圈(_run_squeeze_kdj_preregistered_cost_backtests)，變體換成3x3的9格(不加濾網)。
+    回傳 {max_pos: {格子代號: {"train": {...}, "test": {...}}}}。"""
+    cell_ids = list(cell_ids) if cell_ids is not None else list(SQUEEZE_KDJ_ST_GRID_SELECTABLE)
+    specs = []
+    for cid in cell_ids:
+        _, s, t = _squeeze_kdj_st_cell(cid)
+        specs.append((cid, dict(atr_stop_mult=s, atr_target_mult=t, entry_filter=None)))
+    return _run_squeeze_kdj_preregistered_cost_backtests(
+        price_data, universe, starting_capital, master_calendar, commission_per_lot_side, futures_tax_rate,
+        max_positions_list, specs, SQUEEZE_KDJ_STOPS_EXIT_REASONS, features_by_code, precomputed)
+
+
+def select_squeeze_kdj_stop_target_cell(train_stats_by_cell: dict,
+                                        min_trades: int = SQUEEZE_KDJ_FILTER_MIN_TRAIN_TRADES):
+    """事先登錄的挑選規則(同select_squeeze_kdj_filter_variant())：只看挑選期統計，9格裡挑選期筆數>=60者
+    PF最高勝出；同分比挑選期總損益，再同分依停損由小到大、停利由小到大(G10_20→G10_30→…→G20_40)。"""
+    return select_squeeze_kdj_filter_variant(
+        {cid: st for cid, st in train_stats_by_cell.items() if cid in SQUEEZE_KDJ_ST_GRID_SELECTABLE},
+        min_trades=min_trades, order=SQUEEZE_KDJ_ST_GRID_SELECTABLE)
+
+
+def squeeze_kdj_stop_target_verdict(selected, test_by_cell: dict) -> dict:
+    """事先登錄的通過標準：驗證期PF>1、bootstrap正報酬比例>80%、驗證期PF比G15_30(=N2)高。"""
+    verdict = _squeeze_kdj_preregistered_verdict(
+        selected, test_by_cell, SQUEEZE_KDJ_ST_GRID_BASELINE, squeeze_kdj_stop_target_cell_label,
+        "G15_30(=N2：停損1.5倍、停利3.0倍)",
+        "❌ 不通過：挑選期PF最高的就是G15_30(=N2)本身——9格裡沒有任何一格在挑選期勝過N2，"
+        "依事先登錄的規則，這張圖沒有找到比N2更好的停損/停利組合(N2本身相對實盤仍只是「兩段都贏」、"
+        "沒有通過正式驗證，見--squeeze-kdj-stops)。")
+    if selected == SQUEEZE_KDJ_ST_GRID_LIVE:
+        verdict["text"] += "(注意：選出的G10_30就是目前實盤設定N1。)"
+    return verdict
+
+
+def squeeze_kdj_stop_target_improvement_table(by_cell: dict, baseline: str) -> list:
+    """「兩段都變好」：其他8格各自跟baseline(G15_30或G10_30)比勝率、PF(挑選期、驗證期)。"""
+    return squeeze_kdj_filter_improvement_table(
+        by_cell, variant_ids=[c for c in SQUEEZE_KDJ_ST_GRID_SELECTABLE if c != baseline], baseline=baseline)
+
+
+def squeeze_kdj_stop_target_summary_frame(results: dict, selected, commission_per_lot_side: float,
+                                          futures_tax_rate: float, plateaus: dict = None) -> pd.DataFrame:
+    """squeeze_kdj_stop_target_grid_summary.csv：格子 x 期間 x 最多持倉數，每列一組回測(欄位跟stops模式同一套)，
+    另外加上9年合計(挑選期+驗證期)與高原檢查欄位。"""
+    def prefix(cid):
+        _, s, t = _squeeze_kdj_st_cell(cid)
+        return {"變體名稱": squeeze_kdj_stop_target_cell_name(cid), "可被挑選": cid in SQUEEZE_KDJ_ST_GRID_SELECTABLE,
+                "停損ATR倍數": s, "停利ATR倍數": t, "進場濾網": SQUEEZE_KDJ_ENTRY_FILTER_LABELS[None],
+                "是否基準(G15_30=N2)": cid == SQUEEZE_KDJ_ST_GRID_BASELINE,
+                "是否目前實盤(G10_30=N1)": cid == SQUEEZE_KDJ_ST_GRID_LIVE,
+                "之前模式對應": SQUEEZE_KDJ_ST_GRID_PRIOR_NAMES.get(cid, "")}
+    df = _squeeze_kdj_cost_summary_frame(results, selected, commission_per_lot_side, futures_tax_rate,
+                                         prefix, SQUEEZE_KDJ_STOPS_EXIT_REASONS)
+    if df.empty:
+        return df
+    plateaus = plateaus if plateaus is not None else {
+        mp: _squeeze_kdj_st_plateau_from_results(by) for mp, by in results.items()
+        if set(SQUEEZE_KDJ_ST_GRID_SELECTABLE) <= set(by)}
+    total = {(mp, cid): sum(by[cid][p]["stats"]["total_pnl_ntd"] for p in ("train", "test"))
+             for mp, by in results.items() for cid in by}
+    keys = list(zip(df["最多同時持倉數"], df["變體代號"]))
+    df["9年合計損益(NT$，挑選期+驗證期)"] = [total[k] for k in keys]
+    df["鄰域平均PF_挑選期"] = [plateaus[mp][cid]["nbhd_train"] if mp in plateaus else np.nan for mp, cid in keys]
+    df["鄰域平均PF_驗證期"] = [plateaus[mp][cid]["nbhd_test"] if mp in plateaus else np.nan for mp, cid in keys]
+    df["鄰域格數(含自己)"] = [plateaus[mp][cid]["n_cells"] if mp in plateaus else np.nan for mp, cid in keys]
+    df["在高原上(自己+鄰域兩段PF都>1)"] = [bool(plateaus[mp][cid]["plateau"]) if mp in plateaus else False
+                                   for mp, cid in keys]
+    return df
+
+
+def squeeze_kdj_stop_target_yearly_frame(results: dict, starting_capital: float) -> pd.DataFrame:
+    return squeeze_kdj_stops_yearly_frame(results, starting_capital, name_fn=squeeze_kdj_stop_target_cell_name)
+
+
+def squeeze_kdj_stop_target_trades_frame(results: dict) -> pd.DataFrame:
+    return squeeze_kdj_stops_trades_frame(results, name_fn=squeeze_kdj_stop_target_cell_name)
+
+
+def _fmt_st_heatmap(title: str, by_cell: dict, value_fn, marks: dict = None, width: int = 13) -> list:
+    """文字熱度圖：列 = 停損倍數(由上到下1.0/1.5/2.0)、欄 = 停利倍數(由左到右2.0/3.0/4.0)。
+    value_fn(格子代號, 該格結果) -> 字串；marks：{格子代號: 標記字元}(加在數值後面)。"""
+    marks = marks or {}
+    head = "  " + _disp_ljust("停損\\停利", 10) + "".join(
+        _disp_rjust(f"{t:.1f}倍", width) for t in SQUEEZE_KDJ_ST_GRID_TARGET_MULTS)
+    lines = [f"  ▸ {title}", head]
+    for s in SQUEEZE_KDJ_ST_GRID_STOP_MULTS:
+        row = "  " + _disp_ljust(f"{s:.1f}倍", 10)
+        for t in SQUEEZE_KDJ_ST_GRID_TARGET_MULTS:
+            cid = squeeze_kdj_stop_target_cell_id(s, t)
+            cell = value_fn(cid, by_cell[cid]) + marks.get(cid, " ")
+            row += _disp_rjust(cell, width)
+        lines.append(row)
+    return lines
+
+
+def _disp_width(text: str) -> int:
+    """等寬字型下的顯示寬度：中文/全形字算2格。"""
+    import unicodedata
+    return sum(2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1 for ch in text)
+
+
+def _disp_rjust(text: str, width: int) -> str:
+    return " " * max(0, width - _disp_width(text)) + text
+
+
+def _disp_ljust(text: str, width: int) -> str:
+    return text + " " * max(0, width - _disp_width(text))
+
+
+def _st_grid_marks(selected) -> dict:
+    marks = {SQUEEZE_KDJ_ST_GRID_LIVE: "L", SQUEEZE_KDJ_ST_GRID_BASELINE: "b"}
+    if selected:
+        marks[selected] = "*"
+    return marks
+
+
+def _st_grid_heatmap_block(by_cell: dict, marks: dict) -> list:
+    def st(p, k):
+        return lambda cid, r: r[p]["stats"][k]
+    lines = []
+    lines += _fmt_st_heatmap("挑選期PF", by_cell, lambda c, r: _fmt_pf(st("train", "profit_factor")(c, r)), marks)
+    lines += _fmt_st_heatmap("驗證期PF", by_cell, lambda c, r: _fmt_pf(st("test", "profit_factor")(c, r)), marks)
+    lines += _fmt_st_heatmap("挑選期總損益(NT$)", by_cell,
+                             lambda c, r: f"{st('train', 'total_pnl_ntd')(c, r):,.0f}", marks)
+    lines += _fmt_st_heatmap("驗證期總損益(NT$)", by_cell,
+                             lambda c, r: f"{st('test', 'total_pnl_ntd')(c, r):,.0f}", marks)
+    lines += _fmt_st_heatmap("9年合計損益(NT$，挑選期+驗證期)", by_cell,
+                             lambda c, r: f"{r['train']['stats']['total_pnl_ntd'] + r['test']['stats']['total_pnl_ntd']:,.0f}",
+                             marks)
+    lines += _fmt_st_heatmap("勝率%(挑選期/驗證期)", by_cell,
+                             lambda c, r: f"{r['train']['stats']['win_rate']:.1f}/{r['test']['stats']['win_rate']:.1f}",
+                             marks)
+    lines += _fmt_st_heatmap("交易筆數(挑選期/驗證期)", by_cell,
+                             lambda c, r: f"{r['train']['stats']['trade_count']}/{r['test']['stats']['trade_count']}",
+                             marks)
+    lines += _fmt_st_heatmap("驗證期bootstrap正報酬比例%", by_cell,
+                             lambda c, r: f"{r['test']['bootstrap']['pct_positive']:.1f}", marks)
+    return lines
+
+
+def _st_plateau_block(plateau: dict) -> list:
+    lines = []
+    lines += _fmt_st_heatmap("鄰域平均PF(挑選期)", plateau, lambda c, r: _fmt_pf(r["nbhd_train"]))
+    lines += _fmt_st_heatmap("鄰域平均PF(驗證期)", plateau, lambda c, r: _fmt_pf(r["nbhd_test"]))
+    lines += _fmt_st_heatmap("在高原上？(自己+鄰域、兩段PF都>1)", plateau,
+                             lambda c, r: "高原" if r["plateau"] else "－")
+    cells = [c for c in SQUEEZE_KDJ_ST_GRID_SELECTABLE if plateau[c]["plateau"]]
+    lines.append("  在高原上的格子：" + ("、".join(squeeze_kdj_stop_target_cell_label(c) for c in cells)
+                                   if cells else "沒有任何一格"))
+    for cid in SQUEEZE_KDJ_ST_GRID_SELECTABLE:
+        r = plateau[cid]
+        lines.append(f"    {_disp_ljust(squeeze_kdj_stop_target_cell_label(cid), 32)}鄰格{'、'.join(r['neighbors'])}"
+                     f"(含自己{r['n_cells']}格)｜自己PF 挑選期{_fmt_pf(r['own_train'])}/驗證期{_fmt_pf(r['own_test'])}"
+                     f"｜鄰域平均PF 挑選期{_fmt_pf(r['nbhd_train'])}/驗證期{_fmt_pf(r['nbhd_test'])}"
+                     f"｜{'✅高原' if r['plateau'] else '❌'}")
+    return lines
+
+
+SQUEEZE_KDJ_ST_GRID_PLATEAU_EXPLANATION = (
+    "  白話：一個穩健的設定應該坐落在「高原」上——不只自己這格兩段都賺(PF>1)，旁邊停損或停利稍微改一檔的格子"
+    "平均起來也賺。如果最好的那一格四周都是PF<1(孤峰)，它很可能只是剛好對到這段資料的雜訊：實盤時停損/停利"
+    "稍微偏一點、或市場稍微變一點，就會從峰頂掉下去。所以這張圖要看的是「哪一片區域兩段都好」，"
+    "不是「哪一格數字最大」。")
+
+SQUEEZE_KDJ_ST_GRID_CAVEATS_TEXT = (
+    "【誠實caveat】\n"
+    f"  - 累計多重比較：這9格裡G10_30/G15_30/G20_30就是--squeeze-kdj-stops的N1/N2/N3(G15_30也=--squeeze-kdj-exits的E0)，"
+    f"在同一份資料(2018~2026、同一批股票)上累計已經比較了約{SQUEEZE_KDJ_ST_GRID_CUMULATIVE_VARIANTS}個變體"
+    "(濾網4+停損6+出場5+這次9)，而且之前的結果已經看過才決定測這張圖——就算停損/停利完全沒差，"
+    "這麼多組裡挑一組，驗證期也很可能剛好比基準好。所以「最好那一格」的數字最不可信，地圖的形狀(高原在哪)比較有參考價值。\n"
+    "  - 驗證期(2023-01-01之後)不是全新資料：N2是看過驗證期之後才拿來當基準的，"
+    "停利3.0倍、最長20天這組基本設定也是看過2023-10-06之後的1440組網格結果才選的，驗證期對全部格子都偏樂觀——"
+    "「格子之間的比較」比「驗證期PF的絕對水準」可信。\n"
+    "  - 停損越寬、每筆風險越大(1口固定，停損距離 x 合約乘數)；停利越遠，到期出場越多。PF相近的兩格，"
+    "每筆風險跟資金曲線可能差很多。\n"
+    "  - 倖存者偏差：標的清單是「今天」的股票期貨清單，這些年下市/被剔除的不在裡面，很多股票2018年還沒有股票期貨。\n"
+    "  - 價格是標的「股票」的yfinance日K(未還原權值)，拿來代理股票期貨：基差、期貨本身的流動性/買賣價差都沒有模擬。\n"
+    "  - 交易成本是假設值：手續費依你給的每口單邊金額，期交稅是我們理解的十萬分之二(每邊)；"
+    "限價1檔模型的進場/市價出場滑價已另外算在成交價裡。\n"
+    "  - 停損風險(NT$)是「照停損價出場」的價差虧損，跳空停損(開盤就跌破停損)實際會賠得更多。\n"
+    "  - 各段是獨立重跑(從空帳戶開始)：段尾還沒出場的部位不計入，段首不會有前一段遺留的持倉；"
+    "「9年合計」= 兩段各自獨立回測的損益相加，不是一條連續的資金曲線。\n"
+    "  - bootstrap假設每筆交易獨立，空頭年連續虧損成串出現的風險會被低估；80%是寬鬆門檻。"
+)
+
+
+def run_squeeze_kdj_stop_target_grid_mode(args, price_data, universe, master_calendar):
+    """
+    --squeeze-kdj-stop-target-grid模式：事先登錄的「停損 x 停利」3x3穩健度地圖
+    (停損1.0/1.5/2.0倍ATR x 停利2.0/3.0/4.0倍ATR，不加濾網)，見SQUEEZE_KDJ_ST_GRID_CELLS上方說明。
+    執行設定、期間、挑選規則跟--squeeze-kdj-stops相同；通過標準的比較基準是G15_30(=N2)，G10_30標成目前實盤。
+    另外做事先登錄的高原檢查(每格+上下左右鄰格的平均PF)。交易成本用args.commission_per_lot_side/
+    args.futures_tax_rate。不需要大盤指數。master_calendar：已從--start開始(main()切掉暖身資料)。
+    輸出squeeze_kdj_stop_target_grid_summary.csv/_yearly.csv/_trades.csv+summary.txt。
+    跟其他squeeze模式一樣跳過完整6階段流程。
+    """
+    print("=" * 100)
+    print("--squeeze-kdj-stop-target-grid模式：squeeze+KDJ事先登錄的停損x停利3x3穩健度地圖(9格)")
+    print("=" * 100, flush=True)
+    starting_capital = args.starting_capital
+    commission = getattr(args, "commission_per_lot_side", None)
+    commission = SQUEEZE_KDJ_STOPS_DEFAULT_COMMISSION_PER_LOT_SIDE if commission is None else float(commission)
+    tax_rate = getattr(args, "futures_tax_rate", None)
+    tax_rate = SQUEEZE_KDJ_STOPS_DEFAULT_FUTURES_TAX_RATE if tax_rate is None else float(tax_rate)
+
+    train_cal, test_cal = split_squeeze_kdj_filter_periods(master_calendar)
+    validity = squeeze_kdj_filter_validity_warnings(args.start, train_cal, test_cal)
+
+    results = run_squeeze_kdj_stop_target_grid_backtests(price_data, universe, starting_capital, master_calendar,
+                                                         commission, tax_rate)
+    main_res = results[SQUEEZE_KDJ_FILTER_MAX_POSITIONS]
+    selected, selection_reason = select_squeeze_kdj_stop_target_cell(
+        {cid: main_res[cid]["train"]["stats"] for cid in SQUEEZE_KDJ_ST_GRID_SELECTABLE})
+    verdict = squeeze_kdj_stop_target_verdict(selected, {cid: main_res[cid]["test"] for cid in main_res})
+    improvements = {base: squeeze_kdj_stop_target_improvement_table(main_res, base)
+                    for base in (SQUEEZE_KDJ_ST_GRID_BASELINE, SQUEEZE_KDJ_ST_GRID_LIVE)}
+    plateaus = {mp: _squeeze_kdj_st_plateau_from_results(by) for mp, by in results.items()}
+
+    squeeze_kdj_stop_target_summary_frame(results, selected, commission, tax_rate, plateaus).to_csv(
+        os.path.join(RESULTS_DIR, "squeeze_kdj_stop_target_grid_summary.csv"), index=False, encoding="utf-8-sig")
+    squeeze_kdj_stop_target_yearly_frame(results, starting_capital).to_csv(
+        os.path.join(RESULTS_DIR, "squeeze_kdj_stop_target_grid_yearly.csv"), index=False, encoding="utf-8-sig")
+    squeeze_kdj_stop_target_trades_frame(results).to_csv(
+        os.path.join(RESULTS_DIR, "squeeze_kdj_stop_target_grid_trades.csv"), index=False, encoding="utf-8-sig")
+
+    s = SQUEEZE_KDJ_FIXED_SETTING
+    cal = pd.DatetimeIndex(master_calendar)
+    marks = _st_grid_marks(selected)
+    lines = [
+        "=" * 100,
+        "布林+Keltner擠壓+KDJ訊號 --squeeze-kdj-stop-target-grid模式(停損 x 停利 3x3穩健度地圖，9格，事先登錄)",
+        f"回測期間：{args.start} ~ {args.end}(實際交易日曆：{cal[0].date() if len(cal) else '無'} ~ "
+        f"{cal[-1].date() if len(cal) else '無'}，{len(cal)}個交易日)　起始資金：NT${starting_capital:,.0f}"
+        f"　標的數：{len(universe)}",
+        f"固定執行設定(全部格子相同)：不加進場濾網｜{describe_squeeze_kdj_stops_execution(commission, tax_rate)}",
+        "=" * 100,
+    ]
+    if validity:
+        lines += [
+            "",
+            "!" * 100,
+            "⚠️⚠️⚠️ 這次測試無效 ⚠️⚠️⚠️：" + "；".join(validity) + "。",
+            "請把GitHub Actions的「回測起始日期」(start_date)設成2018-01-01、掃描股票數量(max_stocks)設成0重跑。"
+            "下面的數字只能看看，不能拿來決定要不要改停損/停利。",
+            "!" * 100,
+        ]
+
+    grid_desc = "、".join(squeeze_kdj_stop_target_cell_label(c) for c in SQUEEZE_KDJ_ST_GRID_SELECTABLE)
+    lines += [
+        "",
+        "【事先登錄的規則(在看任何結果之前就定好，程式機械式執行，不會因為結果改規則)】",
+        f"  格子：停損{'/'.join(f'{x:.1f}' for x in SQUEEZE_KDJ_ST_GRID_STOP_MULTS)}倍ATR x "
+        f"停利{'/'.join(f'{x:.1f}' for x in SQUEEZE_KDJ_ST_GRID_TARGET_MULTS)}倍ATR = 9格(全部可以被挑選，不加濾網，"
+        "沒有其他參數)。代號G{停損x10}_{停利x10}，例如G10_20 = 停損1.0倍、停利2.0倍。",
+        f"    {grid_desc}",
+        f"  基準：{SQUEEZE_KDJ_ST_GRID_BASELINE}(=N2，停損1.5倍/停利3.0倍)；{SQUEEZE_KDJ_ST_GRID_LIVE}(=N1)是目前實盤設定，另外標出來對照。",
+        "  跟之前模式重疊：G10_30=N1、G15_30=N2(=E0)、G20_30=N3已經在--squeeze-kdj-stops/--squeeze-kdj-exits測過；"
+        f"在同一份資料上累計比較的變體已經約{SQUEEZE_KDJ_ST_GRID_CUMULATIVE_VARIANTS}個(濾網4+停損6+出場5+這次9)。"
+        "所以這張圖最有用的讀法是「地圖的形狀」(哪一片區域兩段都好)，不是最好的那一格。",
+        f"  期間：挑選期 {SQUEEZE_KDJ_FILTER_TRAIN_START}~{SQUEEZE_KDJ_FILTER_TRAIN_END}"
+        f"(實際{len(train_cal)}個交易日)；驗證期 {SQUEEZE_KDJ_FILTER_TEST_START}~結束(實際{len(test_cal)}個交易日)。"
+        "兩段各自從空帳戶獨立重跑一次。",
+        f"  挑選規則：只看挑選期、最多同時持有{SQUEEZE_KDJ_FILTER_MAX_POSITIONS}檔的結果。9格裡挑選期交易筆數"
+        f">={SQUEEZE_KDJ_FILTER_MIN_TRAIN_TRADES}的，挑選期PF最高者勝出(同分比挑選期總損益，再同分依停損由小到大、"
+        "停利由小到大的順序)。選定之後才看驗證期。",
+        f"  通過標準(只判定選出的那一格)：驗證期PF>1 且 驗證期bootstrap(1000次、seed=42)正報酬比例>"
+        f"{SQUEEZE_KDJ_BOOTSTRAP_PASS_PCT_POSITIVE:.0f}% 且 驗證期PF比{SQUEEZE_KDJ_ST_GRID_BASELINE}(=N2)高。三個都成立才算「通過」。",
+        "  高原檢查(事先登錄)：每一格的「鄰域」= 自己 + 上下左右存在的鄰格(角落3格、邊4格、中間5格)，"
+        "分別算挑選期、驗證期的鄰域平均PF(算術平均)。自己的PF>1 且 鄰域平均PF>1，兩段都成立，才算「在高原上」。"
+        f"最多{SQUEEZE_KDJ_FILTER_MAX_POSITIONS}檔、最多{SQUEEZE_KDJ_FILTER_SENSITIVITY_MAX_POSITIONS}檔各算一次。",
+        SQUEEZE_KDJ_ST_GRID_PLATEAU_EXPLANATION,
+        f"  最多同時持有{SQUEEZE_KDJ_FILTER_SENSITIVITY_MAX_POSITIONS}檔的結果只當敏感度對照，不參與挑選。",
+        "",
+        "【交易成本假設】",
+        f"  本次：{_fmt_cost_assumption(commission, tax_rate)}。",
+        "  「每口50元」這裡解讀成單邊(一進一出共100元/口)；如果你的50元已經是來回，請把commission_per_lot_side改成25重跑。",
+        "",
+        "#" * 100,
+        "【挑選結果與判定】",
+        "#" * 100,
+        f"  挑選(只看挑選期)：{selection_reason}",
+        f"  → 選出：{squeeze_kdj_stop_target_cell_label(selected) if selected else '無'}",
+    ]
+    if selected:
+        lines.append(f"    挑選期：{_fmt_filter_seg_line(main_res[selected]['train'])}")
+        lines.append(f"    驗證期：{_fmt_filter_seg_line(main_res[selected]['test'])}")
+        lines.append(f"    G15_30驗證期(對照，=N2)：{_fmt_filter_seg_line(main_res[SQUEEZE_KDJ_ST_GRID_BASELINE]['test'])}")
+        lines.append(f"    G10_30驗證期(對照，目前實盤)：{_fmt_filter_seg_line(main_res[SQUEEZE_KDJ_ST_GRID_LIVE]['test'])}")
+    lines.append("  判定條件：")
+    for txt, ok in verdict["checks"]:
+        lines.append(f"    {'✅' if ok else '❌'} {txt}")
+    lines.append(f"  ★ 結論：{verdict['text']}")
+    if selected:
+        on = plateaus[SQUEEZE_KDJ_FILTER_MAX_POSITIONS][selected]["plateau"]
+        lines.append(f"  ★ 選出的{selected}{'在' if on else '不在'}高原上(最多{SQUEEZE_KDJ_FILTER_MAX_POSITIONS}檔)"
+                     + ("" if on else "——就算判定通過，也要當成孤峰看待，不建議直接換。"))
+
+    legend = "  (表內標記：*=挑選規則選中、b=G15_30基準(N2)、L=G10_30目前實盤；列=停損倍數、欄=停利倍數)"
+    for max_pos, title in ((SQUEEZE_KDJ_FILTER_MAX_POSITIONS, "主要：最多同時持有2檔(用來挑選)"),
+                           (SQUEEZE_KDJ_FILTER_SENSITIVITY_MAX_POSITIONS, "敏感度對照：最多同時持有1檔(不用來挑選)")):
+        if max_pos not in results:
+            continue
+        lines += ["", f"【熱度圖｜{title}】", legend]
+        lines += _st_grid_heatmap_block(results[max_pos], marks if max_pos == SQUEEZE_KDJ_FILTER_MAX_POSITIONS
+                                        else {SQUEEZE_KDJ_ST_GRID_LIVE: "L", SQUEEZE_KDJ_ST_GRID_BASELINE: "b"})
+
+    for max_pos, title in ((SQUEEZE_KDJ_FILTER_MAX_POSITIONS, "最多同時持有2檔"),
+                           (SQUEEZE_KDJ_FILTER_SENSITIVITY_MAX_POSITIONS, "最多同時持有1檔(敏感度對照)")):
+        if max_pos not in plateaus:
+            continue
+        lines += ["", f"【高原檢查｜{title}】"]
+        lines += _st_plateau_block(plateaus[max_pos])
+    both = [c for c in SQUEEZE_KDJ_ST_GRID_SELECTABLE
+            if all(plateaus[mp][c]["plateau"] for mp in plateaus)]
+    lines.append("  最多2檔、最多1檔都在高原上的格子：" + ("、".join(both) if both else "沒有任何一格"))
+    lines.append(SQUEEZE_KDJ_ST_GRID_PLATEAU_EXPLANATION)
+
+    def mark(b):
+        return "✅" if b else "❌"
+    for base, base_title in ((SQUEEZE_KDJ_ST_GRID_BASELINE, "G15_30(=N2，基準)"),
+                             (SQUEEZE_KDJ_ST_GRID_LIVE, "G10_30(目前實盤)")):
+        lines += ["", f"【兩段都變好？其他8格跟{base_title}比(最多2檔；勝率、PF；挑選期、驗證期)】"]
+        for r in improvements[base]:
+            pf_both = r["train_pf_better"] and r["test_pf_better"]
+            lines.append(
+                f"  {_disp_ljust(squeeze_kdj_stop_target_cell_label(r['variant']), 32)}：挑選期 勝率{mark(r['train_win_rate_better'])} "
+                f"PF{mark(r['train_pf_better'])}｜驗證期 勝率{mark(r['test_win_rate_better'])} PF{mark(r['test_pf_better'])}"
+                f"｜{'兩段都變好' if r['both_periods_better'] else '沒有兩段都變好'}"
+                f"｜PF兩段都較高：{'是' if pf_both else '否'}")
+    lines.append("  (「兩段都變好」= 勝率跟PF在兩段都比較好；停利遠近本來就會讓勝率跟PF往反方向動，所以另外列"
+                 "「PF兩段都較高」。兩者都只是一致性檢查，不取代事先登錄的挑選規則。)")
+
+    lines += ["", f"【9年合計與逐年(依出場日)｜最多同時持有{SQUEEZE_KDJ_FILTER_MAX_POSITIONS}檔：選出的格子、G15_30、G10_30】",
+              "  (全部9格的逐年表在squeeze_kdj_stop_target_grid_yearly.csv)"]
+    shown = []
+    for cid in (selected, SQUEEZE_KDJ_ST_GRID_BASELINE, SQUEEZE_KDJ_ST_GRID_LIVE):
+        if cid and cid not in shown:
+            shown.append(cid)
+    for cid in shown:
+        r = main_res[cid]
+        tot = r["train"]["stats"]["total_pnl_ntd"] + r["test"]["stats"]["total_pnl_ntd"]
+        n = r["train"]["stats"]["trade_count"] + r["test"]["stats"]["trade_count"]
+        tag = "  ← 挑選規則選中" if cid == selected else ""
+        lines.append(f"  ### {squeeze_kdj_stop_target_cell_label(cid)}{tag}：9年合計{n}筆、NT${tot:,.0f}"
+                     f"(挑選期NT${r['train']['stats']['total_pnl_ntd']:,.0f}＋驗證期NT${r['test']['stats']['total_pnl_ntd']:,.0f})")
+        for period, period_label in SQUEEZE_KDJ_FILTER_PERIODS:
+            seg = r[period]
+            lines.append(f"    {period_label}：{_fmt_filter_seg_line(seg)}")
+            lines += ["  " + x for x in _fmt_stop_detail_lines(seg)]
+        yearly = _squeeze_kdj_filter_yearly(r, starting_capital)
+        if not yearly:
+            lines.append("    (沒有任何交易)")
+        for y in yearly:
+            lines.append(f"    {y['year']}年[{y['period']}]：{y['trade_count']}筆, PF={_fmt_pf(y['profit_factor'])}, "
+                         f"勝率={y['win_rate']:.1f}%, 總損益NT${y['total_pnl_ntd']:,.0f}, "
+                         f"年內最大回撤NT${y['max_drawdown_ntd']:,.0f}, 拿掉最大3筆後NT${y['pnl_excluding_top3_ntd']:,.0f}")
+
+    lines += [
+        "",
+        "【每日掃描不會跟著改】",
+        f"  每日訊號掃描(daily_squeeze_signals.py)仍然沿用SQUEEZE_KDJ_FIXED_SETTING：停損{s['atr_stop_mult']:.1f}倍ATR、"
+        f"停利{s['atr_target_mult']:.1f}倍ATR。這個模式只是回測，不會改掃描器或實盤設定的任何東西，"
+        "要不要換停損/停利，等你看完地圖自己決定。",
+        "",
+        SQUEEZE_KDJ_ST_GRID_CAVEATS_TEXT, "",
+        "輸出：squeeze_kdj_stop_target_grid_summary.csv(格子x期間x最多持倉數，含9年合計/鄰域平均PF/是否在高原上)、"
+        "squeeze_kdj_stop_target_grid_yearly.csv(全部格子逐年)、squeeze_kdj_stop_target_grid_trades.csv(全部交易)。",
+    ]
+
+    summary_text = "\n".join(lines)
+    print(summary_text)
+    summary_path = os.path.join(RESULTS_DIR, "summary.txt")
+    with open(summary_path, "w", encoding="utf-8") as f:
+        f.write(summary_text + "\n")
+    print(f"\n已輸出：{summary_path}")
+    return {"results": results, "selected": selected, "verdict": verdict, "improvements": improvements,
+            "plateaus": plateaus, "validity_warnings": validity,
+            "commission_per_lot_side": commission, "futures_tax_rate": tax_rate}
+
+
 def evaluate_combo(label, price_data, indicators_by_code, regime_series, is_calendar, oos_calendar,
                     starting_capital, hold_days, signal_weights, gate_kwargs, atr_stop_mult,
                     trailing_atr_mult, use_trailing_stop, extra_kwargs, execution_kwargs):
@@ -4508,13 +4995,23 @@ def main():
                               "--max-stocks 0；股價往前多抓200個日曆天當暖身。輸出squeeze_kdj_exits_summary.csv/"
                               "squeeze_kdj_exits_yearly.csv/squeeze_kdj_exits_trades.csv+summary.txt。"
                               "跟其他squeeze模式互斥(main()依序檢查，前面的若同時開啟會先執行並直接return)")
+    parser.add_argument("--squeeze-kdj-stop-target-grid", action="store_true",
+                         help="squeeze+KDJ事先登錄的停損x停利3x3穩健度地圖(--squeeze-kdj-stop-target-grid)：停損1.0/1.5/2.0倍ATR"
+                              " x 停利2.0/3.0/4.0倍ATR共9格(代號G10_20…G20_40，不加濾網)，基準G15_30(=N2)、G10_30=目前實盤。"
+                              "執行設定/期間/挑選規則跟--squeeze-kdj-stops相同(1口、最多2檔+1檔敏感度對照、限價1檔、top_n=3；"
+                              "挑選期2018~2022選PF最高且筆數>=60者；驗證期PF>1、bootstrap正報酬>80%%、PF勝過G15_30)，"
+                              "另外做事先登錄的高原檢查(每格+上下左右鄰格的平均PF兩段都>1)。"
+                              "交易成本用--commission-per-lot-side/--futures-tax-rate。必須--start 2018-01-01，建議"
+                              "--max-stocks 0；股價往前多抓200個日曆天當暖身。輸出squeeze_kdj_stop_target_grid_summary.csv/"
+                              "squeeze_kdj_stop_target_grid_yearly.csv/squeeze_kdj_stop_target_grid_trades.csv+summary.txt。"
+                              "跟其他squeeze模式互斥(main()依序檢查，前面的若同時開啟會先執行並直接return)")
     parser.add_argument("--commission-per-lot-side", type=float,
                          default=SQUEEZE_KDJ_STOPS_DEFAULT_COMMISSION_PER_LOT_SIDE,
                          help="每口「單邊」手續費(新台幣)，一進一出付兩次；預設50(=來回100元/口)。"
-                              "目前只有--squeeze-kdj-stops/--squeeze-kdj-exits使用，其他模式仍是舊假設200元/口/單邊")
+                              "目前只有--squeeze-kdj-stops/--squeeze-kdj-exits/--squeeze-kdj-stop-target-grid使用，其他模式仍是舊假設200元/口/單邊")
     parser.add_argument("--futures-tax-rate", type=float, default=SQUEEZE_KDJ_STOPS_DEFAULT_FUTURES_TAX_RATE,
                          help="期貨交易稅率(每一邊、按契約價值)，預設0.00002(十萬分之二，我們對股票期貨稅率的理解)。"
-                              "目前只有--squeeze-kdj-stops/--squeeze-kdj-exits使用")
+                              "目前只有--squeeze-kdj-stops/--squeeze-kdj-exits/--squeeze-kdj-stop-target-grid使用")
     parser.add_argument("--fixed-combo-walkforward-folds", type=int, default=0,
                          help="測試幾組「固定死不重新挑選」的候選規則(FIXED_WALKFORWARD_COMBO_VARIANTS，"
                               "基準+只改一個維度的變體)跨N個獨立、不重疊歷史區塊的表現，0代表不啟用(預設)。"
@@ -4534,12 +5031,14 @@ def main():
         if INDEX_PROXY_CODE not in universe:
             universe[INDEX_PROXY_CODE] = STOCK_FUTURES_UNIVERSE[INDEX_PROXY_CODE]
 
-    # --squeeze-kdj-filters/--squeeze-kdj-stops/--squeeze-kdj-exits：股價往前多抓SQUEEZE_KDJ_FILTER_LOOKBACK_DAYS個日曆天當均線/BB/KC/ATR暖身
+    # --squeeze-kdj-filters/--squeeze-kdj-stops/--squeeze-kdj-exits/--squeeze-kdj-stop-target-grid：股價往前多抓SQUEEZE_KDJ_FILTER_LOOKBACK_DAYS個日曆天當均線/BB/KC/ATR暖身
     # (個股120日均線在回測第一天就算得出來)，交易日曆之後再切回從--start開始。其他模式完全不變。
     load_start = args.start
-    if args.squeeze_kdj_filters or args.squeeze_kdj_stops or args.squeeze_kdj_exits:
+    if (args.squeeze_kdj_filters or args.squeeze_kdj_stops or args.squeeze_kdj_exits
+            or args.squeeze_kdj_stop_target_grid):
         mode_flag = ("--squeeze-kdj-filters" if args.squeeze_kdj_filters
-                     else "--squeeze-kdj-stops" if args.squeeze_kdj_stops else "--squeeze-kdj-exits")
+                     else "--squeeze-kdj-stops" if args.squeeze_kdj_stops
+                     else "--squeeze-kdj-exits" if args.squeeze_kdj_exits else "--squeeze-kdj-stop-target-grid")
         load_start = (pd.Timestamp(args.start) - pd.Timedelta(days=SQUEEZE_KDJ_FILTER_LOOKBACK_DAYS)).date().isoformat()
         print(f"{mode_flag}：股價從{load_start}開始下載(比--start多{SQUEEZE_KDJ_FILTER_LOOKBACK_DAYS}"
               f"個日曆天，當均線暖身用，不會被拿來交易)")
@@ -4633,6 +5132,11 @@ def main():
     if args.squeeze_kdj_exits:
         run_squeeze_kdj_exits_mode(args, price_data, universe,
                                    master_calendar[master_calendar >= pd.Timestamp(args.start)])
+        return
+
+    if args.squeeze_kdj_stop_target_grid:
+        run_squeeze_kdj_stop_target_grid_mode(args, price_data, universe,
+                                              master_calendar[master_calendar >= pd.Timestamp(args.start)])
         return
 
     if args.use_trailing_stop:

@@ -2310,14 +2310,415 @@ class TestSqueezeKdjExitsCliMode:
         assert out["validity_warnings"]
 
 
-class TestWorkflowInputsWithinGithubLimit:
-    def test_at_most_25_inputs_and_exits_wired(self):
+# ============================================================================
+# --squeeze-kdj-stop-target-grid：停損 x 停利 3x3穩健度地圖
+# ============================================================================
+ST_ALL_IDS = ["G10_20", "G10_30", "G10_40", "G15_20", "G15_30", "G15_40", "G20_20", "G20_30", "G20_40"]
+
+
+def _st_key_to_id(kw):
+    return cb.squeeze_kdj_stop_target_cell_id(kw["atr_stop_mult"], kw["atr_target_mult"])
+
+
+class TestSqueezeKdjStopTargetGridConstruction:
+    def test_nine_cells_ids_order_and_baseline(self):
+        assert [c[0] for c in cb.SQUEEZE_KDJ_ST_GRID_CELLS] == ST_ALL_IDS
+        assert cb.SQUEEZE_KDJ_ST_GRID_SELECTABLE == tuple(ST_ALL_IDS)
+        assert [(c[1], c[2]) for c in cb.SQUEEZE_KDJ_ST_GRID_CELLS] == [
+            (s, t) for s in (1.0, 1.5, 2.0) for t in (2.0, 3.0, 4.0)]
+        assert cb.squeeze_kdj_stop_target_cell_id(1.0, 2.0) == "G10_20"
+        assert cb.squeeze_kdj_stop_target_cell_id(1.5, 3.0) == "G15_30"
+        assert cb.SQUEEZE_KDJ_ST_GRID_BASELINE == "G15_30" and cb.SQUEEZE_KDJ_ST_GRID_LIVE == "G10_30"
+        assert "基準N2" in cb.squeeze_kdj_stop_target_cell_label("G15_30")
+        assert "實盤" in cb.squeeze_kdj_stop_target_cell_label("G10_30")
+        assert cb.squeeze_kdj_stop_target_cell_name("G20_40") == "stop2.0_target4.0"
+        # 基準/實盤就是stops模式的N2/N1
+        n = {v[0]: (v[2], v[3]) for v in cb.SQUEEZE_KDJ_STOP_VARIANTS}
+        assert cb.squeeze_kdj_stop_target_cell_id(*n["N2"]) == "G15_30"
+        assert cb.squeeze_kdj_stop_target_cell_id(*n["N1"]) == "G10_30"
+        assert cb.SQUEEZE_KDJ_FIXED_SETTING["atr_stop_mult"] == 1.0 and cb.SQUEEZE_KDJ_FIXED_SETTING["atr_target_mult"] == 3.0
+
+    def test_neighbors_edges_and_corners(self):
+        nb = cb.squeeze_kdj_stop_target_neighbors
+        assert nb("G10_20") == ["G15_20", "G10_30"]                       # 角落：2個
+        assert nb("G20_40") == ["G15_40", "G20_30"]
+        assert nb("G10_30") == ["G15_30", "G10_20", "G10_40"]             # 邊：3個
+        assert nb("G15_20") == ["G10_20", "G20_20", "G15_30"]
+        assert nb("G15_30") == ["G10_30", "G20_30", "G15_20", "G15_40"]   # 中間：4個
+
+    def test_plateau_on_hand_made_grid(self):
+        # 挑選期PF(列=停損、欄=停利)          驗證期PF
+        #   0.6  1.2  1.4                      0.9  1.1  1.3
+        #   0.8  1.3  1.5                      1.0  1.2  1.6
+        #   0.7  0.9  1.1                      0.5  0.95 1.2
+        train = [[0.6, 1.2, 1.4], [0.8, 1.3, 1.5], [0.7, 0.9, 1.1]]
+        test = [[0.9, 1.1, 1.3], [1.0, 1.2, 1.6], [0.5, 0.95, 1.2]]
+        pf = {}
+        for i, s in enumerate((1.0, 1.5, 2.0)):
+            for j, t in enumerate((2.0, 3.0, 4.0)):
+                pf[cb.squeeze_kdj_stop_target_cell_id(s, t)] = {"train": train[i][j], "test": test[i][j]}
+        p = cb.squeeze_kdj_stop_target_plateau(pf)
+        # 角落G10_20：自己+2鄰格
+        assert p["G10_20"]["n_cells"] == 3
+        assert p["G10_20"]["nbhd_train"] == pytest.approx((0.6 + 0.8 + 1.2) / 3)
+        # 邊G10_30：自己+3鄰格
+        assert p["G10_30"]["n_cells"] == 4
+        assert p["G10_30"]["nbhd_train"] == pytest.approx((1.2 + 1.3 + 0.6 + 1.4) / 4)
+        assert p["G10_30"]["nbhd_test"] == pytest.approx((1.1 + 1.2 + 0.9 + 1.3) / 4)
+        # 中間G15_30：自己+4鄰格
+        assert p["G15_30"]["n_cells"] == 5
+        assert p["G15_30"]["nbhd_train"] == pytest.approx((1.3 + 1.2 + 0.9 + 0.8 + 1.5) / 5)
+        assert p["G15_30"]["nbhd_test"] == pytest.approx((1.2 + 1.1 + 0.95 + 1.0 + 1.6) / 5)
+        plateau = {c for c, r in p.items() if r["plateau"]}
+        # G20_40：自己1.1/1.2>1，但鄰域挑選期平均(1.1+1.5+0.9)/3=1.167、驗證期(1.2+1.6+0.95)/3=1.25 → 高原
+        # G20_30：自己挑選期0.9 → 不是；G15_20：驗證期自己1.0(不>1) → 不是
+        assert plateau == {"G10_30", "G10_40", "G15_30", "G15_40", "G20_40"}
+        assert p["G20_30"]["plateau"] is False and p["G15_20"]["plateau"] is False
+        # 自己>1但鄰域平均<=1 → 不算(孤峰)
+        lone = {c: {"train": 0.5, "test": 0.5} for c in ST_ALL_IDS}
+        lone["G10_20"] = {"train": 1.4, "test": 1.4}
+        pl = cb.squeeze_kdj_stop_target_plateau(lone)
+        assert pl["G10_20"]["nbhd_train"] == pytest.approx(0.8) and pl["G10_20"]["plateau"] is False
+        assert not any(r["plateau"] for r in pl.values())
+        # inf(只有賺沒賠)照樣算>1
+        lone["G10_30"] = {"train": float("inf"), "test": float("inf")}
+        assert cb.squeeze_kdj_stop_target_plateau(lone)["G10_20"]["plateau"] is True
+
+    def _all(self, **override):
+        base = {c: _stats(100, 0.8) for c in ST_ALL_IDS}
+        base.update(override)
+        return base
+
+    def test_selection_rule_train_only(self):
+        sel, reason = cb.select_squeeze_kdj_stop_target_cell(self._all(G20_40=_stats(60, 1.3), G10_20=_stats(59, 9.0)))
+        assert sel == "G20_40" and "G10_20" in reason and "排除" in reason
+        sel, _ = cb.select_squeeze_kdj_stop_target_cell(self._all(G15_20=_stats(100, 1.1, pnl=100),
+                                                                  G10_40=_stats(100, 1.1, pnl=300)))
+        assert sel == "G10_40"
+        tied = {c: _stats(100, 1.1, pnl=100) for c in ST_ALL_IDS}
+        assert cb.select_squeeze_kdj_stop_target_cell(tied)[0] == "G10_20"  # 停損由小到大、停利由小到大
+        tied["G10_20"] = _stats(10, 1.1, pnl=100)
+        assert cb.select_squeeze_kdj_stop_target_cell(tied)[0] == "G10_30"
+        assert cb.select_squeeze_kdj_stop_target_cell(self._all(N2=_stats(500, 9.0)))[0] == "G10_20"
+        sel, reason = cb.select_squeeze_kdj_stop_target_cell({c: _stats(59, 2.0) for c in ST_ALL_IDS})
+        assert sel is None and "無法挑選" in reason
+
+    def _seg(self, n, pf, pct):
+        return {"stats": _stats(n, pf), "bootstrap": {"pct_positive": pct, "p_value": 1 - pct / 100}}
+
+    def test_verdict_branches_vs_g15_30(self):
+        base = self._seg(80, 0.9, 30.0)
+        v = cb.squeeze_kdj_stop_target_verdict("G20_40", {"G15_30": base, "G20_40": self._seg(70, 1.4, 90.0)})
+        assert v["passed"] and v["text"].startswith("✅")
+        v = cb.squeeze_kdj_stop_target_verdict("G20_40", {"G15_30": base, "G20_40": self._seg(70, 1.4, 75.0)})
+        assert not v["passed"] and "bootstrap" in v["text"] and "PF>1" not in v["text"]
+        v = cb.squeeze_kdj_stop_target_verdict("G20_40", {"G15_30": self._seg(80, 1.6, 95.0),
+                                                          "G20_40": self._seg(70, 1.4, 90.0)})
+        assert not v["passed"] and "勝過G15_30" in v["text"]
+        v = cb.squeeze_kdj_stop_target_verdict("G20_40", {"G15_30": base, "G20_40": self._seg(70, 0.8, 20.0)})
+        assert not v["passed"] and "PF>1" in v["text"]
+        v = cb.squeeze_kdj_stop_target_verdict("G15_30", {"G15_30": self._seg(80, 2.0, 99.0)})
+        assert not v["passed"] and "G15_30(=N2)本身" in v["text"]
+        # 選出實盤G10_30：照樣跟G15_30比，並註明是實盤
+        v = cb.squeeze_kdj_stop_target_verdict("G10_30", {"G15_30": base, "G10_30": self._seg(70, 1.4, 90.0)})
+        assert v["passed"] and "目前實盤" in v["text"]
+        assert cb.squeeze_kdj_stop_target_verdict(None, {"G15_30": base})["passed"] is False
+
+    def test_improvement_tables_vs_baseline_and_live(self):
+        def seg(wr, pf):
+            return {"stats": {"trade_count": 10, "win_rate": wr, "profit_factor": pf}}
+        by = {c: {"train": seg(40, 0.8), "test": seg(40, 0.8)} for c in ST_ALL_IDS}
+        by["G15_30"] = {"train": seg(45, 1.0), "test": seg(45, 1.0)}
+        by["G20_40"] = {"train": seg(50, 1.2), "test": seg(50, 1.1)}
+        rows = {r["variant"]: r for r in cb.squeeze_kdj_stop_target_improvement_table(by, "G15_30")}
+        assert set(rows) == set(ST_ALL_IDS) - {"G15_30"} and rows["G20_40"]["both_periods_better"]
+        assert not rows["G10_30"]["both_periods_better"]
+        rows = {r["variant"]: r for r in cb.squeeze_kdj_stop_target_improvement_table(by, "G10_30")}
+        assert "G10_30" not in rows and rows["G15_30"]["both_periods_better"]
+
+
+def _st_grid_args(start="2018-01-01", end="2026-10-06", **extra):
+    return _stops_args(start=start, end=end, **extra)
+
+
+class TestSqueezeKdjStopTargetGridModeSelectionIgnoresTest:
+    # 挑選期：G20_40 PF最高但只有40筆(不符資格)，符合資格裡最高的是G15_40
+    TRAIN = {c: (100, 0.8) for c in ST_ALL_IDS}
+    TRAIN.update({"G20_40": (40, 9.0), "G15_40": (100, 1.3), "G15_30": (120, 1.1), "G10_30": (200, 0.9)})
+
+    def _run(self, monkeypatch, tmp_path, test_pf, **arg_extra):
+        calls = []
+
+        def _fake_backtest(**kw):
+            calls.append(kw)
+            cid = _st_key_to_id(kw)
+            if kw["master_calendar"][0] < pd.Timestamp("2023-01-01"):
+                n, pf = self.TRAIN[cid]
+                trades = _make_pf_trades(n, pf, 2019)
+            else:
+                trades = _make_pf_trades(80, test_pf[cid], 2024)
+            return trades, dict.fromkeys(cb.CAPITAL_CONSTRAINED_DIAGNOSTIC_KEYS, 0)
+        monkeypatch.setattr(cb, "run_squeeze_kdj_capital_constrained_backtest", _fake_backtest)
+
+        def _boom(*a, **k):
+            raise AssertionError("--squeeze-kdj-stop-target-grid不需要大盤指數")
+        monkeypatch.setattr(cb, "load_index_series", _boom)
+        monkeypatch.setattr(cb, "load_squeeze_kdj_market_index", _boom)
+        monkeypatch.setattr(cb, "RESULTS_DIR", str(tmp_path))
+        codes = ["1101", "2330"]
+        price_data, idx = _make_regime_switching_market(codes, start="2018-01-01", n_days=2300)
+        universe = {c: STOCK_FUTURES_UNIVERSE[c] for c in codes}
+        out = cb.run_squeeze_kdj_stop_target_grid_mode(_st_grid_args(**arg_extra), price_data, universe, idx)
+        return out, calls
+
+    def test_selection_uses_train_only(self, monkeypatch, tmp_path):
+        # 驗證期把G10_20捧成最好、G15_40最差 → 照樣選G15_40，不通過
+        bad = {c: 1.2 for c in ST_ALL_IDS}
+        bad.update({"G10_20": 9.0, "G15_40": 0.5})
+        out, calls = self._run(monkeypatch, tmp_path, bad)
+        assert out["selected"] == "G15_40" and not out["verdict"]["passed"]
+        assert len(calls) == 2 * 9 * 2  # 主要+敏感度 x 9格 x 2期間
+        assert {_st_key_to_id(kw) for kw in calls} == set(ST_ALL_IDS)
+        for kw in calls:
+            assert kw["lots"] == 1 and kw["top_n"] == 3 and kw["execution_model"] == "limit_1tick"
+            assert kw["variant"] == "B" and kw["entry_filter"] is None
+            assert kw["max_hold_days"] == 20 and kw["atr_period"] == 14 and kw["ranking_rule"] == "trigger_return"
+            assert kw["max_concurrent_positions"] in (1, 2) and "slippage_pct" not in kw
+            assert kw["commission_per_lot_side"] == 50.0 and kw["futures_tax_rate"] == 0.00002
+            assert "market_series" not in kw
+        train_cals = [kw["master_calendar"] for kw in calls if kw["master_calendar"][0] < pd.Timestamp("2023-01-01")]
+        assert len(train_cals) == 18 and all(c[-1] <= pd.Timestamp("2022-12-31") for c in train_cals)
+        # 驗證期換成G15_40好過G15_30 → 選擇不變、通過
+        good = {c: 1.0 for c in ST_ALL_IDS}
+        good.update({"G15_40": 2.0, "G15_30": 1.2})
+        out2, _ = self._run(monkeypatch, tmp_path, good)
+        assert out2["selected"] == "G15_40" and out2["verdict"]["passed"]
+        assert "✅ 通過" in (tmp_path / "summary.txt").read_text(encoding="utf-8")
+        # G15_40驗證期PF>1但沒勝過G15_30 → 不通過
+        worse = dict(good, G15_30=3.0)
+        out3, _ = self._run(monkeypatch, tmp_path, worse)
+        assert out3["selected"] == "G15_40" and not out3["verdict"]["passed"]
+        assert "勝過G15_30" in out3["verdict"]["text"]
+
+    def test_plateau_and_heatmaps_in_summary(self, monkeypatch, tmp_path):
+        test_pf = {c: 0.8 for c in ST_ALL_IDS}
+        test_pf.update({"G15_40": 1.3, "G10_40": 1.2, "G20_40": 1.1, "G15_30": 1.1})
+        train = {c: (100, 0.8) for c in ST_ALL_IDS}
+        train.update({"G15_40": (100, 1.3), "G10_40": (100, 1.2), "G20_40": (100, 1.1), "G15_30": (100, 1.1)})
+        monkeypatch.setattr(self, "TRAIN", train)
+        out, _ = self._run(monkeypatch, tmp_path, test_pf)
+        p2 = out["plateaus"][2]
+        # G15_40鄰域：自己1.3、G10_40 1.2、G20_40 1.1、G15_30 1.1 → 平均1.175 → 高原
+        assert p2["G15_40"]["nbhd_train"] == pytest.approx((1.3 + 1.2 + 1.1 + 1.1) / 4, rel=1e-6)
+        assert p2["G15_40"]["plateau"]
+        # G10_40(角落)：自己1.2、鄰格G15_40 1.3、G10_30 0.8 → 平均1.1 → 高原
+        assert p2["G10_40"]["plateau"] and p2["G10_40"]["n_cells"] == 3
+        # G15_30(中間)：自己1.1，但鄰域平均(1.1+0.8+0.8+0.8+1.3)/5=0.96 → 不是
+        assert not p2["G15_30"]["plateau"]
+        assert {c for c, r in p2.items() if r["plateau"]} == {"G10_40", "G15_40", "G20_40"}
+        summary = (tmp_path / "summary.txt").read_text(encoding="utf-8")
+        i_rules = summary.index("【事先登錄的規則")
+        assert "高原檢查(事先登錄)" in summary[i_rules:summary.index("【挑選結果與判定】")]
+        assert "約24個" in summary and "地圖的形狀" in summary
+        assert (i_rules < summary.index("【交易成本假設】") < summary.index("【挑選結果與判定】")
+                < summary.index("【熱度圖｜主要") < summary.index("【熱度圖｜敏感度對照")
+                < summary.index("【高原檢查｜最多同時持有2檔") < summary.index("【兩段都變好？其他8格跟G15_30")
+                < summary.index("【兩段都變好？其他8格跟G10_30"))
+        for t in ("挑選期PF", "驗證期PF", "挑選期總損益", "驗證期總損益", "9年合計損益", "勝率%(挑選期/驗證期)",
+                  "交易筆數(挑選期/驗證期)", "驗證期bootstrap正報酬比例%"):
+            assert summary.count(f"▸ {t}") == 2, t  # 最多2檔、最多1檔各一張
+        heat = summary[summary.index("【熱度圖｜主要"):summary.index("【熱度圖｜敏感度對照")]
+        pf_rows = heat[heat.index("▸ 挑選期PF"):heat.index("▸ 驗證期PF")].splitlines()
+        assert pf_rows[2].split()[0] == "1.0倍" and pf_rows[2].split()[1:] == ["0.80", "0.80L", "1.20"]
+        assert pf_rows[3].split()[1:] == ["0.80", "1.10b", "1.30*"]
+        assert "在高原上的格子：G10_40" in summary
+        assert "一個穩健的設定應該坐落在「高原」上" in summary
+        assert "PF兩段都較高" in summary
+        assert "【9年合計與逐年" in summary and summary.count("  ### G") == 3
+        summ = pd.read_csv(tmp_path / "squeeze_kdj_stop_target_grid_summary.csv", encoding="utf-8-sig")
+        assert len(summ) == 36
+        assert summ.loc[summ["在高原上(自己+鄰域兩段PF都>1)"], "變體代號"].nunique() == 3
+        assert summ["被挑選規則選中"].sum() == 2 and set(summ.loc[summ["被挑選規則選中"], "變體代號"]) == {"G15_40"}
+
+
+class TestSqueezeKdjStopTargetGridCliMode:
+    def test_skips_full_pipeline_writes_outputs_without_scipy(self, monkeypatch, tmp_path):
+        import data_loader
+        import chip_data_loader
+        monkeypatch.setitem(sys.modules, "scipy", None)
+        monkeypatch.setitem(sys.modules, "scipy.stats", None)
+
+        codes = list(STOCK_FUTURES_UNIVERSE)[:12]
+        price_data, idx = _make_regime_switching_market(codes + ["2330"], start="2017-06-15", n_days=1950, seed=3)
+        load_calls = []
+
+        def _fake_load(universe, start, end, refresh=False):
+            load_calls.append((start, end))
+            return price_data
+        monkeypatch.setattr(cb, "load_price_data", _fake_load)
+
+        def _boom(*args, **kwargs):
+            raise AssertionError("--squeeze-kdj-stop-target-grid模式不該呼叫這個")
+        monkeypatch.setattr(cb, "load_index_series", _boom)
+        monkeypatch.setattr(data_loader, "load_price_data", _boom)
+        monkeypatch.setattr(data_loader, "load_index_series", _boom)
+        monkeypatch.setattr(chip_data_loader, "load_chip_data", _boom)
+        TestSqueezeKdjFixedCliMode()._patch_heavy_stages_to_explode(monkeypatch)
+        for name in ("run_squeeze_kdj_fixed_mode", "run_squeeze_kdj_filters_mode", "run_squeeze_kdj_stops_mode",
+                     "run_squeeze_kdj_exits_mode", "run_squeeze_kdj_only_mode",
+                     "run_squeeze_kdj_capital_constrained_mode", "run_squeeze_kdj_grid_mode"):
+            monkeypatch.setattr(cb, name, _boom)
+        monkeypatch.setattr(cb, "RESULTS_DIR", str(tmp_path))
+
+        mode_calls = []
+        real_mode = cb.run_squeeze_kdj_stop_target_grid_mode
+
+        def _spy(*args, **kwargs):
+            mode_calls.append(args)
+            return real_mode(*args, **kwargs)
+        monkeypatch.setattr(cb, "run_squeeze_kdj_stop_target_grid_mode", _spy)
+
+        argv = ["compare_breakout.py", "--squeeze-kdj-stop-target-grid", "--max-stocks", "12",
+                "--start", "2018-01-01", "--end", "2024-11-15", "--starting-capital", "1000000"]
+        monkeypatch.setattr(sys, "argv", argv)
+        cb.main()
+
+        assert load_calls == [("2017-06-15", "2024-11-15")]  # 股價往前多抓200個日曆天
+        assert len(mode_calls) == 1
+        args, cal = mode_calls[0][0], mode_calls[0][3]
+        assert args.commission_per_lot_side == 50.0 and args.futures_tax_rate == 0.00002
+        assert cal.equals(idx[idx >= pd.Timestamp("2018-01-01")])
+
+        summ = pd.read_csv(tmp_path / "squeeze_kdj_stop_target_grid_summary.csv", encoding="utf-8-sig")
+        assert len(summ) == 36  # 2種最多持倉數 x 9格 x 2期間
+        for col in ("最多同時持倉數", "用途", "變體代號", "停損ATR倍數", "停利ATR倍數", "是否基準(G15_30=N2)",
+                    "是否目前實盤(G10_30=N1)", "之前模式對應", "期間", "交易筆數", "勝率(%)", "獲利因子PF",
+                    "總損益(NT$)", "9年合計損益(NT$，挑選期+驗證期)", "鄰域平均PF_挑選期", "鄰域平均PF_驗證期",
+                    "鄰域格數(含自己)", "在高原上(自己+鄰域兩段PF都>1)", "bootstrap正報酬比例(%)",
+                    "手續費合計(NT$)", "期交稅合計(NT$)", "被挑選規則選中"):
+            assert col in summ.columns, col
+        assert set(summ["變體代號"]) == set(ST_ALL_IDS)
+        assert summ.loc[summ["是否基準(G15_30=N2)"], "變體代號"].unique().tolist() == ["G15_30"]
+        assert summ.loc[summ["是否目前實盤(G10_30=N1)"], "變體代號"].unique().tolist() == ["G10_30"]
+        assert summ["被挑選規則選中"].sum() <= 2
+        assert summ["交易筆數"].sum() > 0, "合成資料要有交易，測試才有意義"
+        assert (summ["手續費合計(NT$)"] == 100.0 * summ["交易筆數"]).all()
+        assert set(summ["鄰域格數(含自己)"]) == {3, 4, 5}
+        reason_cols = [f"出場_{lab}筆數" for _, lab in cb.SQUEEZE_KDJ_STOPS_EXIT_REASONS]
+        assert (summ[reason_cols].sum(axis=1) == summ["交易筆數"]).all()
+        # 9年合計 = 同一格兩段損益相加
+        for (mp, cid), g in summ.groupby(["最多同時持倉數", "變體代號"]):
+            assert g["9年合計損益(NT$，挑選期+驗證期)"].iloc[0] == pytest.approx(g["總損益(NT$)"].sum())
+
+        yearly = pd.read_csv(tmp_path / "squeeze_kdj_stop_target_grid_yearly.csv", encoding="utf-8-sig")
+        assert list(yearly.columns) == cb.SQUEEZE_KDJ_FILTER_YEARLY_COLUMNS and len(yearly) > 0
+        assert set(yearly["變體代號"]) <= set(ST_ALL_IDS)
+        trades = pd.read_csv(tmp_path / "squeeze_kdj_stop_target_grid_trades.csv", encoding="utf-8-sig")
+        assert list(trades.columns) == cb.SQUEEZE_KDJ_STOPS_TRADE_COLUMNS
+        assert len(trades) == summ["交易筆數"].sum()
+
+        summary = (tmp_path / "summary.txt").read_text(encoding="utf-8")
+        assert "--squeeze-kdj-stop-target-grid模式" in summary
+        assert (summary.index("【事先登錄的規則") < summary.index("【挑選結果與判定】") < summary.index("【熱度圖"))
+        assert "【高原檢查｜最多同時持有1檔" in summary and "最多2檔、最多1檔都在高原上的格子" in summary
+        assert "多重比較" in summary and "倖存者偏差" in summary and "偏樂觀" in summary and "基差" in summary
+        assert "daily_squeeze_signals.py" in summary
+        assert "這次測試無效" not in summary and "[階段0]" not in summary
+
+    def test_invalid_start_prints_big_warning(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(cb, "RESULTS_DIR", str(tmp_path))
+        codes = ["1101", "2330"]
+        price_data, idx = _make_regime_switching_market(codes, start="2021-06-01", n_days=600)
+        universe = {c: STOCK_FUTURES_UNIVERSE[c] for c in codes}
+        out = cb.run_squeeze_kdj_stop_target_grid_mode(_st_grid_args(start="2021-06-01", end="2023-09-01"),
+                                                       price_data, universe, idx)
+        summary = (tmp_path / "summary.txt").read_text(encoding="utf-8")
+        assert "這次測試無效" in summary and "2018-01-01" in summary
+        assert summary.index("這次測試無效") < summary.index("【挑選結果與判定】")
+        assert out["validity_warnings"]
+
+
+class TestWorkflowSqueezeModeChoice:
+    """GitHub workflow_dispatch最多25個輸入：7個squeeze布林輸入合併成一個squeeze_mode下拉選單。"""
+    WF_PATH = os.path.join(os.path.dirname(cb.__file__), ".github", "workflows", "momentum_breakout_backtest.yml")
+    EXPECTED_OPTIONS = ["none", "only", "capital_constrained", "grid", "fixed", "filters", "stops", "exits",
+                        "stop_target_grid"]
+
+    def _load(self):
         import yaml
-        path = os.path.join(os.path.dirname(cb.__file__), ".github", "workflows", "momentum_breakout_backtest.yml")
-        with open(path, encoding="utf-8") as f:
+        with open(self.WF_PATH, encoding="utf-8") as f:
             text = f.read()
-        wf = yaml.safe_load(text)
+        return text, yaml.safe_load(text)
+
+    def _run_script(self, wf):
+        steps = wf["jobs"]["backtest"]["steps"]
+        return next(s["run"] for s in steps if "compare_breakout.py" in s.get("run", ""))
+
+    def _cli_squeeze_flags(self):
+        import re
+        with open(cb.__file__, encoding="utf-8") as f:
+            src = f.read()
+        return set(re.findall(r'add_argument\("(--squeeze-kdj-[a-z-]+)"', src))
+
+    def _option_to_flags(self, script):
+        import re
+        mapping = {}
+        for opt, body in re.findall(r'^\s*([a-z_"|]+)\)\s*(.*?);;\s*$', script, flags=re.M):
+            mapping[opt] = re.findall(r"--squeeze-kdj-[a-z-]+", body)
+        return mapping
+
+    def test_yaml_parses_and_within_limit(self):
+        text, wf = self._load()
         inputs = wf[True]["workflow_dispatch"]["inputs"]  # PyYAML把on解析成True
         assert len(inputs) <= 25
-        assert inputs["squeeze_kdj_exits"]["default"] == "false"
-        assert 'inputs.squeeze_kdj_exits }}" = "true"' in text and "--squeeze-kdj-exits" in text
+        assert not [k for k in inputs if k.startswith("squeeze_kdj_")], "舊的squeeze布林輸入應該全部拿掉"
+        sm = inputs["squeeze_mode"]
+        assert sm["type"] == "choice" and sm["default"] == "none" and sm["options"] == self.EXPECTED_OPTIONS
+        for opt in self.EXPECTED_OPTIONS[1:]:
+            assert f"{opt} = " in sm["description"], opt  # 每個選項在說明裡各有一行
+        # 非squeeze的輸入保留(含手續費)
+        for k in ("start_date", "end_date", "starting_capital", "max_stocks", "simple_combo", "combo_search",
+                  "fixed_combo_walkforward_folds", "commission_per_lot_side"):
+            assert k in inputs, k
+        assert inputs["commission_per_lot_side"]["default"] == "50"
+        assert "inputs.squeeze_kdj_" not in text
+
+    def test_every_squeeze_flag_reachable_from_exactly_one_option(self):
+        _, wf = self._load()
+        script = self._run_script(wf)
+        mapping = self._option_to_flags(script)
+        options = [o for o in mapping if o not in ('""|none', "*")]
+        assert sorted(options) == sorted(self.EXPECTED_OPTIONS[1:])
+        assert mapping['""|none'] == []
+        flags = self._cli_squeeze_flags()
+        assert "--squeeze-kdj-stop-target-grid" in flags and len(flags) == 8
+        for opt in options:
+            assert len(mapping[opt]) == 1, opt
+        for flag in flags:
+            assert sum(mapping[o] == [flag] for o in options) == 1, flag
+
+    def test_bash_mapping_actually_produces_args(self, tmp_path):
+        import subprocess
+        _, wf = self._load()
+        inputs = wf[True]["workflow_dispatch"]["inputs"]
+        script = self._run_script(wf).replace("python compare_breakout.py $ARGS", 'echo "$ARGS"')
+
+        def render(overrides):
+            out = script
+            for k, spec in inputs.items():
+                out = out.replace("${{ github.event.inputs.%s }}" % k, str(overrides.get(k, spec.get("default", ""))))
+            assert "${{" not in out
+            return subprocess.run(["bash", "-c", out], capture_output=True, text=True)
+
+        r = render({})
+        assert r.returncode == 0 and "--squeeze-kdj" not in r.stdout
+        assert "--commission-per-lot-side 50" in r.stdout
+        r = render({"squeeze_mode": "stop_target_grid", "start_date": "2018-01-01", "max_stocks": "0"})
+        assert r.returncode == 0
+        assert r.stdout.split().count("--squeeze-kdj-stop-target-grid") == 1
+        assert "--start 2018-01-01" in r.stdout and "--max-stocks 0" in r.stdout
+        assert sum(tok.startswith("--squeeze-kdj") for tok in r.stdout.split()) == 1
+        r = render({"squeeze_mode": "capital_constrained"})
+        assert r.stdout.split().count("--squeeze-kdj-capital-constrained") == 1
+        r = render({"squeeze_mode": "bogus"})
+        assert r.returncode != 0
