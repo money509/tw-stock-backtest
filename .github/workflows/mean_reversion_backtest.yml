@@ -95,8 +95,12 @@ on:
         description: 'squeeze+KDJ停損寬度小測試(--squeeze-kdj-stops)：進場濾網測試選出F2(個股收盤在120日均線上)但仍只打平，逐筆看到大部分虧損是進場後1~3天就被1.0倍ATR停損掉、手續費也吃掉很多，所以測6個事先登錄的變體(停利都是3.0倍ATR)：N1停損1.0倍不加濾網(=目前實盤)、N2停損1.5倍不加濾網、N3停損2.0倍不加濾網、S1停損1.0倍+F2、S2停損1.5倍+F2、S3停損2.0倍+F2，6個全部可以被挑選。執行設定跟squeeze_kdj_filters相同(1口、最多2檔+1檔敏感度對照、限價1檔、top_n=3、最長20天)，規則也相同：挑選期2018-01-01~2022-12-31、驗證期2023-01-01之後各自獨立重跑；6個裡挑選期筆數>=60者挑PF最高(同分比損益，再同分依N1,N2,N3,S1,S2,S3順序)；選定後驗證期PF>1、bootstrap正報酬>80%、PF勝過N1(目前實盤)才算通過。比較的變體從3個變成6個，多重比較風險略增。每個變體另外列出平均獲利/平均虧損、每筆損益、持有1/3/5天內出場的比例與損益、出場原因(停利/停損/跳空停損/到期)、逐年表、最大回撤、拿掉最大3筆後損益、手續費+期交稅合計、平均每筆停損風險(停損越寬、1口固定時每筆賠越多)，並把N1、S1用舊成本(200元/口/單邊、不計稅)重跑並排，看手續費更正本身的影響。交易成本用下面的commission_per_lot_side(每口單邊手續費)，期交稅固定十萬分之二(每邊)。⚠️請搭配「回測起始日期」(start_date)=2018-01-01、掃描股票數量(max_stocks)=0執行。輸出squeeze_kdj_stops_summary.csv/squeeze_kdj_stops_yearly.csv/squeeze_kdj_stops_trades.csv(中文欄名)+summary.txt。只是回測，不會改每日掃描的設定。跟squeeze_kdj_only/squeeze_kdj_capital_constrained/squeeze_kdj_grid/squeeze_kdj_fixed/squeeze_kdj_filters互斥(main()依序檢查，那幾個若同時開啟會先執行並直接return，這個選項就不會執行)'
         required: false
         default: 'false'
+      squeeze_kdj_exits:
+        description: 'squeeze+KDJ出場方式小測試(--squeeze-kdj-exits)：停損寬度測試裡N2(停損1.5倍ATR、停利3.0倍ATR、不加濾網)兩段都贏過目前實盤N1但還沒通過驗證，逐筆看到只有約32%打到停利、約17%持有20天到期出場、週五進場常常一進場就吃週末跳空，所以以N2為基準測5個事先登錄的變體(停損都是1.5倍ATR、不加濾網)：E0=N2原樣(基準)、E1停利縮到2.25倍ATR(1.5R)、E2停利放到4.5倍ATR(3R)、E3停利3.0倍+保本(某天收盤漲到進場價+1.5倍ATR=1R之後，隔天起停損移到進場價，出場原因標成「保本停損」)、E4停利3.0倍+週五不進場(這條是看N2依星期分組的結果才想到的，資料挖掘、先驗最弱)，5個全部可以被挑選。執行設定跟squeeze_kdj_stops相同(1口、最多2檔+1檔敏感度對照、限價1檔、top_n=3、最長20天)，規則也相同：挑選期2018-01-01~2022-12-31、驗證期2023-01-01之後各自獨立重跑；5個裡挑選期筆數>=60者挑PF最高(同分比損益，再同分依E0~E4順序)；選定後驗證期PF>1、bootstrap正報酬>80%、PF勝過E0(N2)才算通過。5個變體是多重比較。每個變體列出勝率、PF、損益、平均獲利/虧損、出場原因(停利/停損/跳空停損/保本停損/到期)、到期出場筆數與損益、持有1/3/5天內出場、平均持有天數、最大回撤、拿掉最大3筆後損益、bootstrap、逐年表、依進場星期分組、診斷(含進場星期略過)、手續費+期交稅合計。交易成本用下面的commission_per_lot_side。⚠️請搭配「回測起始日期」(start_date)=2018-01-01、掃描股票數量(max_stocks)=0、每口單邊手續費(commission_per_lot_side)=50執行。輸出squeeze_kdj_exits_summary.csv/squeeze_kdj_exits_yearly.csv/squeeze_kdj_exits_trades.csv(中文欄名)+summary.txt。只是回測，不會改每日掃描的設定。跟其他squeeze模式互斥(main()依序檢查，前面的若同時開啟會先執行並直接return，這個選項就不會執行)，一次只開一個'
+        required: false
+        default: 'false'
       commission_per_lot_side:
-        description: '每口單邊手續費(新台幣)：進場、出場各付一次，預設50代表一口來回100元；如果你的50元已經是來回，請填25。目前只有squeeze_kdj_stops使用，其他模式仍是舊假設200元/口/單邊'
+        description: '每口單邊手續費(新台幣)：進場、出場各付一次，預設50代表一口來回100元；如果你的50元已經是來回，請填25。目前只有squeeze_kdj_stops/squeeze_kdj_exits使用，其他模式仍是舊假設200元/口/單邊'
         required: false
         default: '50'
 
@@ -192,6 +196,9 @@ jobs:
           fi
           if [ "${{ github.event.inputs.squeeze_kdj_stops }}" = "true" ]; then
             ARGS="$ARGS --squeeze-kdj-stops"
+          fi
+          if [ "${{ github.event.inputs.squeeze_kdj_exits }}" = "true" ]; then
+            ARGS="$ARGS --squeeze-kdj-exits"
           fi
           if [ -n "${{ github.event.inputs.commission_per_lot_side }}" ]; then
             ARGS="$ARGS --commission-per-lot-side ${{ github.event.inputs.commission_per_lot_side }}"
