@@ -133,6 +133,7 @@ compare_breakout.py
     python3 compare_breakout.py --squeeze-kdj-grid --max-stocks 50   # squeeze+KDJ混搭網格(1440組，只用IS選贏家)
     python3 compare_breakout.py --squeeze-kdj-fixed --start 2018-01-01 --max-stocks 0   # 選定的固定設定長歷史+限價1檔成交
     python3 compare_breakout.py --squeeze-kdj-stop-target-grid --start 2018-01-01 --max-stocks 0   # 停損x停利3x3穩健度地圖
+    python3 compare_breakout.py --squeeze-kdj-execution --start 2018-01-01 --max-stocks 0   # 進場成交方式：不追價的代價
 
 ⚠️ 誠實揭露：跟 mean_reversion_engine.py 共用的已知限制(結算日近似、大盤氛圍濾網用0050
 代理、跌停鎖死/注意股處置股未實作、倖存者偏差、保證金追繳/強制斷頭沒有完整模擬)在這裡
@@ -160,6 +161,7 @@ from squeeze_kdj_signal import (
     compute_squeeze_kdj_features, simulate_variant_a_trades, simulate_variant_b_trades,
     precompute_squeeze_kdj_features_by_code, run_squeeze_kdj_capital_constrained_backtest,
     precompute_squeeze_kdj_backtest_arrays, CAPITAL_CONSTRAINED_DIAGNOSTIC_KEYS,
+    squeeze_kdj_entry_limit_price,
 )
 
 RESULTS_DIR = os.path.join(os.path.dirname(__file__), "results_breakout")
@@ -2891,6 +2893,9 @@ def _run_squeeze_kdj_preregistered_cost_backtests(price_data: dict, universe: di
             out[max_pos][vid] = {}
             for period, _ in SQUEEZE_KDJ_FILTER_PERIODS:
                 cal = calendars[period]
+                # 變體參數dict可以覆寫execution_model(--squeeze-kdj-execution用)，其餘模式不會給，維持限價1檔
+                bt_kwargs = dict(execution_model=SQUEEZE_KDJ_FILTER_EXECUTION_MODEL)
+                bt_kwargs.update(variant_kwargs)
                 trades, diag = run_squeeze_kdj_capital_constrained_backtest(
                     price_data=price_data, universe=universe, master_calendar=cal,
                     starting_capital=starting_capital, variant=s["variant"], lots=SQUEEZE_KDJ_FILTER_LOTS,
@@ -2898,9 +2903,8 @@ def _run_squeeze_kdj_preregistered_cost_backtests(price_data: dict, universe: di
                     atr_period=s["atr_period"], max_hold_days=s["max_hold_days"],
                     ranking_rule=s["ranking_rule"],
                     features_by_code=features_by_code, precomputed=precomputed, return_diagnostics=True,
-                    execution_model=SQUEEZE_KDJ_FILTER_EXECUTION_MODEL,
                     commission_per_lot_side=commission_per_lot_side, futures_tax_rate=futures_tax_rate,
-                    **variant_kwargs,
+                    **bt_kwargs,
                 )
                 _annotate_squeeze_kdj_stop_risk(trades, precomputed["per_code"], variant_kwargs["atr_stop_mult"])
                 seg = _squeeze_kdj_filter_period_stats(trades, starting_capital, cal, diag)
@@ -4182,6 +4186,567 @@ def run_squeeze_kdj_stop_target_grid_mode(args, price_data, universe, master_cal
             "commission_per_lot_side": commission, "futures_tax_rate": tax_rate}
 
 
+# ============================================================================
+# --squeeze-kdj-execution：事先登錄(pre-registered)的「進場成交方式」測試——不追價這個習慣值多少錢？
+#
+# 背景：使用者實際下單是「訊號日收盤+1檔掛限價買，開盤比這個價高就不追」，回測裡大約20~25%的單因此
+# 沒有成交(skipped_limit_not_filled)。使用者想知道這個習慣的代價。這裡只測「事先寫死」的4種成交方式，
+# 每一種都放在使用者打算改用的兩個基準設定上跑(停損1.5倍ATR、不加濾網、ATR14、最長20天、觸發K棒漲幅排名、
+# top_n=3、1口、使用者手續費/期交稅)：
+#   B2 = 停利3.0倍ATR、最多同時持有2檔(=N2)；B1 = 停利4.0倍ATR、最多同時持有1檔(=G15_40只用1檔)。
+# 期間/挑選/通過規則跟之前的事先登錄模式同一套(看結果之前就定好，程式機械式執行)：
+#   1. 每個(基準設定, 成交方式)在挑選期(2018-01-01~2022-12-31)、驗證期(2023-01-01~結束)各自從空帳戶獨立重跑；
+#   2. 每個基準設定各自挑選：只看挑選期，挑選期交易筆數>=60的成交方式裡挑選期PF最高者(同分比挑選期總損益，
+#      再同分依X0,X1,X2,X3順序——X0=維持現狀優先)；沒有任何一個>=60筆(B1筆數少，可能發生)時不挑選、只報告；
+#   3. 選定之後才看驗證期：驗證期PF>1、驗證期bootstrap正報酬>80%、驗證期PF比X0高，三個都成立才「通過」。
+# 最乾淨的讀法是「跳空分組」：用X3(全部都買)的交易，依開盤跳空幅度分組，看「目前習慣放棄的那些單」
+# (開盤高於收盤+1檔)到底賺不賺錢。X0~X3的PF比較還混了「名額被不同的交易佔走」的效果。
+# ============================================================================
+
+SQUEEZE_KDJ_EXEC_STOP_MULT = 1.5
+SQUEEZE_KDJ_EXEC_VARIANTS = (
+    # (代號, 英文短名, 回測的成交模型參數, 短標籤, 白話說明)——4個全部可以被挑選，順序就是同分時的優先順序
+    ("X0", "limit_close+1tick", dict(execution_model="limit_ticks", entry_limit_ticks=1), "收盤+1檔,目前習慣",
+     "限價 = 訊號日收盤+1檔，開盤高於限價就不買(=你現在的習慣，基準；跟之前各模式的「限價1檔」逐筆相同)"),
+    ("X1", "limit_close+2ticks", dict(execution_model="limit_ticks", entry_limit_ticks=2), "收盤+2檔",
+     "限價 = 訊號日收盤+2檔(逐檔往上走，跨價位級距時檔位跟著變)，開盤高於限價就不買"),
+    ("X2", "limit_close*1.01", dict(execution_model="limit_pct", entry_limit_pct=0.01), "收盤x1.01",
+     "限價 = 訊號日收盤 x 1.01(往下取到合法價位)，開盤跳空1%以內都買"),
+    ("X3", "market_open", dict(execution_model="market_open"), "開盤市價全買",
+     "不設限價，一律開盤買進，成交價 = 開盤+1檔"),
+)
+SQUEEZE_KDJ_EXEC_SELECTABLE = tuple(v[0] for v in SQUEEZE_KDJ_EXEC_VARIANTS)
+SQUEEZE_KDJ_EXEC_BASELINE = "X0"
+SQUEEZE_KDJ_EXEC_BUY_ALL = "X3"
+SQUEEZE_KDJ_EXEC_BASES = (
+    # (代號, 停利ATR倍數, 最多同時持倉數, 白話說明)
+    ("B2", 3.0, 2, "停損1.5倍ATR／停利3.0倍ATR、最多同時持有2檔(=N2)"),
+    ("B1", 4.0, 1, "停損1.5倍ATR／停利4.0倍ATR、最多同時持有1檔(=G15_40只用1檔)"),
+)
+SQUEEZE_KDJ_EXEC_PRIOR_VARIANTS = 24  # 之前在同一份資料上比過的策略變體(濾網4+停損6+出場5+停損停利9)
+SQUEEZE_KDJ_EXEC_GAP_BUCKETS = (
+    # (代號, 中文)——依「進場日開盤」相對「訊號日收盤」的位置分組(價位跟X0~X2的限價用同一個函式算)
+    ("gap_down", "開低(開盤<收盤)"),
+    ("le_1tick", "平盤~+1檔(X0也會買)"),
+    ("1_2ticks", "+1檔~+2檔"),
+    ("2ticks_1pct", "+2檔~+1%"),
+    ("gt_1pct", "超過+1%"),
+)
+SQUEEZE_KDJ_EXEC_GAP_ABOVE_1TICK = ("1_2ticks", "2ticks_1pct", "gt_1pct")  # = 目前習慣放棄的單
+
+
+def _squeeze_kdj_exec_variant(vid: str) -> tuple:
+    for v in SQUEEZE_KDJ_EXEC_VARIANTS:
+        if v[0] == vid:
+            return v
+    raise KeyError(vid)
+
+
+def _squeeze_kdj_exec_base(bid: str) -> tuple:
+    for b in SQUEEZE_KDJ_EXEC_BASES:
+        if b[0] == bid:
+            return b
+    raise KeyError(bid)
+
+
+def squeeze_kdj_exec_variant_label(vid: str) -> str:
+    return f"{vid}({_squeeze_kdj_exec_variant(vid)[3]})"
+
+
+def squeeze_kdj_exec_backtest_kwargs(bid: str, vid: str) -> dict:
+    """一個(基準設定, 成交方式)要傳給回測的變體參數(其他執行設定由共用迴圈固定)。"""
+    _, target_mult, _, _ = _squeeze_kdj_exec_base(bid)
+    return dict(atr_stop_mult=SQUEEZE_KDJ_EXEC_STOP_MULT, atr_target_mult=target_mult, entry_filter=None,
+                **_squeeze_kdj_exec_variant(vid)[2])
+
+
+def squeeze_kdj_gap_bucket(trigger_close: float, open_price: float) -> str:
+    """開盤相對訊號日收盤的跳空分組(回傳SQUEEZE_KDJ_EXEC_GAP_BUCKETS的代號)。
+    gap_down：開盤 < 收盤；le_1tick：收盤 <= 開盤 <= 收盤+1檔(X0會成交)；1_2ticks：(+1檔, +2檔]；
+    2ticks_1pct：(+2檔, X2的1%限價]；gt_1pct：超過X2的1%限價。限價跟回測引擎用同一個函式算
+    (squeeze_kdj_entry_limit_price)，所以「X0會不會成交」的判斷跟回測完全一致。低價股的1%可能只有2檔左右，
+    這時(+2檔, +1%]這組本來就是空的(1%限價 <= 2檔限價時，超過2檔的全部歸到「超過+1%」)。"""
+    if open_price < trigger_close:
+        return "gap_down"
+    lim1 = squeeze_kdj_entry_limit_price(trigger_close, "limit_ticks", entry_limit_ticks=1)
+    if open_price <= lim1:
+        return "le_1tick"
+    lim2 = squeeze_kdj_entry_limit_price(trigger_close, "limit_ticks", entry_limit_ticks=2)
+    if open_price <= lim2:
+        return "1_2ticks"
+    lim_pct = squeeze_kdj_entry_limit_price(trigger_close, "limit_pct", entry_limit_pct=0.01)
+    if open_price <= max(lim2, lim_pct):
+        return "2ticks_1pct"
+    return "gt_1pct"
+
+
+def _bucket_stats(trades: list) -> dict:
+    pnl = [t["pnl_ntd"] for t in trades]
+    n = len(pnl)
+    return {"count": n, "win_rate": sum(p > 0 for p in pnl) / n * 100 if n else 0.0,
+            "profit_factor": _profit_factor(pnl), "total_pnl_ntd": float(sum(pnl)),
+            "avg_pnl_ntd": float(np.mean(pnl)) if n else 0.0}
+
+
+def squeeze_kdj_gap_bucket_table(trades: list) -> dict:
+    """依跳空分組統計(交易要有entry_trigger_close/entry_open欄位，也就是新成交模型跑出來的)。
+    回傳 {"buckets": {代號: 統計}, "above_1tick": 統計(=目前習慣放棄的三組合計), "x0_fillable": 統計(開低+平盤~1檔),
+    "total": 統計}，統計 = 筆數/勝率/PF/總損益/平均每筆(另加佔全部筆數的比例)。"""
+    groups = {k: [] for k, _ in SQUEEZE_KDJ_EXEC_GAP_BUCKETS}
+    for t in trades:
+        groups[squeeze_kdj_gap_bucket(t["entry_trigger_close"], t["entry_open"])].append(t)
+    n = len(trades)
+
+    def with_share(st):
+        st["share_pct"] = st["count"] / n * 100 if n else 0.0
+        return st
+    out = {"buckets": {k: with_share(_bucket_stats(v)) for k, v in groups.items()}}
+    out["above_1tick"] = with_share(_bucket_stats([t for k in SQUEEZE_KDJ_EXEC_GAP_ABOVE_1TICK for t in groups[k]]))
+    out["x0_fillable"] = with_share(_bucket_stats(groups["gap_down"] + groups["le_1tick"]))
+    out["total"] = with_share(_bucket_stats(trades))
+    return out
+
+
+def squeeze_kdj_exec_entry_breakdown(trades: list, diag: dict) -> dict:
+    """成交方式相關的細項：限價沒成交的筆數/比例(_limit_skip_shares)、平均進場滑價(成交價 - 開盤價，
+    NT$ = 價差 x 合約乘數 x 口數；%相對開盤)、平均開盤跳空。"""
+    slip_ntd, slip_pct, gaps = [], [], []
+    for t in trades:
+        if "entry_open" not in t:
+            continue
+        mult = get_contract_multiplier(t["code"], t["e_price"])
+        slip_ntd.append((t["e_price"] - t["entry_open"]) * mult * t["lots"])
+        slip_pct.append((t["e_price"] / t["entry_open"] - 1) * 100)
+        gaps.append(t["entry_gap_pct"] * 100)
+    shares = _limit_skip_shares(diag)
+    return {
+        "skipped_limit": diag["skipped_limit_not_filled"],
+        "skipped_limit_pct_of_orders": shares["pct_of_orders_placed"],
+        "skipped_limit_pct_of_candidates": shares["pct_of_candidates"],
+        "orders_placed": shares["orders_placed"],
+        "avg_entry_slippage_ntd": float(np.mean(slip_ntd)) if slip_ntd else 0.0,
+        "avg_entry_slippage_pct": float(np.mean(slip_pct)) if slip_pct else 0.0,
+        "avg_entry_gap_pct": float(np.mean(gaps)) if gaps else 0.0,
+    }
+
+
+def run_squeeze_kdj_execution_backtests(price_data: dict, universe: dict, starting_capital: float, master_calendar,
+                                        commission_per_lot_side: float, futures_tax_rate: float,
+                                        base_ids=None, variant_ids=None, features_by_code: dict = None,
+                                        precomputed: dict = None) -> dict:
+    """--squeeze-kdj-execution的計算核心(不寫檔，方便測試)：每個基準設定(B2/B1，各自固定自己的最多持倉數) x
+    成交方式(X0~X3) x 2個期間，用--squeeze-kdj-stops同一個共用迴圈各自從空帳戶獨立跑一次；
+    每段另外加上squeeze_kdj_exec_entry_breakdown()、跳空分組(squeeze_kdj_gap_bucket_table())。
+    回傳 {基準代號: {成交方式代號: {"train": {...}, "test": {...}}}}。"""
+    base_ids = list(base_ids) if base_ids is not None else [b[0] for b in SQUEEZE_KDJ_EXEC_BASES]
+    variant_ids = list(variant_ids) if variant_ids is not None else list(SQUEEZE_KDJ_EXEC_SELECTABLE)
+    s = SQUEEZE_KDJ_FIXED_SETTING
+    if precomputed is None:
+        if features_by_code is None:
+            features_by_code = precompute_squeeze_kdj_features_by_code(price_data, universe)
+        precomputed = precompute_squeeze_kdj_backtest_arrays(price_data, features_by_code, atr_period=s["atr_period"])
+    out = {}
+    for bid in base_ids:
+        _, _, max_pos, _ = _squeeze_kdj_exec_base(bid)
+        specs = [(vid, squeeze_kdj_exec_backtest_kwargs(bid, vid)) for vid in variant_ids]
+        res = _run_squeeze_kdj_preregistered_cost_backtests(
+            price_data, universe, starting_capital, master_calendar, commission_per_lot_side, futures_tax_rate,
+            (max_pos,), specs, SQUEEZE_KDJ_STOPS_EXIT_REASONS, features_by_code, precomputed)[max_pos]
+        for by_period in res.values():
+            for seg in by_period.values():
+                seg.update(squeeze_kdj_exec_entry_breakdown(seg["trades"], seg["diagnostics"]))
+                seg["gap_buckets"] = squeeze_kdj_gap_bucket_table(seg["trades"])
+        out[bid] = res
+    return out
+
+
+def select_squeeze_kdj_exec_variant(train_stats_by_variant: dict,
+                                    min_trades: int = SQUEEZE_KDJ_FILTER_MIN_TRAIN_TRADES):
+    """事先登錄的挑選規則(同select_squeeze_kdj_filter_variant())：只看挑選期統計，X0~X3裡挑選期筆數>=60者
+    PF最高勝出；同分比挑選期總損益，再同分依X0→X1→X2→X3。沒有任何一個>=60筆時回傳(None, 說明)。"""
+    return select_squeeze_kdj_filter_variant(
+        {vid: st for vid, st in train_stats_by_variant.items() if vid in SQUEEZE_KDJ_EXEC_SELECTABLE},
+        min_trades=min_trades, order=SQUEEZE_KDJ_EXEC_SELECTABLE)
+
+
+def squeeze_kdj_exec_verdict(selected, test_by_variant: dict) -> dict:
+    """事先登錄的通過標準：驗證期PF>1、bootstrap正報酬比例>80%、驗證期PF比X0(目前習慣)高。
+    selected=None(挑選期沒有任何成交方式>=60筆)時不判定，只報告(report_only=True)。"""
+    if selected is None:
+        return {"passed": False, "checks": [], "report_only": True,
+                "text": (f"⚪ 不挑選、只報告：挑選期沒有任何成交方式有>={SQUEEZE_KDJ_FILTER_MIN_TRAIN_TRADES}筆交易，"
+                         "依事先登錄的規則這個基準設定不做挑選/判定，下面的數字只能當參考。")}
+    verdict = _squeeze_kdj_preregistered_verdict(
+        selected, test_by_variant, SQUEEZE_KDJ_EXEC_BASELINE, squeeze_kdj_exec_variant_label,
+        "X0(目前習慣：收盤+1檔不追)",
+        "❌ 不通過：挑選期PF最高的就是X0(目前的不追價習慣)——放寬限價或開盤市價全買，在挑選期都沒有勝過不追價，"
+        "依事先登錄的規則，這次的結論是「維持不追價」。")
+    verdict["report_only"] = False
+    return verdict
+
+
+def squeeze_kdj_exec_improvement_table(by_variant: dict) -> list:
+    """「兩段都變好」：X1~X3各自跟X0比勝率、PF(挑選期、驗證期)。"""
+    return squeeze_kdj_filter_improvement_table(
+        by_variant, variant_ids=[v for v in SQUEEZE_KDJ_EXEC_SELECTABLE if v != SQUEEZE_KDJ_EXEC_BASELINE
+                                 and v in by_variant],
+        baseline=SQUEEZE_KDJ_EXEC_BASELINE)
+
+
+def _squeeze_kdj_exec_summary_extra(seg: dict) -> dict:
+    return {
+        "實際掛單數(輪到要下單的候選)": seg["orders_placed"],
+        "限價沒成交筆數": seg["skipped_limit"],
+        "限價沒成交佔掛單比例(%)": seg["skipped_limit_pct_of_orders"],
+        "限價沒成交佔候選比例(%)": seg["skipped_limit_pct_of_candidates"],
+        "平均進場滑價(成交價-開盤，NT$/筆)": seg["avg_entry_slippage_ntd"],
+        "平均進場滑價(相對開盤%)": seg["avg_entry_slippage_pct"],
+        "成交單平均開盤跳空(%)": seg["avg_entry_gap_pct"],
+    }
+
+
+def squeeze_kdj_execution_summary_frame(results: dict, selected_by_base: dict, commission_per_lot_side: float,
+                                        futures_tax_rate: float) -> pd.DataFrame:
+    """squeeze_kdj_execution_summary.csv：基準設定 x 成交方式 x 期間，每列一組回測(欄位跟stops模式同一套，
+    另外加成交方式相關欄位)。兩個基準設定各自挑選，所以「被挑選規則選中」是各自基準內的結果。"""
+    frames = []
+    for bid, by_variant in results.items():
+        _, target_mult, max_pos, desc = _squeeze_kdj_exec_base(bid)
+
+        def prefix(vid, bid=bid, target_mult=target_mult):
+            _, name, kw, _, _ = _squeeze_kdj_exec_variant(vid)
+            return {"基準設定": bid, "基準設定說明": _squeeze_kdj_exec_base(bid)[3], "變體名稱": name,
+                    "可被挑選": vid in SQUEEZE_KDJ_EXEC_SELECTABLE, "成交方式": _squeeze_kdj_exec_variant(vid)[4],
+                    "停損ATR倍數": SQUEEZE_KDJ_EXEC_STOP_MULT, "停利ATR倍數": target_mult,
+                    "進場濾網": SQUEEZE_KDJ_ENTRY_FILTER_LABELS[None]}
+        df = _squeeze_kdj_cost_summary_frame({max_pos: by_variant}, None, commission_per_lot_side, futures_tax_rate,
+                                             prefix, SQUEEZE_KDJ_STOPS_EXIT_REASONS,
+                                             extra_fn=_squeeze_kdj_exec_summary_extra)
+        if df.empty:
+            continue
+        df["用途"] = "用來挑選(各基準設定各自挑選)"
+        df["被挑選規則選中"] = df["變體代號"] == selected_by_base.get(bid)
+        frames.append(df)
+    return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+
+
+def squeeze_kdj_execution_yearly_frame(results: dict, starting_capital: float) -> pd.DataFrame:
+    frames = []
+    for bid, by_variant in results.items():
+        max_pos = _squeeze_kdj_exec_base(bid)[2]
+        df = squeeze_kdj_stops_yearly_frame({max_pos: by_variant}, starting_capital,
+                                            name_fn=lambda vid: _squeeze_kdj_exec_variant(vid)[1])
+        df.insert(0, "基準設定", bid)
+        frames.append(df)
+    cols = ["基準設定"] + SQUEEZE_KDJ_FILTER_YEARLY_COLUMNS
+    return pd.concat(frames, ignore_index=True)[cols] if frames else pd.DataFrame(columns=cols)
+
+
+SQUEEZE_KDJ_EXEC_TRADE_COLUMNS = (["基準設定"] + SQUEEZE_KDJ_STOPS_TRADE_COLUMNS
+                                  + ["訊號日收盤", "進場日開盤", "開盤跳空(%)", "跳空分組", "進場滑價(成交價-開盤，NT$)"])
+SQUEEZE_KDJ_EXEC_GAP_LABELS = dict(SQUEEZE_KDJ_EXEC_GAP_BUCKETS)
+
+
+def squeeze_kdj_execution_trades_frame(results: dict) -> pd.DataFrame:
+    def extra(t):
+        mult = get_contract_multiplier(t["code"], t["e_price"])
+        return {"訊號日收盤": t["entry_trigger_close"], "進場日開盤": t["entry_open"],
+                "開盤跳空(%)": round(t["entry_gap_pct"] * 100, 4),
+                "跳空分組": SQUEEZE_KDJ_EXEC_GAP_LABELS[squeeze_kdj_gap_bucket(t["entry_trigger_close"], t["entry_open"])],
+                "進場滑價(成交價-開盤，NT$)": round((t["e_price"] - t["entry_open"]) * mult * t["lots"], 2)}
+    frames = []
+    for bid, by_variant in results.items():
+        max_pos = _squeeze_kdj_exec_base(bid)[2]
+        df = squeeze_kdj_stops_trades_frame({max_pos: by_variant}, name_fn=lambda vid: _squeeze_kdj_exec_variant(vid)[1],
+                                            extra_fn=extra, columns=SQUEEZE_KDJ_EXEC_TRADE_COLUMNS[1:])
+        df.insert(0, "基準設定", bid)
+        frames.append(df)
+    return (pd.concat(frames, ignore_index=True) if frames
+            else pd.DataFrame(columns=SQUEEZE_KDJ_EXEC_TRADE_COLUMNS))
+
+
+SQUEEZE_KDJ_EXEC_GAP_COLUMNS = ["基準設定", "成交方式", "期間", "跳空分組", "交易筆數", "佔全部比例(%)", "勝率(%)",
+                                "獲利因子PF", "總損益(NT$)", "平均每筆損益(NT$)"]
+
+
+def squeeze_kdj_execution_gap_buckets_frame(results: dict) -> pd.DataFrame:
+    """squeeze_kdj_execution_gap_buckets.csv：每個基準設定 x 期間，X3(全部都買)交易的跳空分組，
+    另外兩列合計：「超過+1檔合計(=目前習慣放棄的單)」、「開低+平盤~1檔合計(=X0會買的單)」。"""
+    rows = []
+    for bid, by_variant in results.items():
+        if SQUEEZE_KDJ_EXEC_BUY_ALL not in by_variant:
+            continue
+        for period, period_label in SQUEEZE_KDJ_FILTER_PERIODS:
+            gb = by_variant[SQUEEZE_KDJ_EXEC_BUY_ALL][period]["gap_buckets"]
+            items = [(SQUEEZE_KDJ_EXEC_GAP_LABELS[k], gb["buckets"][k]) for k, _ in SQUEEZE_KDJ_EXEC_GAP_BUCKETS]
+            items += [("超過+1檔合計(=目前習慣放棄的單)", gb["above_1tick"]),
+                      ("開低+平盤~1檔合計(=X0也會買的單)", gb["x0_fillable"]), ("全部", gb["total"])]
+            for label, st in items:
+                rows.append({"基準設定": bid, "成交方式": squeeze_kdj_exec_variant_label(SQUEEZE_KDJ_EXEC_BUY_ALL),
+                             "期間": period_label, "跳空分組": label, "交易筆數": st["count"],
+                             "佔全部比例(%)": st["share_pct"], "勝率(%)": st["win_rate"],
+                             "獲利因子PF": st["profit_factor"], "總損益(NT$)": st["total_pnl_ntd"],
+                             "平均每筆損益(NT$)": st["avg_pnl_ntd"]})
+    return pd.DataFrame(rows, columns=SQUEEZE_KDJ_EXEC_GAP_COLUMNS)
+
+
+def _fmt_exec_table_row(vid: str, seg_train: dict, seg_test: dict) -> str:
+    def cell(seg):
+        st = seg["stats"]
+        return (f"{st['trade_count']:>4}筆(月{seg['trades_per_month']:>4.1f}) 沒成交{seg['skipped_limit']:>4}"
+                f"({seg['skipped_limit_pct_of_orders']:>4.1f}%) 勝率{st['win_rate']:>5.1f}% PF{_fmt_pf(st['profit_factor']):>6} "
+                f"損益{st['total_pnl_ntd']:>11,.0f} boot正{seg['bootstrap']['pct_positive']:>5.1f}%")
+    return f"  {_disp_ljust(squeeze_kdj_exec_variant_label(vid), 20)}｜挑選期 {cell(seg_train)}｜驗證期 {cell(seg_test)}"
+
+
+def _fmt_exec_entry_line(seg: dict) -> str:
+    return (f"    成交方式：實際掛單{seg['orders_placed']}張，限價沒成交{seg['skipped_limit']}張"
+            f"(佔掛單{seg['skipped_limit_pct_of_orders']:.1f}%、佔候選{seg['skipped_limit_pct_of_candidates']:.1f}%)；"
+            f"成交單平均開盤跳空{seg['avg_entry_gap_pct']:+.2f}%，平均進場滑價(成交價-開盤)"
+            f"NT${seg['avg_entry_slippage_ntd']:,.0f}/筆({seg['avg_entry_slippage_pct']:+.3f}%)")
+
+
+def _fmt_gap_bucket_lines(gb: dict) -> list:
+    def row(label, st):
+        return (f"      {_disp_ljust(label, 34)}{st['count']:>4}筆({st['share_pct']:>5.1f}%) 勝率{st['win_rate']:>5.1f}% "
+                f"PF{_fmt_pf(st['profit_factor']):>6} 總損益NT${st['total_pnl_ntd']:>11,.0f} "
+                f"平均NT${st['avg_pnl_ntd']:>8,.0f}/筆")
+    lines = [row(SQUEEZE_KDJ_EXEC_GAP_LABELS[k], gb["buckets"][k]) for k, _ in SQUEEZE_KDJ_EXEC_GAP_BUCKETS]
+    lines.append(row("→ 超過+1檔合計(=目前習慣放棄的單)", gb["above_1tick"]))
+    lines.append(row("→ 開低+平盤~1檔合計(=X0也會買的單)", gb["x0_fillable"]))
+    return lines
+
+
+def squeeze_kdj_gap_bucket_reading(gb: dict) -> str:
+    """跳空分組的白話結論(只看「超過+1檔合計」那一組)。"""
+    above = gb["above_1tick"]
+    if above["count"] == 0:
+        return "這段期間X3沒有任何一筆是開盤高於收盤+1檔的，看不出不追價的代價。"
+    if above["total_pnl_ntd"] > 0 and above["profit_factor"] > 1:
+        return (f"目前習慣放棄的這{above['count']}筆合計賺NT${above['total_pnl_ntd']:,.0f}(PF{_fmt_pf(above['profit_factor'])})"
+                "——在這段期間「不追價」是有代價的，少賺了這些。")
+    return (f"目前習慣放棄的這{above['count']}筆合計NT${above['total_pnl_ntd']:,.0f}(PF{_fmt_pf(above['profit_factor'])})"
+            "——不賺錢，在這段期間「不追價」反而保護了你。")
+
+
+SQUEEZE_KDJ_EXEC_GAP_EXPLANATION = (
+    "  白話：用X3(開盤全部都買)的交易，依「進場日開盤比訊號日收盤高多少」分組。開盤 <= 收盤+1檔的(含開低)，"
+    "你現在的習慣(X0)也會買到；高於收盤+1檔的三組，就是你現在的習慣「放棄不買」的那些單。"
+    "如果這三組合計是賺錢的，不追價就是在少賺；如果是賠錢的，不追價反而在保護你。"
+    "這張表是最乾淨的讀法：同樣一批訊號、同樣的出場規則，只差在開盤跳空多少。"
+    "下面X0~X3的PF比較還混了「名額效應」——X3多買的單會佔掉名額，讓後面某些訊號沒有位置，"
+    "所以X3跟X0的交易路徑本來就不一樣，PF差異不全是「追不追價」造成的。")
+
+SQUEEZE_KDJ_EXEC_CAVEATS_TEXT = (
+    "【誠實caveat】\n"
+    "  - 股票期貨開盤的流動性可能比股票本身薄：回測的「開盤價」是標的股票的開盤價，開盤用市價買股票期貨，"
+    "實際成交價可能比開盤+1檔更差(尤其是跳空大的那幾天)，X3/X2的結果可能偏樂觀。\n"
+    f"  - 累計多重比較：這次是「成交方式」不是策略參數，但仍然是在同一份資料上再多比較4種成交方式x2個基準設定"
+    f"(之前已累計約{SQUEEZE_KDJ_EXEC_PRIOR_VARIANTS}個策略變體：濾網4+停損6+出場5+停損停利9)；"
+    "就算追不追價完全沒差，多比幾個也有機會剛好比X0好。\n"
+    "  - 兩個基準設定(B2=N2、B1=G15_40用1檔)本身都是看過同一份資料(含驗證期)之後才選的，驗證期對全部變體都偏樂觀——"
+    "「成交方式之間的比較」比「驗證期PF的絕對水準」可信。\n"
+    "  - X0~X3的PF比較含名額效應(X3多買的單會佔掉名額)，跳空分組表才是最乾淨的讀法；跳空分組的筆數通常不多，"
+    "單一組的PF很容易被幾筆大賺/大賠左右。\n"
+    "  - 倖存者偏差：標的清單是「今天」的股票期貨清單，這些年下市/被剔除的不在裡面，很多股票2018年還沒有股票期貨。\n"
+    "  - 價格是標的「股票」的yfinance日K(未還原權值)，拿來代理股票期貨：基差、期貨本身的流動性/買賣價差都沒有模擬。\n"
+    "  - 交易成本是假設值：手續費依你給的每口單邊金額，期交稅是我們理解的十萬分之二(每邊)；"
+    "進場/市價出場滑價1檔已另外算在成交價裡。\n"
+    "  - 各段是獨立重跑(從空帳戶開始)：段尾還沒出場的部位不計入，段首不會有前一段遺留的持倉。\n"
+    "  - bootstrap假設每筆交易獨立，空頭年連續虧損成串出現的風險會被低估；80%是寬鬆門檻。"
+)
+
+
+def run_squeeze_kdj_execution_mode(args, price_data, universe, master_calendar):
+    """
+    --squeeze-kdj-execution模式：事先登錄的4種進場成交方式(X0收盤+1檔不追=目前習慣、X1收盤+2檔、X2收盤x1.01、
+    X3開盤市價全買)，各自放在兩個基準設定上(B2=停利3.0倍/最多2檔=N2、B1=停利4.0倍/最多1檔)，見
+    SQUEEZE_KDJ_EXEC_VARIANTS上方說明。其餘設定：停損1.5倍ATR、不加濾網、ATR14、最長20天、觸發K棒漲幅排名、
+    top_n=3、1口、args.commission_per_lot_side/args.futures_tax_rate。每個基準設定各自依事先登錄規則挑選/判定，
+    另外做X3交易的跳空分組。不需要大盤指數。master_calendar：已從--start開始(main()切掉暖身資料)。
+    輸出squeeze_kdj_execution_summary.csv/_yearly.csv/_trades.csv/_gap_buckets.csv+summary.txt。
+    """
+    print("=" * 100)
+    print("--squeeze-kdj-execution模式：squeeze+KDJ事先登錄的進場成交方式測試(X0~X3 x 基準設定B2/B1)")
+    print("=" * 100, flush=True)
+    starting_capital = args.starting_capital
+    commission = getattr(args, "commission_per_lot_side", None)
+    commission = SQUEEZE_KDJ_STOPS_DEFAULT_COMMISSION_PER_LOT_SIDE if commission is None else float(commission)
+    tax_rate = getattr(args, "futures_tax_rate", None)
+    tax_rate = SQUEEZE_KDJ_STOPS_DEFAULT_FUTURES_TAX_RATE if tax_rate is None else float(tax_rate)
+
+    train_cal, test_cal = split_squeeze_kdj_filter_periods(master_calendar)
+    validity = squeeze_kdj_filter_validity_warnings(args.start, train_cal, test_cal)
+
+    results = run_squeeze_kdj_execution_backtests(price_data, universe, starting_capital, master_calendar,
+                                                  commission, tax_rate)
+    selected, reasons, verdicts, improvements = {}, {}, {}, {}
+    for bid, by_variant in results.items():
+        selected[bid], reasons[bid] = select_squeeze_kdj_exec_variant(
+            {vid: by_variant[vid]["train"]["stats"] for vid in SQUEEZE_KDJ_EXEC_SELECTABLE})
+        verdicts[bid] = squeeze_kdj_exec_verdict(selected[bid], {vid: by_variant[vid]["test"] for vid in by_variant})
+        improvements[bid] = squeeze_kdj_exec_improvement_table(by_variant)
+
+    squeeze_kdj_execution_summary_frame(results, selected, commission, tax_rate).to_csv(
+        os.path.join(RESULTS_DIR, "squeeze_kdj_execution_summary.csv"), index=False, encoding="utf-8-sig")
+    squeeze_kdj_execution_yearly_frame(results, starting_capital).to_csv(
+        os.path.join(RESULTS_DIR, "squeeze_kdj_execution_yearly.csv"), index=False, encoding="utf-8-sig")
+    squeeze_kdj_execution_trades_frame(results).to_csv(
+        os.path.join(RESULTS_DIR, "squeeze_kdj_execution_trades.csv"), index=False, encoding="utf-8-sig")
+    squeeze_kdj_execution_gap_buckets_frame(results).to_csv(
+        os.path.join(RESULTS_DIR, "squeeze_kdj_execution_gap_buckets.csv"), index=False, encoding="utf-8-sig")
+
+    s = SQUEEZE_KDJ_FIXED_SETTING
+    cal = pd.DatetimeIndex(master_calendar)
+    order = list(SQUEEZE_KDJ_EXEC_SELECTABLE)
+    lines = [
+        "=" * 100,
+        "布林+Keltner擠壓+KDJ訊號 --squeeze-kdj-execution模式(進場成交方式：不追價的代價，4種 x 2個基準設定，事先登錄)",
+        f"回測期間：{args.start} ~ {args.end}(實際交易日曆：{cal[0].date() if len(cal) else '無'} ~ "
+        f"{cal[-1].date() if len(cal) else '無'}，{len(cal)}個交易日)　起始資金：NT${starting_capital:,.0f}"
+        f"　標的數：{len(universe)}",
+        f"固定執行設定(全部相同)：變體B固定ATR、停損{SQUEEZE_KDJ_EXEC_STOP_MULT:.1f}倍ATR、不加進場濾網、ATR{s['atr_period']}天"
+        f"｜最長持有{s['max_hold_days']}天｜同日多檔排名：{SQUEEZE_KDJ_RANKING_RULE_LABELS[s['ranking_rule']]}"
+        f"(top_n={SQUEEZE_KDJ_FILTER_TOP_N})｜固定{SQUEEZE_KDJ_FILTER_LOTS}口"
+        f"｜交易成本：{_fmt_cost_assumption(commission, tax_rate)}",
+        "=" * 100,
+    ]
+    if validity:
+        lines += [
+            "",
+            "!" * 100,
+            "⚠️⚠️⚠️ 這次測試無效 ⚠️⚠️⚠️：" + "；".join(validity) + "。",
+            "請把GitHub Actions的「回測起始日期」(start_date)設成2018-01-01、掃描股票數量(max_stocks)設成0重跑。"
+            "下面的數字只能看看，不能拿來決定要不要改下單方式。",
+            "!" * 100,
+        ]
+
+    lines += [
+        "",
+        "【事先登錄的規則(在看任何結果之前就定好，程式機械式執行，不會因為結果改規則)】",
+        "  4種成交方式(只有這4種，全部可以被挑選)：",
+        *[f"    {vid}({name})：{desc}" for vid, name, _, _, desc in SQUEEZE_KDJ_EXEC_VARIANTS],
+        "  4種的出場完全相同：停損/跳空停損/到期出場是市價，多付1檔；固定停利是事先掛好的限價單，不加滑價。",
+        "  2個基準設定(每種成交方式都在兩個上面各跑一次，各自挑選、各自判定)：",
+        *[f"    {bid}：{desc}" for bid, _, _, desc in SQUEEZE_KDJ_EXEC_BASES],
+        f"  期間：挑選期 {SQUEEZE_KDJ_FILTER_TRAIN_START}~{SQUEEZE_KDJ_FILTER_TRAIN_END}"
+        f"(實際{len(train_cal)}個交易日)；驗證期 {SQUEEZE_KDJ_FILTER_TEST_START}~結束(實際{len(test_cal)}個交易日)。"
+        "每個(基準設定, 成交方式)兩段各自從空帳戶獨立重跑一次。",
+        f"  挑選規則(每個基準設定各自)：只看挑選期。挑選期交易筆數>={SQUEEZE_KDJ_FILTER_MIN_TRAIN_TRADES}的成交方式裡，"
+        "挑選期PF最高者勝出(同分比挑選期總損益，再同分依X0,X1,X2,X3順序)。選定之後才看驗證期。"
+        f"B1只有1檔名額、交易比較少：如果沒有任何成交方式在挑選期>={SQUEEZE_KDJ_FILTER_MIN_TRAIN_TRADES}筆，"
+        "B1就不挑選、只報告數字。",
+        f"  通過標準(只判定選出的那一個)：驗證期PF>1 且 驗證期bootstrap(1000次、seed=42)正報酬比例>"
+        f"{SQUEEZE_KDJ_BOOTSTRAP_PASS_PCT_POSITIVE:.0f}% 且 驗證期PF比X0(目前習慣)高。三個都成立才算「通過」。",
+        "  跳空分組(事先登錄)：用X3(開盤全部都買)的交易，依進場日開盤相對訊號日收盤分成5組："
+        + "、".join(lab for _, lab in SQUEEZE_KDJ_EXEC_GAP_BUCKETS)
+        + "。「+1檔/+2檔/+1%」的價位跟X0/X1/X2的限價用同一個函式算(逐檔走、1%往下取到合法價位)；"
+        "低價股的1%可能只有約2檔，這時「+2檔~+1%」那組是空的。",
+        "",
+        "【交易成本假設】",
+        f"  本次：{_fmt_cost_assumption(commission, tax_rate)}。",
+        "  「每口50元」這裡解讀成單邊(一進一出共100元/口)；如果你的50元已經是來回，請把commission_per_lot_side改成25重跑。",
+        "",
+        "#" * 100,
+        "【挑選結果與判定】",
+        "#" * 100,
+    ]
+    for bid, by_variant in results.items():
+        sel = selected[bid]
+        lines.append(f"  ▸ 基準設定{bid}：{_squeeze_kdj_exec_base(bid)[3]}")
+        lines.append(f"    挑選(只看挑選期)：{reasons[bid]}")
+        lines.append(f"    → 選出：{squeeze_kdj_exec_variant_label(sel) if sel else '無(只報告)'}")
+        if sel:
+            lines.append(f"      挑選期：{_fmt_filter_seg_line(by_variant[sel]['train'])}")
+            lines.append(f"      驗證期：{_fmt_filter_seg_line(by_variant[sel]['test'])}")
+            lines.append(f"      X0驗證期(對照，目前習慣)：{_fmt_filter_seg_line(by_variant[SQUEEZE_KDJ_EXEC_BASELINE]['test'])}")
+        if verdicts[bid]["checks"]:
+            lines.append("    判定條件：")
+        for txt, ok in verdicts[bid]["checks"]:
+            lines.append(f"      {'✅' if ok else '❌'} {txt}")
+        lines.append(f"    ★ 結論：{verdicts[bid]['text']}")
+        lines.append("")
+
+    def mark(b):
+        return "✅" if b else "❌"
+    for bid in results:
+        lines.append(f"【兩段都變好？{bid}：每種成交方式跟X0(目前習慣)比(勝率、PF；挑選期、驗證期)】")
+        for r in improvements[bid]:
+            pf_both = r["train_pf_better"] and r["test_pf_better"]
+            lines.append(
+                f"  {_disp_ljust(squeeze_kdj_exec_variant_label(r['variant']), 20)}：挑選期 勝率{mark(r['train_win_rate_better'])} "
+                f"PF{mark(r['train_pf_better'])}｜驗證期 勝率{mark(r['test_win_rate_better'])} PF{mark(r['test_pf_better'])}"
+                f"｜{'兩段都變好' if r['both_periods_better'] else '沒有兩段都變好'}｜PF兩段都較高：{'是' if pf_both else '否'}")
+    lines.append("  (「兩段都變好」只是一致性檢查，不取代事先登錄的挑選規則；PF比較含名額效應，見下方跳空分組。)")
+
+    for bid, by_variant in results.items():
+        lines += ["", f"【並排總表｜{bid}：{_squeeze_kdj_exec_base(bid)[3]}】",
+                  "  (沒成交 = 開盤高於限價、不追價放棄的單；括號是佔實際掛單的比例)"]
+        for vid in order:
+            if vid in by_variant:
+                lines.append(_fmt_exec_table_row(vid, by_variant[vid]["train"], by_variant[vid]["test"]))
+
+    lines += ["", "#" * 100, "【跳空分組：目前不追價的習慣，放棄的那些單到底賺不賺？(X3開盤全買的交易)】", "#" * 100,
+              SQUEEZE_KDJ_EXEC_GAP_EXPLANATION]
+    for bid, by_variant in results.items():
+        if SQUEEZE_KDJ_EXEC_BUY_ALL not in by_variant:
+            continue
+        for period, period_label in SQUEEZE_KDJ_FILTER_PERIODS:
+            gb = by_variant[SQUEEZE_KDJ_EXEC_BUY_ALL][period]["gap_buckets"]
+            lines.append(f"  ▸ {bid}｜{period_label}(X3共{gb['total']['count']}筆，PF{_fmt_pf(gb['total']['profit_factor'])}，"
+                         f"NT${gb['total']['total_pnl_ntd']:,.0f})")
+            lines += _fmt_gap_bucket_lines(gb)
+            lines.append(f"      ★ {squeeze_kdj_gap_bucket_reading(gb)}")
+
+    for bid, by_variant in results.items():
+        lines += ["", f"【各成交方式明細｜{bid}：{_squeeze_kdj_exec_base(bid)[3]}】"]
+        for vid in order:
+            if vid not in by_variant:
+                continue
+            r = by_variant[vid]
+            lines.append("-" * 100)
+            lines.append(f"### {squeeze_kdj_exec_variant_label(vid)}：{_squeeze_kdj_exec_variant(vid)[4]}"
+                         f"{'  ← 挑選規則選中' if vid == selected[bid] else ''}")
+            for period, period_label in SQUEEZE_KDJ_FILTER_PERIODS:
+                seg = r[period]
+                lines.append(f"  {period_label}：{_fmt_filter_seg_line(seg)}")
+                lines.append(f"    bootstrap 5%~95%區間=[NT${seg['bootstrap']['p5']:,.0f}, NT${seg['bootstrap']['p95']:,.0f}]"
+                             f"，每月候選訊號{seg['candidates_per_month']:.1f}個")
+                lines.append(_fmt_exec_entry_line(seg))
+                lines += _fmt_stop_detail_lines(seg)
+                lines.append(f"    [診斷] {_fmt_filter_diag_line(seg['diagnostics']).replace('限價1檔沒成交', '限價沒成交')}")
+            lines.append("  逐年(依出場日)：")
+            yearly = _squeeze_kdj_filter_yearly(r, starting_capital)
+            if not yearly:
+                lines.append("    (沒有任何交易)")
+            for y in yearly:
+                lines.append(f"    {y['year']}年[{y['period']}]：{y['trade_count']}筆, PF={_fmt_pf(y['profit_factor'])}, "
+                             f"勝率={y['win_rate']:.1f}%, 總損益NT${y['total_pnl_ntd']:,.0f}, "
+                             f"年內最大回撤NT${y['max_drawdown_ntd']:,.0f}, 拿掉最大3筆後NT${y['pnl_excluding_top3_ntd']:,.0f}")
+
+    lines += [
+        "",
+        "【每日掃描不會跟著改】",
+        "  每日訊號掃描(daily_squeeze_signals.py)跟其他回測模式都不受影響。這個模式只是回測，"
+        "要不要改成追價/放寬限價，等你看完跳空分組自己決定。",
+        "",
+        SQUEEZE_KDJ_EXEC_CAVEATS_TEXT, "",
+        "輸出：squeeze_kdj_execution_summary.csv(基準設定x成交方式x期間)、squeeze_kdj_execution_yearly.csv(逐年)、"
+        "squeeze_kdj_execution_trades.csv(全部交易，含訊號日收盤/開盤跳空/跳空分組/進場滑價)、"
+        "squeeze_kdj_execution_gap_buckets.csv(X3跳空分組)。",
+    ]
+
+    summary_text = "\n".join(lines)
+    print(summary_text)
+    summary_path = os.path.join(RESULTS_DIR, "summary.txt")
+    with open(summary_path, "w", encoding="utf-8") as f:
+        f.write(summary_text + "\n")
+    print(f"\n已輸出：{summary_path}")
+    return {"results": results, "selected": selected, "selection_reasons": reasons, "verdicts": verdicts,
+            "improvements": improvements, "validity_warnings": validity,
+            "commission_per_lot_side": commission, "futures_tax_rate": tax_rate}
+
+
 def evaluate_combo(label, price_data, indicators_by_code, regime_series, is_calendar, oos_calendar,
                     starting_capital, hold_days, signal_weights, gate_kwargs, atr_stop_mult,
                     trailing_atr_mult, use_trailing_stop, extra_kwargs, execution_kwargs):
@@ -5005,13 +5570,23 @@ def main():
                               "--max-stocks 0；股價往前多抓200個日曆天當暖身。輸出squeeze_kdj_stop_target_grid_summary.csv/"
                               "squeeze_kdj_stop_target_grid_yearly.csv/squeeze_kdj_stop_target_grid_trades.csv+summary.txt。"
                               "跟其他squeeze模式互斥(main()依序檢查，前面的若同時開啟會先執行並直接return)")
+    parser.add_argument("--squeeze-kdj-execution", action="store_true",
+                         help="squeeze+KDJ事先登錄的進場成交方式測試(--squeeze-kdj-execution)：不追價這個習慣值多少錢。"
+                              "4種成交方式X0限價=收盤+1檔(目前習慣)/X1收盤+2檔/X2收盤x1.01/X3不設限價開盤+1檔全買，"
+                              "各自放在B2(停損1.5倍、停利3.0倍、最多2檔=N2)跟B1(停損1.5倍、停利4.0倍、最多1檔)兩個基準設定上，"
+                              "其餘：不加濾網、ATR14、最長20天、觸發K棒漲幅排名、top_n=3、1口。每個基準設定各自"
+                              "依挑選期PF(筆數>=60，不足就只報告)挑一個，再看驗證期PF>1、bootstrap正報酬>80%%、PF勝過X0；"
+                              "另外用X3的交易做開盤跳空分組。交易成本用--commission-per-lot-side/--futures-tax-rate。"
+                              "必須--start 2018-01-01，建議--max-stocks 0；股價往前多抓200個日曆天當暖身。輸出"
+                              "squeeze_kdj_execution_summary.csv/_yearly.csv/_trades.csv/_gap_buckets.csv+summary.txt。"
+                              "跟其他squeeze模式互斥(main()依序檢查，前面的若同時開啟會先執行並直接return)")
     parser.add_argument("--commission-per-lot-side", type=float,
                          default=SQUEEZE_KDJ_STOPS_DEFAULT_COMMISSION_PER_LOT_SIDE,
                          help="每口「單邊」手續費(新台幣)，一進一出付兩次；預設50(=來回100元/口)。"
-                              "目前只有--squeeze-kdj-stops/--squeeze-kdj-exits/--squeeze-kdj-stop-target-grid使用，其他模式仍是舊假設200元/口/單邊")
+                              "目前只有--squeeze-kdj-stops/--squeeze-kdj-exits/--squeeze-kdj-stop-target-grid/--squeeze-kdj-execution使用，其他模式仍是舊假設200元/口/單邊")
     parser.add_argument("--futures-tax-rate", type=float, default=SQUEEZE_KDJ_STOPS_DEFAULT_FUTURES_TAX_RATE,
                          help="期貨交易稅率(每一邊、按契約價值)，預設0.00002(十萬分之二，我們對股票期貨稅率的理解)。"
-                              "目前只有--squeeze-kdj-stops/--squeeze-kdj-exits/--squeeze-kdj-stop-target-grid使用")
+                              "目前只有--squeeze-kdj-stops/--squeeze-kdj-exits/--squeeze-kdj-stop-target-grid/--squeeze-kdj-execution使用")
     parser.add_argument("--fixed-combo-walkforward-folds", type=int, default=0,
                          help="測試幾組「固定死不重新挑選」的候選規則(FIXED_WALKFORWARD_COMBO_VARIANTS，"
                               "基準+只改一個維度的變體)跨N個獨立、不重疊歷史區塊的表現，0代表不啟用(預設)。"
@@ -5031,14 +5606,16 @@ def main():
         if INDEX_PROXY_CODE not in universe:
             universe[INDEX_PROXY_CODE] = STOCK_FUTURES_UNIVERSE[INDEX_PROXY_CODE]
 
-    # --squeeze-kdj-filters/--squeeze-kdj-stops/--squeeze-kdj-exits/--squeeze-kdj-stop-target-grid：股價往前多抓SQUEEZE_KDJ_FILTER_LOOKBACK_DAYS個日曆天當均線/BB/KC/ATR暖身
+    # --squeeze-kdj-filters/--squeeze-kdj-stops/--squeeze-kdj-exits/--squeeze-kdj-stop-target-grid/--squeeze-kdj-execution：股價往前多抓SQUEEZE_KDJ_FILTER_LOOKBACK_DAYS個日曆天當均線/BB/KC/ATR暖身
     # (個股120日均線在回測第一天就算得出來)，交易日曆之後再切回從--start開始。其他模式完全不變。
     load_start = args.start
     if (args.squeeze_kdj_filters or args.squeeze_kdj_stops or args.squeeze_kdj_exits
-            or args.squeeze_kdj_stop_target_grid):
+            or args.squeeze_kdj_stop_target_grid or args.squeeze_kdj_execution):
         mode_flag = ("--squeeze-kdj-filters" if args.squeeze_kdj_filters
                      else "--squeeze-kdj-stops" if args.squeeze_kdj_stops
-                     else "--squeeze-kdj-exits" if args.squeeze_kdj_exits else "--squeeze-kdj-stop-target-grid")
+                     else "--squeeze-kdj-exits" if args.squeeze_kdj_exits
+                     else "--squeeze-kdj-stop-target-grid" if args.squeeze_kdj_stop_target_grid
+                     else "--squeeze-kdj-execution")
         load_start = (pd.Timestamp(args.start) - pd.Timedelta(days=SQUEEZE_KDJ_FILTER_LOOKBACK_DAYS)).date().isoformat()
         print(f"{mode_flag}：股價從{load_start}開始下載(比--start多{SQUEEZE_KDJ_FILTER_LOOKBACK_DAYS}"
               f"個日曆天，當均線暖身用，不會被拿來交易)")
@@ -5137,6 +5714,11 @@ def main():
     if args.squeeze_kdj_stop_target_grid:
         run_squeeze_kdj_stop_target_grid_mode(args, price_data, universe,
                                               master_calendar[master_calendar >= pd.Timestamp(args.start)])
+        return
+
+    if args.squeeze_kdj_execution:
+        run_squeeze_kdj_execution_mode(args, price_data, universe,
+                                       master_calendar[master_calendar >= pd.Timestamp(args.start)])
         return
 
     if args.use_trailing_stop:

@@ -2025,3 +2025,229 @@ class TestSkipEntryWeekdays:
         assert any(t["entry_date"].weekday() == 4 for t in base)
         assert all(t["entry_date"].weekday() != 4 for t in got) and d["skipped_weekday"] > 0
         assert d["candidates_total"] >= d["skipped_weekday"]
+
+
+# ============================================================================
+# --squeeze-kdj-execution新增的成交模型：limit_ticks(收盤+N檔)/limit_pct(收盤x(1+p)往下取檔)/market_open(開盤+1檔)
+# ============================================================================
+from squeeze_kdj_signal import (
+    taiwan_add_ticks, taiwan_round_down_to_tick, squeeze_kdj_entry_limit_price,
+    EXTENDED_EXECUTION_MODELS, ALL_EXECUTION_MODELS,
+)
+
+_GAP_KEYS = ("entry_trigger_close", "entry_open", "entry_gap_pct")
+
+
+class TestTickWalkingAndRounding:
+    @pytest.mark.parametrize("price, n, expected", [
+        (49.95, 1, 50.0),
+        (49.95, 2, 50.1),     # 49.95 →(0.05) 50.0 →(0.1) 50.1，不是49.95+2x0.05=50.05
+        (49.9, 3, 50.1),      # 49.9 → 49.95 → 50.0 → 50.1
+        (99.9, 2, 100.5),     # 99.9 →(0.1) 100.0 →(0.5) 100.5
+        (9.99, 2, 10.05),     # 9.99 →(0.01) 10.0 →(0.05) 10.05
+        (499.5, 3, 502.0),    # 499.5 → 500 → 501 → 502
+        (995.0, 6, 1005.0),   # 995..999 → 1000 → 1005
+        (100.0, 2, 101.0),
+    ])
+    def test_add_ticks_walks_across_boundaries(self, price, n, expected):
+        assert taiwan_add_ticks(price, n) == pytest.approx(expected, abs=1e-9)
+
+    def test_add_one_tick_is_bit_identical_to_limit_1tick_formula(self):
+        for p in (49.95, 49.97, 99.9, 100.0, 123.45, 999.0, 10.0, 9.999, 37.123456):
+            assert taiwan_add_ticks(p, 1) == p + taiwan_tick_size(p)
+
+    @pytest.mark.parametrize("bad", [0, -1, 1.0, True, None])
+    def test_add_ticks_rejects_bad_n(self, bad):
+        with pytest.raises(ValueError):
+            taiwan_add_ticks(100.0, bad)
+
+    @pytest.mark.parametrize("price, expected", [
+        (100.0 * 1.01, 101.0), (50.03, 50.0), (49.97, 49.95), (101.4, 101.0), (101.303, 101.0),
+        (1012.0, 1010.0), (9.999, 9.99), (60.66, 60.6), (10.1, 10.1), (500.9, 500.0), (49.95, 49.95),
+    ])
+    def test_round_down_to_tick(self, price, expected):
+        assert taiwan_round_down_to_tick(price) == pytest.approx(expected, abs=1e-9)
+
+    def test_entry_limit_price_per_model(self):
+        assert squeeze_kdj_entry_limit_price(100.0, "limit_1tick") == 100.5
+        assert squeeze_kdj_entry_limit_price(49.95, "limit_ticks", entry_limit_ticks=2) == pytest.approx(50.1)
+        assert squeeze_kdj_entry_limit_price(100.3, "limit_pct", entry_limit_pct=0.01) == pytest.approx(101.0)
+        assert squeeze_kdj_entry_limit_price(60.0, "limit_pct", entry_limit_pct=0.01) == pytest.approx(60.6)
+        assert squeeze_kdj_entry_limit_price(100.0, "market_open") is None
+        assert squeeze_kdj_entry_limit_price(100.0, "open") is None
+
+    def test_model_lists_backwards_compatible(self):
+        assert VALID_EXECUTION_MODELS == ("open", "limit_1tick")
+        assert EXTENDED_EXECUTION_MODELS == ("limit_ticks", "limit_pct", "market_open")
+        assert ALL_EXECUTION_MODELS == VALID_EXECUTION_MODELS + EXTENDED_EXECUTION_MODELS
+
+
+def _run_exec(df, open_price, close_t=None, **kwargs):
+    """觸發K棒idx20(收盤close_t)、idx21開盤open_price進場；回傳(trades, diag, 第一次_process_mr_day看到的部位)。"""
+    df = df.copy()
+    if close_t is not None:
+        df.iloc[20, df.columns.get_loc("Close")] = close_t
+    df.iloc[21, df.columns.get_loc("Open")] = open_price
+    df.iloc[21, df.columns.get_loc("High")] = max(df.iloc[21]["High"], open_price)
+    df.iloc[21, df.columns.get_loc("Low")] = min(df.iloc[21]["Low"], open_price)
+    features = _make_fixed_features(df, entry_idx=20, prior_low=np.nan)
+    params = dict(max_hold_days=3)
+    params.update(kwargs)
+    return _run_limit(df, features, **params)
+
+
+class TestLimitTicksEntry:
+    @pytest.mark.parametrize("open_price, expected_fill", [
+        (49.95, 50.0),   # 開盤+1檔
+        (50.0, 50.1),    # 50的tick是0.1 → 50.1 = 限價
+        (50.05, 50.1),   # min(50.15, 50.1) → 被限價封頂
+        (50.1, 50.1),    # 剛好等於限價
+        (48.0, 48.05),   # 開低
+    ])
+    def test_two_ticks_across_boundary_fill(self, open_price, expected_fill):
+        df = _make_flat_df(49.95, n=30)
+        trades, diag = _run_exec(df, open_price, execution_model="limit_ticks", entry_limit_ticks=2)
+        assert diag["skipped_limit_not_filled"] == 0
+        assert trades[0]["e_price"] == pytest.approx(expected_fill)
+        assert trades[0]["entry_trigger_close"] == 49.95 and trades[0]["entry_open"] == open_price
+        assert trades[0]["entry_gap_pct"] == pytest.approx(open_price / 49.95 - 1)
+
+    def test_two_ticks_skip_above_limit_but_one_tick_skips_earlier(self):
+        df = _make_flat_df(49.95, n=30)
+        trades, diag = _run_exec(df, 50.2, execution_model="limit_ticks", entry_limit_ticks=2)
+        assert trades == [] and diag["skipped_limit_not_filled"] == 1
+        # 50.05：2檔(限價50.1)會買、1檔(限價50.0)不買
+        t2, d2 = _run_exec(df, 50.05, execution_model="limit_ticks", entry_limit_ticks=2)
+        t1, d1 = _run_exec(df, 50.05, execution_model="limit_ticks", entry_limit_ticks=1)
+        tl, dl = _run_exec(df, 50.05, execution_model="limit_1tick")
+        assert len(t2) == 1 and d2["skipped_limit_not_filled"] == 0
+        assert t1 == [] and d1["skipped_limit_not_filled"] == 1 == dl["skipped_limit_not_filled"] and tl == []
+
+    def test_stop_targets_use_fill_and_market_exit_one_tick_worse(self):
+        df = _limit_df()
+        df.iloc[23, df.columns.get_loc("Low")] = 90.0
+        trades, _ = _run_exec(df, 100.0, execution_model="limit_ticks", entry_limit_ticks=2, max_hold_days=30)
+        t = trades[0]
+        assert t["e_price"] == pytest.approx(100.5) and t["exit_reason"] == "stop"
+        assert t["exit_price"] == pytest.approx(100.5 - 2.0 - 0.1)  # 停損98.5，市價多付1檔(98.5的tick=0.1)
+
+
+class TestLimitPctEntry:
+    def test_pct_limit_rounds_down_and_skips(self):
+        df = _limit_df()
+        # 收盤100.3 → 100.3x1.01 = 101.303 → 往下取到101.0；開盤101.2(跳空<1%)仍然超過限價 → 不買
+        trades, diag = _run_exec(df, 101.2, close_t=100.3, execution_model="limit_pct", entry_limit_pct=0.01)
+        assert trades == [] and diag["skipped_limit_not_filled"] == 1
+        trades, diag = _run_exec(df, 101.0, close_t=100.3, execution_model="limit_pct", entry_limit_pct=0.01)
+        assert trades[0]["e_price"] == pytest.approx(101.0)  # min(101.5, 101.0)
+        assert diag["skipped_limit_not_filled"] == 0
+
+    def test_pct_fill_below_limit(self):
+        df = _make_flat_df(60.0, n=30)
+        trades, _ = _run_exec(df, 60.3, execution_model="limit_pct", entry_limit_pct=0.01)
+        assert trades[0]["e_price"] == pytest.approx(60.4)  # 限價60.6，開盤+1檔=60.4
+        trades, diag = _run_exec(df, 60.7, execution_model="limit_pct", entry_limit_pct=0.01)
+        assert trades == [] and diag["skipped_limit_not_filled"] == 1
+
+
+class TestMarketOpenEntry:
+    @pytest.mark.parametrize("open_price, expected_fill", [(105.0, 105.5), (100.0, 100.5), (95.0, 95.1), (49.0, 49.05)])
+    def test_always_fills_at_open_plus_one_tick(self, open_price, expected_fill):
+        df = _limit_df()
+        trades, diag = _run_exec(df, open_price, execution_model="market_open")
+        assert diag["skipped_limit_not_filled"] == 0 and len(trades) == 1
+        t = trades[0]
+        assert t["e_price"] == pytest.approx(expected_fill)
+        assert t["entry_gap_pct"] == pytest.approx(open_price / 100.0 - 1)
+        if open_price == 100.0:  # 其他開盤價會在進場當天/隔天碰到停損或停利，只檢查平盤那個的到期出場
+            assert t["exit_reason"] == "forced_close" and t["exit_price"] == pytest.approx(100.0 - 0.5)
+
+    def test_gap_fields_only_on_new_models(self):
+        df = _limit_df()
+        for model in ("open", "limit_1tick"):
+            trades, _ = _run_exec(df, 100.0, execution_model=model)
+            assert not any(k in trades[0] for k in _GAP_KEYS), model
+        for model, kw in (("limit_ticks", dict(entry_limit_ticks=1)), ("limit_pct", dict(entry_limit_pct=0.01)),
+                          ("market_open", {})):
+            trades, _ = _run_exec(df, 100.0, execution_model=model, **kw)
+            assert all(k in trades[0] for k in _GAP_KEYS), model
+            assert trades[0]["entry_gap_pct"] == 0.0
+
+    def test_custom_costs_applied_on_new_models(self):
+        df = _limit_df()
+        trades, _ = _run_exec(df, 100.0, execution_model="market_open", commission_per_lot_side=50.0,
+                              futures_tax_rate=0.00002)
+        t = trades[0]
+        mult = get_contract_multiplier("1101", 100.5)
+        expected = (99.5 - 100.5) * mult * 2 - 50.0 * 2 * 2 - 0.00002 * (100.5 + 99.5) * mult * 2
+        assert t["pnl_ntd"] == pytest.approx(expected) and t["commission_ntd"] == 200.0
+
+
+class TestExtendedExecutionArgumentValidation:
+    @pytest.mark.parametrize("kw", [
+        dict(execution_model="limit_ticks"),
+        dict(execution_model="limit_ticks", entry_limit_ticks=0),
+        dict(execution_model="limit_ticks", entry_limit_ticks=1.5),
+        dict(execution_model="limit_1tick", entry_limit_ticks=1),
+        dict(execution_model="market_open", entry_limit_ticks=2),
+        dict(execution_model="limit_pct"),
+        dict(execution_model="limit_pct", entry_limit_pct=-0.01),
+        dict(execution_model="limit_pct", entry_limit_pct=np.nan),
+        dict(execution_model="limit_ticks", entry_limit_ticks=2, entry_limit_pct=0.01),
+        dict(execution_model="open", entry_limit_pct=0.01),
+        dict(execution_model="market_open", slippage_pct=0.001),
+        dict(execution_model="limit_pct", entry_limit_pct=0.01, slippage_pct=0.001),
+    ])
+    def test_bad_combinations_raise(self, kw):
+        df = _limit_df()
+        features = _make_fixed_features(df, entry_idx=20, prior_low=np.nan)
+        with pytest.raises(ValueError):
+            _run_limit(df, features, **kw)
+
+
+def _strip_gap_keys(trades):
+    return [{k: v for k, v in t.items() if k not in _GAP_KEYS} for t in trades]
+
+
+class TestLimitTicksN1MatchesLimit1Tick:
+    """凍結比對：limit_ticks N=1 跟 limit_1tick 在合成市場上逐筆相同(拿掉三個新欄位後)，診斷計數器也相同。"""
+
+    @pytest.mark.parametrize("seed, variant, mcp, top_n, extra", [
+        (0, "B", 3, 3, {}),
+        (1, "B", 2, 3, dict(atr_stop_mult=1.5, atr_target_mult=3.0, commission_per_lot_side=50.0,
+                            futures_tax_rate=0.00002)),
+        (2, "A", 2, 2, {}),
+        (3, "B_trail", 3, 3, dict(atr_stop_mult=1.5)),
+        (0, "B", 1, 3, dict(atr_stop_mult=1.5, atr_target_mult=4.0, breakeven_trigger_atr=1.5)),
+        (1, "B", 2, 3, dict(risk_pct_per_trade=0.01, skip_entry_weekdays=(4,))),
+    ])
+    def test_identical_trades_and_diagnostics(self, seed, variant, mcp, top_n, extra):
+        price_data, universe, idx = _make_synthetic_market(seed=seed)
+        feats = precompute_squeeze_kdj_features_by_code(price_data, universe)
+        kw = dict(variant=variant, lots=1, top_n=top_n, max_concurrent_positions=mcp, max_hold_days=20,
+                  features_by_code=feats, return_diagnostics=True, **extra)
+        old, d_old = run_squeeze_kdj_capital_constrained_backtest(price_data, universe, idx, 1_000_000,
+                                                                  execution_model="limit_1tick", **kw)
+        new, d_new = run_squeeze_kdj_capital_constrained_backtest(price_data, universe, idx, 1_000_000,
+                                                                  execution_model="limit_ticks", entry_limit_ticks=1,
+                                                                  **kw)
+        assert len(old) > 0
+        assert _strip_gap_keys(new) == old
+        assert d_new == d_old
+        assert all(all(k in t for k in _GAP_KEYS) for t in new)
+
+    def test_skip_counts_and_market_open_never_skips(self):
+        price_data, universe, idx = _make_synthetic_market(seed=0)
+        feats = precompute_squeeze_kdj_features_by_code(price_data, universe)
+        kw = dict(variant="B", lots=1, top_n=3, max_concurrent_positions=3, max_hold_days=20,
+                  features_by_code=feats, return_diagnostics=True)
+        _, d1 = run_squeeze_kdj_capital_constrained_backtest(price_data, universe, idx, 1_000_000,
+                                                             execution_model="limit_1tick", **kw)
+        t3, d3 = run_squeeze_kdj_capital_constrained_backtest(price_data, universe, idx, 1_000_000,
+                                                              execution_model="market_open", **kw)
+        assert d1["skipped_limit_not_filled"] > 0 and d3["skipped_limit_not_filled"] == 0
+        for t in t3:
+            assert t["e_price"] == pytest.approx(t["entry_open"] + taiwan_tick_size(t["entry_open"]))
+            assert t["entry_gap_pct"] == pytest.approx(t["entry_open"] / t["entry_trigger_close"] - 1)
+        # 跳空 > 1檔的成交在X3裡一定存在(合成市場開盤有雜訊)，而且正是limit_1tick不會買的那種
+        assert any(t["entry_open"] > t["entry_trigger_close"] + taiwan_tick_size(t["entry_trigger_close"]) for t in t3)

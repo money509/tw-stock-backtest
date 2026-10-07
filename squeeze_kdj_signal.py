@@ -497,7 +497,7 @@ CAPITAL_CONSTRAINED_DIAGNOSTIC_KEYS = (
     "skipped_risk_lots_lt1",       # 風險預算反推口數 < 1口
     "skipped_single_margin_cap",   # 單筆保證金超過starting_capital的35%
     "skipped_total_margin_cap",    # 加上這筆之後總保證金超過整體上限
-    "skipped_limit_not_filled",    # execution_model="limit_1tick"：進場日開盤價高於限價(前一根收盤+1檔)，不追價略過
+    "skipped_limit_not_filled",    # execution_model="limit_1tick"/"limit_ticks"/"limit_pct"：進場日開盤價高於限價，不追價略過
     # 以下兩個是skipped_entry_filter的「原因細項」(--squeeze-kdj-filters新增，其他濾網永遠是0)：
     # 被擋掉的候選裡，大盤條件不成立的有幾個 / 個股半年線條件不成立的有幾個。
     # market_ma60_and_stock_ma120時同一個候選兩個條件可能都不成立，會兩邊各記1次，
@@ -612,6 +612,16 @@ def _market_ok_by_code(per_code: dict, market_series: pd.Series) -> dict:
 # 成交模型(execution_model)：tick(最小升降單位)滑價 + 限價不追價
 # ----------------------------------------------------------------------------
 VALID_EXECUTION_MODELS = ("open", "limit_1tick")
+# --squeeze-kdj-execution新增的3個成交模型(另外列一個tuple，VALID_EXECUTION_MODELS維持舊值不變)：
+#   "limit_ticks"：限價 = 觸發K棒收盤 + entry_limit_ticks檔(逐檔往上走，跨級距時tick會跟著變，見
+#                  taiwan_add_ticks())；開盤 > 限價不追；成交 = min(開盤+1檔, 限價)。N=1跟"limit_1tick"逐筆相同。
+#   "limit_pct"：  限價 = 觸發K棒收盤 x (1 + entry_limit_pct)，再「往下」取到合法的價位(taiwan_round_down_to_tick())；
+#                  略過/成交規則同上。
+#   "market_open"：不設限價，一律在開盤成交，成交價 = 開盤 + 1檔(tick用開盤價算)。
+# 三個都跟"limit_1tick"一樣：市價型出場多付1檔、slippage_pct必須是0；另外每筆交易多記
+# entry_trigger_close(觸發K棒收盤)、entry_open(進場日開盤)、entry_gap_pct(= 開盤/觸發K棒收盤 - 1)。
+EXTENDED_EXECUTION_MODELS = ("limit_ticks", "limit_pct", "market_open")
+ALL_EXECUTION_MODELS = VALID_EXECUTION_MODELS + EXTENDED_EXECUTION_MODELS
 
 # --squeeze-kdj-exits新增的出場原因：停損已經依breakeven_trigger_atr移到進場價之後才被打到的停損。
 # 跟一般停損分開標示，出場原因統計才看得出「保本停損」佔多少、賠多少(限價1檔模型下仍會賠1檔+成本)。
@@ -654,6 +664,41 @@ def taiwan_tick_size(price: float) -> float:
         if price < upper:
             return tick
     return TAIWAN_STOCK_TICK_ABOVE_1000
+
+
+def taiwan_add_ticks(price: float, n: int) -> float:
+    """從price往上走n檔(逐檔走，每一步都用「目前價位」的tick)，跨過級距邊界時tick會跟著變：
+    例如49.95 + 2檔 = 49.95 → 50.0(49.95的tick是0.05) → 50.1(50.0的tick是0.1)，不是49.95 + 2x0.05。
+    n=1時就是price + taiwan_tick_size(price)(跟execution_model="limit_1tick"的限價逐位元相同)；
+    第2步起用round(目前價位, 6)判斷級距，避免49.95+0.05=49.999999...這種浮點誤差被歸到錯的級距。"""
+    if not isinstance(n, (int, np.integer)) or isinstance(n, bool) or n < 1:
+        raise ValueError(f"taiwan_add_ticks()的n必須是>=1的整數，收到{n!r}")
+    p = price + taiwan_tick_size(price)
+    for _ in range(int(n) - 1):
+        p = p + taiwan_tick_size(round(p, 6))
+    return p
+
+
+def taiwan_round_down_to_tick(price: float) -> float:
+    """把價格「往下」取到該價位級距的合法價位(tick的整數倍；各級距邊界10/50/100/500/1000本身都是
+    該級距tick的整數倍，所以取整數倍就是合法價位)。例如50.03 → 50.0、100.4 → 100.0、49.97 → 49.95。
+    加一點點epsilon避免101.0/0.5算成201.99999...被多砍一檔。"""
+    tick = taiwan_tick_size(price)
+    return round(np.floor(price / tick + 1e-9) * tick, 8)
+
+
+def squeeze_kdj_entry_limit_price(ref_close: float, execution_model: str, entry_limit_ticks: int = None,
+                                  entry_limit_pct: float = None):
+    """各成交模型的進場限價(ref_close = 觸發K棒收盤)。"market_open"/"open"沒有限價，回傳None。
+    "limit_1tick" = ref_close + 1檔；"limit_ticks" = taiwan_add_ticks(ref_close, N)；
+    "limit_pct" = taiwan_round_down_to_tick(ref_close x (1 + pct))。"""
+    if execution_model == "limit_1tick":
+        return ref_close + taiwan_tick_size(ref_close)
+    if execution_model == "limit_ticks":
+        return taiwan_add_ticks(ref_close, entry_limit_ticks)
+    if execution_model == "limit_pct":
+        return taiwan_round_down_to_tick(ref_close * (1 + entry_limit_pct))
+    return None
 
 
 def _is_market_type_exit(reason: str, variant: str) -> bool:
@@ -850,7 +895,9 @@ def run_squeeze_kdj_capital_constrained_backtest(price_data: dict, universe: dic
                                                    commission_per_lot_side: float = None,
                                                    futures_tax_rate: float = 0.0,
                                                    breakeven_trigger_atr: float = None,
-                                                   skip_entry_weekdays: tuple = ()):
+                                                   skip_entry_weekdays: tuple = (),
+                                                   entry_limit_ticks: int = None,
+                                                   entry_limit_pct: float = None):
     """
     擠壓+KDJ訊號的「資金/部位受限版」完整day-by-day walk-forward回測，只做多方
     (見模組docstring)。跟run_squeeze_kdj_exit_style_comparison()/
@@ -1002,6 +1049,18 @@ def run_squeeze_kdj_capital_constrained_backtest(price_data: dict, universe: dic
         - 這個模型下slippage_pct必須是0(兩種滑價疊加沒有意義)，否則丟ValueError。
         - 邊界上的小近似(偏保守)：出場「往下1檔」的tick用出場價本身的級距算，剛好落在級距
           邊界時(例如100元)真實的下一檔是99.9，這裡算成99.5，多扣了一點，影響極小。
+      以下三個是--squeeze-kdj-execution新增(EXTENDED_EXECUTION_MODELS)，用來回答「不追價這個習慣
+      值多少錢」；"limit_1tick"那條程式路徑完全沒動：
+      "limit_ticks"(需要entry_limit_ticks=N，N>=1的整數)：限價 = 觸發K棒收盤往上走N檔
+        (taiwan_add_ticks()，逐檔走、跨級距時tick跟著變)；開盤 > 限價不追(skipped_limit_not_filled)；
+        成交 = min(開盤+1檔, 限價)。N=1時跟"limit_1tick"逐筆相同(測試有凍結比對)。
+      "limit_pct"(需要entry_limit_pct=p，例如0.01)：限價 = 觸發K棒收盤 x (1+p)往下取到合法價位
+        (taiwan_round_down_to_tick())；略過/成交規則同上。
+      "market_open"：不設限價、一定成交，成交價 = 開盤 + 1檔(tick用開盤價算)。
+      三者的出場跟"limit_1tick"完全一樣(市價型出場多付1檔、變體B固定停利不加滑價)，slippage_pct必須是0；
+      entry_limit_ticks/entry_limit_pct只能搭配各自的模型(搭錯丟ValueError)。另外每筆交易多三個欄位：
+      entry_trigger_close(觸發K棒收盤)、entry_open(進場日開盤)、entry_gap_pct(= 開盤/觸發K棒收盤 - 1)，
+      只有這三個模型才加，舊模型的trade dict完全不變。
 
     交易成本(--squeeze-kdj-stops新增，預設維持舊版行為)：
       commission_per_lot_side=None且futures_tax_rate=0(預設)：完全不動，損益就是_close_mr_trade()算的
@@ -1049,12 +1108,25 @@ def run_squeeze_kdj_capital_constrained_backtest(price_data: dict, universe: dic
     needs_stock_trend = entry_filter in _FILTERS_NEEDING_STOCK_TREND
     if needs_market and market_series is None:
         raise ValueError(f"entry_filter={entry_filter!r}需要大盤指數收盤價market_series，沒有給")
-    if execution_model not in VALID_EXECUTION_MODELS:
-        raise ValueError(f"execution_model必須是{VALID_EXECUTION_MODELS}其中之一，收到{execution_model!r}")
+    if execution_model not in ALL_EXECUTION_MODELS:
+        raise ValueError(f"execution_model必須是{ALL_EXECUTION_MODELS}其中之一，收到{execution_model!r}")
     limit_1tick = execution_model == "limit_1tick"
-    if limit_1tick and slippage_pct != 0:
-        raise ValueError("execution_model='limit_1tick'已經內建1檔滑價，slippage_pct必須是0"
+    extended_exec = execution_model in EXTENDED_EXECUTION_MODELS
+    tick_exits = limit_1tick or extended_exec  # 市價型出場多付1檔(四個tick模型共用)
+    if tick_exits and slippage_pct != 0:
+        raise ValueError(f"execution_model={execution_model!r}已經內建1檔滑價，slippage_pct必須是0"
                          f"(收到{slippage_pct!r})，不要兩種滑價疊加")
+    if execution_model == "limit_ticks":
+        if not isinstance(entry_limit_ticks, (int, np.integer)) or isinstance(entry_limit_ticks, bool) \
+                or entry_limit_ticks < 1:
+            raise ValueError(f"execution_model='limit_ticks'需要entry_limit_ticks>=1的整數，收到{entry_limit_ticks!r}")
+    elif entry_limit_ticks is not None:
+        raise ValueError(f"entry_limit_ticks只適用execution_model='limit_ticks'(目前是{execution_model!r})")
+    if execution_model == "limit_pct":
+        if entry_limit_pct is None or not (np.isfinite(entry_limit_pct) and entry_limit_pct >= 0):
+            raise ValueError(f"execution_model='limit_pct'需要entry_limit_pct>=0的數字，收到{entry_limit_pct!r}")
+    elif entry_limit_pct is not None:
+        raise ValueError(f"entry_limit_pct只適用execution_model='limit_pct'(目前是{execution_model!r})")
     if commission_per_lot_side is not None and not (np.isfinite(commission_per_lot_side)
                                                     and commission_per_lot_side >= 0):
         raise ValueError(f"commission_per_lot_side必須是>=0的數字或None，收到{commission_per_lot_side!r}")
@@ -1113,7 +1185,7 @@ def run_squeeze_kdj_capital_constrained_backtest(price_data: dict, universe: dic
             # 停損已經移到進場價(保本)之後被打到：改標成保本停損(下面limit_1tick重算會沿用這個原因)
             trades[-1]["exit_reason"] = (BREAKEVEN_STOP_REASON if trades[-1]["exit_reason"] == "stop"
                                          else BREAKEVEN_STOP_GAP_REASON)
-        if limit_1tick and updated is None and len(trades) == n_trades_before + 1:
+        if tick_exits and updated is None and len(trades) == n_trades_before + 1:
             # 市價型出場多付1檔：拿掉剛剛那筆，用調整後的價格經同一個_close_mr_trade()重算損益。
             # 冷卻期已經在上面的出場函式裡設定過(只設一次)，這裡不再碰cooldown_until。
             closed = trades[-1]
@@ -1125,6 +1197,10 @@ def run_squeeze_kdj_capital_constrained_backtest(price_data: dict, universe: dic
         if custom_costs and len(trades) == n_trades_before + 1:
             # 出場當下立刻換成自訂交易成本(在上面limit_1tick重算之後，所以用的是最終成交價)
             apply_squeeze_kdj_trade_costs(trades[-1], commission_per_lot_side, futures_tax_rate)
+        if extended_exec and len(trades) == n_trades_before + 1:
+            # 新成交模型(--squeeze-kdj-execution)：把進場當下的跳空資訊帶到交易紀錄上(舊模型不加欄位)
+            for key in ("entry_trigger_close", "entry_open", "entry_gap_pct"):
+                trades[-1][key] = position[key]
         if breakeven_trigger_atr is not None:
             if closed_today:
                 trades[-1]["breakeven_triggered"] = bool(position.get("breakeven_triggered"))
@@ -1223,6 +1299,19 @@ def run_squeeze_kdj_capital_constrained_backtest(price_data: dict, universe: dic
                     diag["skipped_limit_not_filled"] += 1
                     continue
                 e_price = min(open_p + taiwan_tick_size(open_p), limit_price)
+            elif extended_exec:
+                ref_close = arrs["trigger_close"][i]
+                if not np.isfinite(ref_close) or ref_close <= 0:
+                    diag["skipped_limit_not_filled"] += 1  # 同limit_1tick：實際上到不了這裡
+                    continue
+                limit_price = squeeze_kdj_entry_limit_price(ref_close, execution_model,
+                                                            entry_limit_ticks, entry_limit_pct)
+                if limit_price is not None and open_p > limit_price:
+                    diag["skipped_limit_not_filled"] += 1
+                    continue
+                e_price = open_p + taiwan_tick_size(open_p)
+                if limit_price is not None:
+                    e_price = min(e_price, limit_price)
             else:
                 e_price = open_p * (1 + slippage_pct)
 
@@ -1269,6 +1358,10 @@ def run_squeeze_kdj_capital_constrained_backtest(price_data: dict, universe: dic
                 "e_price": e_price, "target_price": target_price, "stop_price": stop_price,
                 "lots": lots_to_use, "hold_days": 1, "margin_used": margin_needed,
             }
+            if extended_exec:
+                position["entry_trigger_close"] = float(ref_close)
+                position["entry_open"] = float(open_p)
+                position["entry_gap_pct"] = float(open_p / ref_close - 1)
             if breakeven_trigger_atr is not None:
                 position["breakeven_trigger_price"] = e_price + breakeven_trigger_atr * atr_at_signal
                 position["breakeven_triggered"] = False
