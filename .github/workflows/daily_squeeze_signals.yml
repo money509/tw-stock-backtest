@@ -26,6 +26,17 @@ on:
         description: '帳戶資金(新台幣)，用來判斷單筆保證金是否超過35%上限'
         required: false
         default: '200000'
+      # 實盤設定(compare_breakout.py的SQUEEZE_KDJ_LIVE_SETTINGS)：停損1.5倍ATR、限價收盤+2檔，停利依持倉數。
+      # 排程(每天自動跑)沒有inputs，一律用下面Scan signals步驟裡的預設值1。
+      # 如果你決定長期改成同時持有2檔：把這裡的default改成'2'，並把Scan signals步驟裡的 POSITIONS 預設值 1 改成 2。
+      positions:
+        description: '同時最多持有幾檔：1=停利4倍ATR、2=停利3倍ATR'
+        type: choice
+        options:
+          - '1'
+          - '2'
+        required: false
+        default: '1'
 
 permissions:
   contents: write
@@ -61,9 +72,11 @@ jobs:
         env:
           AS_OF: ${{ github.event.inputs.as_of }}
           CAPITAL: ${{ github.event.inputs.capital }}
+          # 排程執行時github.event.inputs是空的 → 用1(同時最多1檔)。長期改2檔時這裡的 '1' 也要改成 '2'。
+          POSITIONS: ${{ github.event.inputs.positions || '1' }}
           SIGNALS_LINK: ${{ github.server_url }}/${{ github.repository }}/blob/${{ github.ref_name }}/signals/latest.md
         run: |
-          ARGS="--output-dir signals"
+          ARGS="--output-dir signals --positions ${POSITIONS:-1}"
           if [ -n "$AS_OF" ]; then
             ARGS="$ARGS --as-of $AS_OF"
           fi
