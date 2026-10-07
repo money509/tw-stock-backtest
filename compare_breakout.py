@@ -1533,6 +1533,7 @@ SQUEEZE_KDJ_GRID_DIAG_LABELS_ZH = {
     "skipped_limit_not_filled": "限價1檔沒成交略過",
     "skipped_filter_market": "濾網細項_大盤不在季線上",
     "skipped_filter_stock_trend": "濾網細項_個股不在半年線上",
+    "skipped_weekday": "進場星期略過",
 }
 SQUEEZE_KDJ_GRID_STAT_LABELS_ZH = {
     "trade_count": "交易筆數", "profit_factor": "獲利因子PF", "win_rate": "勝率(%)",
@@ -1787,6 +1788,7 @@ SQUEEZE_KDJ_FIXED_SEGMENTS = (("full", "全期間"), ("unseen", "未見過區段
 SQUEEZE_KDJ_EXIT_REASON_LABELS_ZH = {
     "stop": "停損", "stop_gap": "跳空停損(開盤價出場)", "target": "停利",
     "forced_close": "持有天數到期強制平倉",
+    "breakeven_stop": "保本停損", "breakeven_stop_gap": "保本停損(跳空，開盤價出場)",
 }
 
 
@@ -1854,7 +1856,7 @@ def _limit_skip_shares(diag: dict) -> dict:
     佔實際掛單數：真的輪到要下單的候選 = 候選總數 - 濾網擋掉 - 名額已滿沒輪到(每個候選在
     回測裡只會落在「濾網/名額/逐一嘗試進場」三條路其中一條，逐一嘗試進場的第一步就是限價檢查)。"""
     total = diag["candidates_total"]
-    placed = total - diag["skipped_entry_filter"] - diag["skipped_no_slot"]
+    placed = total - diag["skipped_entry_filter"] - diag["skipped_no_slot"] - diag.get("skipped_weekday", 0)
     skipped = diag["skipped_limit_not_filled"]
     return {
         "orders_placed": placed,
@@ -2539,8 +2541,9 @@ def _fmt_filter_seg_line(seg: dict) -> str:
             f"bootstrap正報酬{b['pct_positive']:.1f}%(p={b['p_value']:.3f})")
 
 
-def _fmt_filter_diag_line(diag: dict) -> str:
-    return (f"候選{diag['candidates_total']}個：濾網擋掉{diag['skipped_entry_filter']}"
+def _fmt_filter_diag_line(diag: dict, show_weekday: bool = False) -> str:
+    weekday = f"進場星期略過{diag.get('skipped_weekday', 0)}，" if show_weekday else ""
+    return (f"候選{diag['candidates_total']}個：{weekday}濾網擋掉{diag['skipped_entry_filter']}"
             f"(細項：大盤不在季線上{diag['skipped_filter_market']}、個股不在半年線上{diag['skipped_filter_stock_trend']})，"
             f"名額已滿沒輪到{diag['skipped_no_slot']}，限價1檔沒成交{diag['skipped_limit_not_filled']}，"
             f"停損無效{diag['skipped_invalid_stop']}，單筆保證金上限{diag['skipped_single_margin_cap']}，"
@@ -2812,9 +2815,11 @@ def _annotate_squeeze_kdj_stop_risk(trades: list, per_code: dict, atr_stop_mult:
         t["stop_risk_ntd"] = atr_stop_mult * atr * mult * t["lots"]
 
 
-def squeeze_kdj_stop_trade_breakdown(trades: list) -> dict:
+def squeeze_kdj_stop_trade_breakdown(trades: list, exit_reasons=SQUEEZE_KDJ_STOPS_EXIT_REASONS) -> dict:
     """一段交易的細項：平均每筆損益、持有<=1/3/5天就出場的筆數/比例/損益(持有天數：進場當天算第1天，
-    跟trade的hold_days欄位同一個定義)、各出場原因的筆數/比例/損益、手續費/期交稅合計、平均停損風險。"""
+    跟trade的hold_days欄位同一個定義)、各出場原因的筆數/比例/損益、手續費/期交稅合計、平均停損風險。
+    exit_reasons：要分開統計的出場原因((代碼, 中文), ...)，不在清單裡的歸到"other"；
+    --squeeze-kdj-exits另外多列保本停損。"""
     n = len(trades)
     pnl = [t["pnl_ntd"] for t in trades]
 
@@ -2823,8 +2828,8 @@ def squeeze_kdj_stop_trade_breakdown(trades: list) -> dict:
                 "pnl_ntd": float(sum(t["pnl_ntd"] for t in sub))}
 
     early = {d: _bucket([t for t in trades if t["hold_days"] <= d]) for d in SQUEEZE_KDJ_STOPS_EARLY_EXIT_DAYS}
-    known = {r for r, _ in SQUEEZE_KDJ_STOPS_EXIT_REASONS}
-    reasons = {r: _bucket([t for t in trades if t["exit_reason"] == r]) for r, _ in SQUEEZE_KDJ_STOPS_EXIT_REASONS}
+    known = {r for r, _ in exit_reasons}
+    reasons = {r: _bucket([t for t in trades if t["exit_reason"] == r]) for r, _ in exit_reasons}
     reasons["other"] = _bucket([t for t in trades if t["exit_reason"] not in known])
     commission = float(sum(t.get("commission_ntd", 0.0) for t in trades))
     tax = float(sum(t.get("tax_ntd", 0.0) for t in trades))
@@ -2850,8 +2855,28 @@ def run_squeeze_kdj_stop_backtests(price_data: dict, universe: dict, starting_ca
     回傳 {max_pos: {variant_id: {"train": {...}, "test": {...}}}}，每段 = _squeeze_kdj_filter_period_stats()
     再加上squeeze_kdj_stop_trade_breakdown()的欄位。
     """
-    s = SQUEEZE_KDJ_FIXED_SETTING
     variant_ids = list(variant_ids) if variant_ids is not None else [v[0] for v in SQUEEZE_KDJ_STOP_ALL]
+    specs = []
+    for vid in variant_ids:
+        _, _, stop_mult, target_mult, entry_filter, _ = _squeeze_kdj_stop_variant(vid)
+        specs.append((vid, dict(atr_stop_mult=stop_mult, atr_target_mult=target_mult, entry_filter=entry_filter)))
+    return _run_squeeze_kdj_preregistered_cost_backtests(
+        price_data, universe, starting_capital, master_calendar, commission_per_lot_side, futures_tax_rate,
+        max_positions_list, specs, SQUEEZE_KDJ_STOPS_EXIT_REASONS, features_by_code, precomputed)
+
+
+def _run_squeeze_kdj_preregistered_cost_backtests(price_data: dict, universe: dict, starting_capital: float,
+                                                  master_calendar, commission_per_lot_side: float,
+                                                  futures_tax_rate: float, max_positions_list, specs: list,
+                                                  exit_reasons, features_by_code: dict = None,
+                                                  precomputed: dict = None) -> dict:
+    """--squeeze-kdj-stops/--squeeze-kdj-exits共用的計算核心：specs = [(變體代號, 變體自己的回測參數dict)]，
+    參數dict至少要有atr_stop_mult/atr_target_mult(其他像entry_filter/breakeven_trigger_atr/skip_entry_weekdays
+    原樣傳給回測)；其餘執行設定(變體B、1口、top_n=3、ATR14、最長20天、觸發K棒漲幅排名、限價1檔、
+    交易成本)全部固定。每個最多持倉數 x 變體 x 2個期間各自在該期間的交易日曆上從空帳戶獨立跑一次。
+    回傳 {max_pos: {變體代號: {"train": {...}, "test": {...}}}}，每段 = _squeeze_kdj_filter_period_stats()
+    再加上squeeze_kdj_stop_trade_breakdown(exit_reasons)的欄位。"""
+    s = SQUEEZE_KDJ_FIXED_SETTING
     train_cal, test_cal = split_squeeze_kdj_filter_periods(master_calendar)
     calendars = {"train": train_cal, "test": test_cal}
     if precomputed is None:
@@ -2861,8 +2886,7 @@ def run_squeeze_kdj_stop_backtests(price_data: dict, universe: dict, starting_ca
     out = {}
     for max_pos in max_positions_list:
         out[max_pos] = {}
-        for vid in variant_ids:
-            _, _, stop_mult, target_mult, entry_filter, _ = _squeeze_kdj_stop_variant(vid)
+        for vid, variant_kwargs in specs:
             out[max_pos][vid] = {}
             for period, _ in SQUEEZE_KDJ_FILTER_PERIODS:
                 cal = calendars[period]
@@ -2870,16 +2894,16 @@ def run_squeeze_kdj_stop_backtests(price_data: dict, universe: dict, starting_ca
                     price_data=price_data, universe=universe, master_calendar=cal,
                     starting_capital=starting_capital, variant=s["variant"], lots=SQUEEZE_KDJ_FILTER_LOTS,
                     top_n=SQUEEZE_KDJ_FILTER_TOP_N, max_concurrent_positions=max_pos,
-                    atr_stop_mult=stop_mult, atr_target_mult=target_mult,
                     atr_period=s["atr_period"], max_hold_days=s["max_hold_days"],
-                    ranking_rule=s["ranking_rule"], entry_filter=entry_filter,
+                    ranking_rule=s["ranking_rule"],
                     features_by_code=features_by_code, precomputed=precomputed, return_diagnostics=True,
                     execution_model=SQUEEZE_KDJ_FILTER_EXECUTION_MODEL,
                     commission_per_lot_side=commission_per_lot_side, futures_tax_rate=futures_tax_rate,
+                    **variant_kwargs,
                 )
-                _annotate_squeeze_kdj_stop_risk(trades, precomputed["per_code"], stop_mult)
+                _annotate_squeeze_kdj_stop_risk(trades, precomputed["per_code"], variant_kwargs["atr_stop_mult"])
                 seg = _squeeze_kdj_filter_period_stats(trades, starting_capital, cal, diag)
-                seg.update(squeeze_kdj_stop_trade_breakdown(trades))
+                seg.update(squeeze_kdj_stop_trade_breakdown(trades, exit_reasons))
                 out[max_pos][vid][period] = seg
     return out
 
@@ -2917,19 +2941,31 @@ def _fmt_ntd_or_dash(x) -> str:
 def squeeze_kdj_stops_summary_frame(results: dict, selected, commission_per_lot_side: float,
                                     futures_tax_rate: float) -> pd.DataFrame:
     """squeeze_kdj_stops_summary.csv：變體 x 期間 x 最多持倉數，每列一組回測。"""
+    def prefix(vid):
+        _, name, stop_mult, target_mult, entry_filter, _ = _squeeze_kdj_stop_variant(vid)
+        return {"變體名稱": name, "可被挑選": vid in SQUEEZE_KDJ_STOP_SELECTABLE,
+                "停損ATR倍數": stop_mult, "停利ATR倍數": target_mult,
+                "進場濾網": SQUEEZE_KDJ_ENTRY_FILTER_LABELS[entry_filter]}
+    return _squeeze_kdj_cost_summary_frame(results, selected, commission_per_lot_side, futures_tax_rate,
+                                           prefix, SQUEEZE_KDJ_STOPS_EXIT_REASONS)
+
+
+def _squeeze_kdj_cost_summary_frame(results: dict, selected, commission_per_lot_side: float,
+                                    futures_tax_rate: float, prefix_fn, exit_reasons,
+                                    extra_fn=None) -> pd.DataFrame:
+    """--squeeze-kdj-stops/--squeeze-kdj-exits共用的summary CSV：每列 = 最多持倉數 x 變體 x 期間。
+    prefix_fn(變體代號) -> 這個模式自己的變體欄位(放在「變體代號」之後、「期間」之前)；
+    extra_fn(seg) -> 額外的統計欄位(放在出場原因之後、bootstrap之前)，可省略。"""
     rows = []
     for max_pos, by_variant in results.items():
         purpose = "主要(用來挑選)" if max_pos == SQUEEZE_KDJ_FILTER_MAX_POSITIONS else "敏感度對照(不用來挑選)"
         for vid, by_period in by_variant.items():
-            _, name, stop_mult, target_mult, entry_filter, _ = _squeeze_kdj_stop_variant(vid)
             for period, period_label in SQUEEZE_KDJ_FILTER_PERIODS:
                 seg = by_period[period]
                 st, b = seg["stats"], seg["bootstrap"]
                 row = {
-                    "最多同時持倉數": max_pos, "用途": purpose, "變體代號": vid, "變體名稱": name,
-                    "可被挑選": vid in SQUEEZE_KDJ_STOP_SELECTABLE,
-                    "停損ATR倍數": stop_mult, "停利ATR倍數": target_mult,
-                    "進場濾網": SQUEEZE_KDJ_ENTRY_FILTER_LABELS[entry_filter], "期間": period_label,
+                    "最多同時持倉數": max_pos, "用途": purpose, "變體代號": vid, **prefix_fn(vid),
+                    "期間": period_label,
                     "期間起": seg["calendar_start"].date().isoformat() if seg["calendar_start"] is not None else "",
                     "期間迄": seg["calendar_end"].date().isoformat() if seg["calendar_end"] is not None else "",
                     "交易日數": seg["trading_days"],
@@ -2949,11 +2985,13 @@ def squeeze_kdj_stops_summary_frame(results: dict, selected, commission_per_lot_
                     row[f"持有<={d}天出場筆數"] = e["count"]
                     row[f"持有<={d}天出場比例(%)"] = e["pct"]
                     row[f"持有<={d}天出場損益(NT$)"] = e["pnl_ntd"]
-                for r, label in SQUEEZE_KDJ_STOPS_EXIT_REASONS:
+                for r, label in exit_reasons:
                     e = seg["reasons"][r]
                     row[f"出場_{label}筆數"] = e["count"]
                     row[f"出場_{label}比例(%)"] = e["pct"]
                     row[f"出場_{label}損益(NT$)"] = e["pnl_ntd"]
+                if extra_fn is not None:
+                    row.update(extra_fn(seg))
                 for k, v in SQUEEZE_KDJ_FIXED_BOOTSTRAP_LABELS_ZH.items():
                     row[v] = b[k]
                 for k in CAPITAL_CONSTRAINED_DIAGNOSTIC_KEYS:
@@ -2965,11 +3003,13 @@ def squeeze_kdj_stops_summary_frame(results: dict, selected, commission_per_lot_
     return pd.DataFrame(rows)
 
 
-def squeeze_kdj_stops_yearly_frame(results: dict, starting_capital: float) -> pd.DataFrame:
+def squeeze_kdj_stops_yearly_frame(results: dict, starting_capital: float,
+                                   name_fn=lambda vid: _squeeze_kdj_stop_variant(vid)[1]) -> pd.DataFrame:
+    """逐年表(--squeeze-kdj-exits也用，name_fn換成自己的變體名稱)。"""
     rows = []
     for max_pos, by_variant in results.items():
         for vid, by_period in by_variant.items():
-            name = _squeeze_kdj_stop_variant(vid)[1]
+            name = name_fn(vid)
             for y in _squeeze_kdj_filter_yearly(by_period, starting_capital):
                 rows.append({
                     "最多同時持倉數": max_pos, "變體代號": vid, "變體名稱": name, "期間": y["period"],
@@ -2987,11 +3027,13 @@ SQUEEZE_KDJ_STOPS_TRADE_COLUMNS = [
 ]
 
 
-def squeeze_kdj_stops_trades_frame(results: dict) -> pd.DataFrame:
+def squeeze_kdj_stops_trades_frame(results: dict, name_fn=lambda vid: _squeeze_kdj_stop_variant(vid)[1],
+                                  extra_fn=None, columns=SQUEEZE_KDJ_STOPS_TRADE_COLUMNS) -> pd.DataFrame:
+    """全部交易明細(--squeeze-kdj-exits也用：name_fn換變體名稱、extra_fn(trade)->dict多加欄位、columns欄位順序)。"""
     rows = []
     for max_pos, by_variant in results.items():
         for vid, by_period in by_variant.items():
-            name = _squeeze_kdj_stop_variant(vid)[1]
+            name = name_fn(vid)
             for period, period_label in SQUEEZE_KDJ_FILTER_PERIODS:
                 for t in by_period[period]["trades"]:
                     rows.append({
@@ -3006,15 +3048,16 @@ def squeeze_kdj_stops_trades_frame(results: dict) -> pd.DataFrame:
                         "期交稅(NT$)": round(float(t.get("tax_ntd", float("nan"))), 2),
                         "停損風險(NT$，停損距離x乘數x口數)": round(float(t.get("stop_risk_ntd", float("nan"))), 2),
                         "報酬率(相對合約價值)": t["return_pct"],
+                        **(extra_fn(t) if extra_fn is not None else {}),
                     })
-    return pd.DataFrame(rows, columns=SQUEEZE_KDJ_STOPS_TRADE_COLUMNS)
+    return pd.DataFrame(rows, columns=columns)
 
 
-def _fmt_stop_detail_lines(seg: dict) -> list:
+def _fmt_stop_detail_lines(seg: dict, exit_reasons=SQUEEZE_KDJ_STOPS_EXIT_REASONS) -> list:
     early = "；".join(f"<={d}天 {seg['early'][d]['count']}筆({seg['early'][d]['pct']:.1f}%) "
                      f"損益NT${seg['early'][d]['pnl_ntd']:,.0f}" for d in SQUEEZE_KDJ_STOPS_EARLY_EXIT_DAYS)
     reasons = "；".join(f"{label} {seg['reasons'][r]['count']}筆({seg['reasons'][r]['pct']:.1f}%) "
-                       f"NT${seg['reasons'][r]['pnl_ntd']:,.0f}" for r, label in SQUEEZE_KDJ_STOPS_EXIT_REASONS)
+                       f"NT${seg['reasons'][r]['pnl_ntd']:,.0f}" for r, label in exit_reasons)
     if seg["reasons"]["other"]["count"]:
         reasons += f"；其他 {seg['reasons']['other']['count']}筆"
     return [
@@ -3240,6 +3283,416 @@ def run_squeeze_kdj_stops_mode(args, price_data, universe, master_calendar):
     return {"results": results, "old_cost": old_cost, "selected": selected, "verdict": verdict,
             "improvements": improvements, "validity_warnings": validity,
             "commission_per_lot_side": commission, "futures_tax_rate": tax_rate}
+
+
+# ============================================================================
+# --squeeze-kdj-exits：事先登錄(pre-registered)的出場方式小測試，以N2為基準
+#
+# 背景：--squeeze-kdj-stops在真實資料(249檔、2018-01~2026-10、1口、最多2檔、限價1檔、手續費50元/口/單邊
+# ＋期交稅十萬分之二/每邊)上，N2(停損1.5倍ATR、停利3.0倍ATR、不加濾網)在挑選期、驗證期都贏過目前實盤的N1，
+# 9年裡7年較好，但還沒有通過驗證。看N2的逐筆交易：只有約32%打到停利、約17%是持有20天到期出場(平均約+NT$1,000)；
+# 週五進場的交易在多數變體都是賠的(28筆跳空停損裡有10筆是週五進場——進場後馬上遇到週末跳空)。
+# 所以這裡只測「事先寫死」的5個出場/進場時機變體，停損固定1.5倍ATR(=N2)，挑選規則/期間/通過標準跟
+# --squeeze-kdj-filters/--squeeze-kdj-stops完全同一套(看結果之前就定好，程式機械式執行)：
+#   1. 每個變體在挑選期(2018-01-01~2022-12-31)、驗證期(2023-01-01~結束)各自獨立、從空帳戶重跑一次；
+#   2. 只看挑選期、最多同時持有2檔：挑選期交易筆數>=60的變體裡，挑選期PF最高的勝出
+#      (PF同分比挑選期總損益，再同分依E0,E1,E2,E3,E4的順序取前面的——E0=維持N2優先，保守)；
+#   3. 選定之後才看驗證期：驗證期PF>1、驗證期bootstrap正報酬比例>80%、驗證期PF比E0(N2)高，
+#      三個全部成立才算「通過」。E0本身也可以被選中(選中E0 = 出場維持N2原樣)。
+# 先驗強弱(事先說明)：E1/E2只動停利距離(1.5R/3R)，E3是常見的「漲1R後保本」，三者都是看到「停利命中率低、
+# 到期出場多」這個現象之後的一般性假設；E4(週五不進場)是直接看N2結果裡「依進場星期幾分組」的數字才想到的，
+# 等於用同一份資料挖出來的(data-mined)，先驗最弱，就算它挑選期最好也要打折看。
+# ============================================================================
+
+SQUEEZE_KDJ_EXITS_STOP_MULT = 1.5  # 5個變體共用的停損(=N2)
+SQUEEZE_KDJ_EXIT_VARIANTS = (
+    # (代號, 英文短名, 停利ATR倍數, 保本觸發ATR倍數(None=不保本), 不進場的星期(0=週一…4=週五), 短標籤, 白話說明)
+    # 5個全部可以被挑選，順序就是同分時的優先順序
+    ("E0", "target3.0", 3.0, None, (), "停利3.0倍,基準N2",
+     "停損1.5倍ATR／停利3.0倍ATR(=--squeeze-kdj-stops的N2，通過標準的比較基準)"),
+    ("E1", "target2.25", 2.25, None, (), "停利2.25倍",
+     "停利縮短到2.25倍ATR(=1.5R，R=停損距離1.5倍ATR)：只有約32%打到3.0倍停利，測近一點的停利能不能多吃到一些"),
+    ("E2", "target4.5", 4.5, None, (), "停利4.5倍",
+     "停利放遠到4.5倍ATR(=3R)：反方向測試，讓少數大漲的單抱更久(到期出場會更多)"),
+    ("E3", "target3.0_be1R", 3.0, 1.5, (), "停利3.0倍+保本1R",
+     "停利3.0倍ATR＋保本：某天收盤 >= 進場價+1.5倍ATR(=1R)之後，從隔天起停損移到進場價(只往上不往下)"),
+    ("E4", "target3.0_no_fri", 3.0, None, (4,), "停利3.0倍+週五不進場",
+     "停利3.0倍ATR＋週五不進場：進場日(訊號隔天)是週五的候選直接放棄(避免一進場就扛週末跳空)"
+     "——這條是看N2依星期分組的結果才想到的，資料挖掘、先驗最弱"),
+)
+SQUEEZE_KDJ_EXIT_SELECTABLE = tuple(v[0] for v in SQUEEZE_KDJ_EXIT_VARIANTS)
+SQUEEZE_KDJ_EXIT_BASELINE = "E0"
+SQUEEZE_KDJ_EXIT_DATA_MINED = ("E4",)
+SQUEEZE_KDJ_EXITS_EXIT_REASONS = (
+    ("target", "停利"), ("stop", "停損"), ("stop_gap", "跳空停損"),
+    ("breakeven_stop", "保本停損"), ("breakeven_stop_gap", "保本跳空停損"), ("forced_close", "到期"),
+)
+WEEKDAY_LABELS_ZH = ("週一", "週二", "週三", "週四", "週五", "週六", "週日")
+
+
+def _squeeze_kdj_exit_variant(vid: str) -> tuple:
+    for v in SQUEEZE_KDJ_EXIT_VARIANTS:
+        if v[0] == vid:
+            return v
+    raise KeyError(vid)
+
+
+def squeeze_kdj_exit_variant_label(vid: str) -> str:
+    return f"{vid}({_squeeze_kdj_exit_variant(vid)[5]})"
+
+
+def _squeeze_kdj_exit_backtest_kwargs(vid: str) -> dict:
+    _, _, target_mult, be_trigger, skip_weekdays, _, _ = _squeeze_kdj_exit_variant(vid)
+    return dict(atr_stop_mult=SQUEEZE_KDJ_EXITS_STOP_MULT, atr_target_mult=target_mult, entry_filter=None,
+                breakeven_trigger_atr=be_trigger, skip_entry_weekdays=tuple(skip_weekdays))
+
+
+def _profit_factor(pnls: list) -> float:
+    gross_win = sum(p for p in pnls if p > 0)
+    gross_loss = -sum(p for p in pnls if p < 0)
+    if gross_loss > 0:
+        return gross_win / gross_loss
+    return float("inf") if gross_win > 0 else 0.0
+
+
+def squeeze_kdj_exit_extra_breakdown(trades: list) -> dict:
+    """--squeeze-kdj-exits額外的細項：
+    weekday：依「進場日」星期幾(0=週一…4=週五)分組的筆數/勝率/PF/損益(看E4的依據、也看其他變體週五是否特別差)；
+    breakeven：有觸發保本(停損移到進場價)的筆數與損益(只有E3會有，其他變體的交易沒有breakeven_triggered欄位=0)；
+    time_exit：到期出場(forced_close)的筆數/總損益/平均每筆。"""
+    weekday = {}
+    for wd in range(5):
+        sub = [t["pnl_ntd"] for t in trades if pd.Timestamp(t["entry_date"]).weekday() == wd]
+        weekday[wd] = {"count": len(sub), "pnl_ntd": float(sum(sub)), "profit_factor": _profit_factor(sub),
+                       "win_rate": (sum(p > 0 for p in sub) / len(sub) * 100) if sub else 0.0}
+    be = [t for t in trades if t.get("breakeven_triggered")]
+    timed = [t["pnl_ntd"] for t in trades if t["exit_reason"] == "forced_close"]
+    return {
+        "weekday": weekday,
+        "breakeven_triggered_count": len(be),
+        "breakeven_triggered_pnl_ntd": float(sum(t["pnl_ntd"] for t in be)),
+        "breakeven_triggered_then_target": sum(t["exit_reason"] == "target" for t in be),
+        "time_exit_count": len(timed), "time_exit_pnl_ntd": float(sum(timed)),
+        "time_exit_avg_pnl_ntd": float(np.mean(timed)) if timed else 0.0,
+    }
+
+
+def run_squeeze_kdj_exit_backtests(price_data: dict, universe: dict, starting_capital: float, master_calendar,
+                                   commission_per_lot_side: float, futures_tax_rate: float,
+                                   max_positions_list=(SQUEEZE_KDJ_FILTER_MAX_POSITIONS,
+                                                       SQUEEZE_KDJ_FILTER_SENSITIVITY_MAX_POSITIONS),
+                                   variant_ids=None, features_by_code: dict = None, precomputed: dict = None) -> dict:
+    """--squeeze-kdj-exits的計算核心(不寫檔，方便測試)：跟run_squeeze_kdj_stop_backtests()同一個共用迴圈
+    (_run_squeeze_kdj_preregistered_cost_backtests)，變體換成E0~E4(停損都是1.5倍ATR、不加濾網)，
+    每段另外加上squeeze_kdj_exit_extra_breakdown()的欄位(進場星期分組、保本觸發、到期出場)。"""
+    variant_ids = list(variant_ids) if variant_ids is not None else list(SQUEEZE_KDJ_EXIT_SELECTABLE)
+    specs = [(vid, _squeeze_kdj_exit_backtest_kwargs(vid)) for vid in variant_ids]
+    out = _run_squeeze_kdj_preregistered_cost_backtests(
+        price_data, universe, starting_capital, master_calendar, commission_per_lot_side, futures_tax_rate,
+        max_positions_list, specs, SQUEEZE_KDJ_EXITS_EXIT_REASONS, features_by_code, precomputed)
+    for by_variant in out.values():
+        for by_period in by_variant.values():
+            for seg in by_period.values():
+                seg.update(squeeze_kdj_exit_extra_breakdown(seg["trades"]))
+    return out
+
+
+def select_squeeze_kdj_exit_variant(train_stats_by_variant: dict,
+                                    min_trades: int = SQUEEZE_KDJ_FILTER_MIN_TRAIN_TRADES):
+    """事先登錄的挑選規則(跟select_squeeze_kdj_filter_variant()同一個函式)：只看挑選期統計，
+    候選是E0~E4全部5個；同分依E0→E1→E2→E3→E4(E0=出場維持N2優先，保守)。"""
+    return select_squeeze_kdj_filter_variant(
+        {vid: st for vid, st in train_stats_by_variant.items() if vid in SQUEEZE_KDJ_EXIT_SELECTABLE},
+        min_trades=min_trades, order=SQUEEZE_KDJ_EXIT_SELECTABLE)
+
+
+def squeeze_kdj_exit_verdict(selected, test_by_variant: dict) -> dict:
+    """事先登錄的通過標準：驗證期PF>1、bootstrap正報酬比例>80%、驗證期PF比E0(=N2)高。"""
+    verdict = _squeeze_kdj_preregistered_verdict(
+        selected, test_by_variant, SQUEEZE_KDJ_EXIT_BASELINE, squeeze_kdj_exit_variant_label,
+        "E0(=N2：停損1.5倍、停利3.0倍)",
+        "❌ 不通過：挑選期PF最高的是E0(=N2原樣)——4個改動在挑選期都沒有勝過N2，"
+        "依事先登錄的規則，這次的結論是「出場維持N2原樣(停利3.0倍ATR、不保本、每天都可進場)」。")
+    if selected in SQUEEZE_KDJ_EXIT_DATA_MINED:
+        verdict["text"] += ("(注意：選出的E4是看N2依星期分組的結果才想到的變體——資料挖掘、先驗最弱，"
+                            "就算通過也要打折看。)")
+    return verdict
+
+
+def squeeze_kdj_exit_improvement_table(by_variant: dict) -> list:
+    """「兩段都變好」：E1~E4各自跟E0(=N2)比勝率、PF。"""
+    return squeeze_kdj_filter_improvement_table(
+        by_variant, variant_ids=[v for v in SQUEEZE_KDJ_EXIT_SELECTABLE if v != SQUEEZE_KDJ_EXIT_BASELINE],
+        baseline=SQUEEZE_KDJ_EXIT_BASELINE)
+
+
+def _squeeze_kdj_exit_summary_prefix(vid: str) -> dict:
+    _, name, target_mult, be_trigger, skip_weekdays, _, _ = _squeeze_kdj_exit_variant(vid)
+    return {"變體名稱": name, "可被挑選": vid in SQUEEZE_KDJ_EXIT_SELECTABLE,
+            "停損ATR倍數": SQUEEZE_KDJ_EXITS_STOP_MULT, "停利ATR倍數": target_mult,
+            "保本觸發(收盤>=進場價+N倍ATR)": be_trigger if be_trigger is not None else "不保本",
+            "不進場的星期": "、".join(WEEKDAY_LABELS_ZH[w] for w in skip_weekdays) or "無",
+            "資料挖掘(先驗最弱)": vid in SQUEEZE_KDJ_EXIT_DATA_MINED}
+
+
+def _squeeze_kdj_exit_summary_extra(seg: dict) -> dict:
+    row = {
+        "到期出場平均損益(NT$/筆)": seg["time_exit_avg_pnl_ntd"],
+        "觸發保本筆數": seg["breakeven_triggered_count"],
+        "觸發保本後打到停利筆數": seg["breakeven_triggered_then_target"],
+        "觸發保本的交易損益(NT$)": seg["breakeven_triggered_pnl_ntd"],
+    }
+    for wd in range(5):
+        w = seg["weekday"][wd]
+        row[f"{WEEKDAY_LABELS_ZH[wd]}進場筆數"] = w["count"]
+        row[f"{WEEKDAY_LABELS_ZH[wd]}進場PF"] = w["profit_factor"]
+        row[f"{WEEKDAY_LABELS_ZH[wd]}進場損益(NT$)"] = w["pnl_ntd"]
+    return row
+
+
+def squeeze_kdj_exits_summary_frame(results: dict, selected, commission_per_lot_side: float,
+                                    futures_tax_rate: float) -> pd.DataFrame:
+    """squeeze_kdj_exits_summary.csv：變體 x 期間 x 最多持倉數，每列一組回測(欄位跟stops模式同一套，
+    另外多保本/週五/到期出場的細項)。"""
+    return _squeeze_kdj_cost_summary_frame(results, selected, commission_per_lot_side, futures_tax_rate,
+                                           _squeeze_kdj_exit_summary_prefix, SQUEEZE_KDJ_EXITS_EXIT_REASONS,
+                                           extra_fn=_squeeze_kdj_exit_summary_extra)
+
+
+def squeeze_kdj_exits_yearly_frame(results: dict, starting_capital: float) -> pd.DataFrame:
+    return squeeze_kdj_stops_yearly_frame(results, starting_capital,
+                                          name_fn=lambda vid: _squeeze_kdj_exit_variant(vid)[1])
+
+
+SQUEEZE_KDJ_EXITS_TRADE_COLUMNS = SQUEEZE_KDJ_STOPS_TRADE_COLUMNS + ["進場星期", "是否觸發保本(停損移到進場價)"]
+
+
+def squeeze_kdj_exits_trades_frame(results: dict) -> pd.DataFrame:
+    def extra(t):
+        return {"進場星期": WEEKDAY_LABELS_ZH[pd.Timestamp(t["entry_date"]).weekday()],
+                "是否觸發保本(停損移到進場價)": bool(t.get("breakeven_triggered", False))}
+    return squeeze_kdj_stops_trades_frame(results, name_fn=lambda vid: _squeeze_kdj_exit_variant(vid)[1],
+                                          extra_fn=extra, columns=SQUEEZE_KDJ_EXITS_TRADE_COLUMNS)
+
+
+def _fmt_exit_structure_row(vid: str, seg_train: dict, seg_test: dict) -> str:
+    def cell(seg):
+        n = seg["stats"]["trade_count"]
+        tgt = seg["reasons"]["target"]
+        be = seg["reasons"]["breakeven_stop"]["count"] + seg["reasons"]["breakeven_stop_gap"]["count"]
+        return (f"停利{tgt['count']:>3}筆({tgt['pct']:>4.1f}%) 到期{seg['time_exit_count']:>3}筆"
+                f"(平均NT${seg['time_exit_avg_pnl_ntd']:>6,.0f}) 保本停損{be:>3}筆 "
+                f"<=3天{seg['early'][3]['pct']:>4.1f}% 均持{seg['stats']['avg_hold_days']:>4.1f}天"
+                if n else "沒有任何交易")
+    return f"  {squeeze_kdj_exit_variant_label(vid):<22}｜挑選期 {cell(seg_train)}｜驗證期 {cell(seg_test)}"
+
+
+def _fmt_exit_extra_lines(seg: dict) -> list:
+    wd = "；".join(f"{WEEKDAY_LABELS_ZH[w]} {seg['weekday'][w]['count']}筆 PF{_fmt_pf(seg['weekday'][w]['profit_factor'])} "
+                   f"NT${seg['weekday'][w]['pnl_ntd']:,.0f}" for w in range(5))
+    lines = [
+        f"    到期出場(持有{SQUEEZE_KDJ_FIXED_SETTING['max_hold_days']}天)：{seg['time_exit_count']}筆，"
+        f"合計NT${seg['time_exit_pnl_ntd']:,.0f}，平均NT${seg['time_exit_avg_pnl_ntd']:,.0f}/筆；"
+        f"平均持有{seg['stats']['avg_hold_days']:.1f}天",
+        f"    依進場星期：{wd}",
+    ]
+    if seg["breakeven_triggered_count"]:
+        lines.append(f"    觸發保本(停損移到進場價)：{seg['breakeven_triggered_count']}筆，之後打到停利"
+                     f"{seg['breakeven_triggered_then_target']}筆，這些交易合計NT${seg['breakeven_triggered_pnl_ntd']:,.0f}")
+    return lines
+
+
+SQUEEZE_KDJ_EXITS_CAVEATS_TEXT = (
+    "【誠實caveat】\n"
+    "  - 基準N2本身就是--squeeze-kdj-stops用同一段挑選期(2018~2022)選出來、也看過驗證期之後才拿來當基準的，"
+    "所以這5個變體的驗證期都不是全新資料；驗證期(2023-01-01之後)也跟「挑基本設定」用過的資料重疊"
+    "(停利3.0倍、最長20天這組基本設定是看過2023-10-06之後的1440組網格結果才選的)，驗證期對全部變體都偏樂觀——"
+    "「出場方式之間的比較」比「驗證期PF的絕對水準」可信。\n"
+    "  - E4(週五不進場)是看N2逐筆結果「依進場星期分組」之後才想到的：等於用同一份資料挖出規則再拿同一份資料驗證，"
+    "先驗最弱；週五特別差也可能只是28筆跳空停損裡的雜訊。\n"
+    "  - 5個變體仍然是多重比較：就算出場方式完全沒差，5個裡挑挑選期最好的，驗證期也有一定機率剛好比E0好。\n"
+    "  - 保本停損只在「收盤」確認、隔天才生效：盤中漲到1R又跌回來的那天不會觸發；限價1檔模型下保本停損"
+    "一樣多付1檔，加上手續費/期交稅，「保本」出場其實是小賠。\n"
+    "  - 週五不進場只看進場日本身是星期幾，沒有處理連假(週四進場、週五放假的長週末不會被擋)。\n"
+    "  - 倖存者偏差：標的清單是「今天」的股票期貨清單，這些年下市/被剔除的不在裡面，很多股票2018年還沒有股票期貨。\n"
+    "  - 價格是標的「股票」的yfinance日K(未還原權值)，拿來代理股票期貨：基差、期貨本身的流動性/買賣價差都沒有模擬。\n"
+    "  - 交易成本是假設值：手續費依你給的每口單邊金額，期交稅是我們理解的十萬分之二(每邊)；"
+    "限價1檔模型的進場/市價出場滑價已另外算在成交價裡。\n"
+    "  - 各段是獨立重跑(從空帳戶開始)：段尾還沒出場的部位不計入，段首不會有前一段遺留的持倉。\n"
+    "  - bootstrap假設每筆交易獨立，空頭年連續虧損成串出現的風險會被低估；80%是寬鬆門檻。"
+)
+
+
+def run_squeeze_kdj_exits_mode(args, price_data, universe, master_calendar):
+    """
+    --squeeze-kdj-exits模式：以N2(停損1.5倍ATR、停利3.0倍ATR、不加濾網)為基準，事先登錄的5個變體
+    (E0=N2、E1停利2.25倍、E2停利4.5倍、E3停利3.0倍+漲1R後保本、E4停利3.0倍+週五不進場)，見
+    SQUEEZE_KDJ_EXIT_VARIANTS上方說明。執行設定、期間、挑選規則、通過標準跟--squeeze-kdj-stops相同
+    (1口、最多2檔+1檔敏感度對照、限價1檔、top_n=3、最長20天、觸發K棒漲幅排名、ATR14)，通過標準的比較基準是E0。
+    交易成本用args.commission_per_lot_side(預設50元/口/單邊)、args.futures_tax_rate(預設十萬分之二/每邊)。
+    不需要大盤指數。master_calendar：這次執行的交易日曆(main()已經切掉往前多抓的暖身資料，從--start開始)。
+    輸出squeeze_kdj_exits_summary.csv/squeeze_kdj_exits_yearly.csv/squeeze_kdj_exits_trades.csv
+    +summary.txt(同時印在畫面上)。跟其他squeeze模式一樣跳過完整6階段流程。
+    """
+    print("=" * 100)
+    print("--squeeze-kdj-exits模式：squeeze+KDJ事先登錄的出場方式測試(以N2為基準，5個變體E0~E4)")
+    print("=" * 100, flush=True)
+    starting_capital = args.starting_capital
+    commission = getattr(args, "commission_per_lot_side", None)
+    commission = SQUEEZE_KDJ_STOPS_DEFAULT_COMMISSION_PER_LOT_SIDE if commission is None else float(commission)
+    tax_rate = getattr(args, "futures_tax_rate", None)
+    tax_rate = SQUEEZE_KDJ_STOPS_DEFAULT_FUTURES_TAX_RATE if tax_rate is None else float(tax_rate)
+
+    train_cal, test_cal = split_squeeze_kdj_filter_periods(master_calendar)
+    validity = squeeze_kdj_filter_validity_warnings(args.start, train_cal, test_cal)
+
+    results = run_squeeze_kdj_exit_backtests(price_data, universe, starting_capital, master_calendar,
+                                             commission, tax_rate)
+    main_res = results[SQUEEZE_KDJ_FILTER_MAX_POSITIONS]
+    selected, selection_reason = select_squeeze_kdj_exit_variant(
+        {vid: main_res[vid]["train"]["stats"] for vid in SQUEEZE_KDJ_EXIT_SELECTABLE})
+    verdict = squeeze_kdj_exit_verdict(selected, {vid: main_res[vid]["test"] for vid in main_res})
+    improvements = squeeze_kdj_exit_improvement_table(main_res)
+
+    squeeze_kdj_exits_summary_frame(results, selected, commission, tax_rate).to_csv(
+        os.path.join(RESULTS_DIR, "squeeze_kdj_exits_summary.csv"), index=False, encoding="utf-8-sig")
+    squeeze_kdj_exits_yearly_frame(results, starting_capital).to_csv(
+        os.path.join(RESULTS_DIR, "squeeze_kdj_exits_yearly.csv"), index=False, encoding="utf-8-sig")
+    squeeze_kdj_exits_trades_frame(results).to_csv(
+        os.path.join(RESULTS_DIR, "squeeze_kdj_exits_trades.csv"), index=False, encoding="utf-8-sig")
+
+    s = SQUEEZE_KDJ_FIXED_SETTING
+    cal = pd.DatetimeIndex(master_calendar)
+    order = list(SQUEEZE_KDJ_EXIT_SELECTABLE)
+    lines = [
+        "=" * 100,
+        "布林+Keltner擠壓+KDJ訊號 --squeeze-kdj-exits模式(以N2為基準的出場方式測試，5個變體，事先登錄)",
+        f"回測期間：{args.start} ~ {args.end}(實際交易日曆：{cal[0].date() if len(cal) else '無'} ~ "
+        f"{cal[-1].date() if len(cal) else '無'}，{len(cal)}個交易日)　起始資金：NT${starting_capital:,.0f}"
+        f"　標的數：{len(universe)}",
+        f"固定執行設定(全部變體相同)：停損{SQUEEZE_KDJ_EXITS_STOP_MULT:.1f}倍ATR、不加進場濾網｜"
+        f"{describe_squeeze_kdj_stops_execution(commission, tax_rate)}",
+        "=" * 100,
+    ]
+    if validity:
+        lines += [
+            "",
+            "!" * 100,
+            "⚠️⚠️⚠️ 這次測試無效 ⚠️⚠️⚠️：" + "；".join(validity) + "。",
+            "請把GitHub Actions的「回測起始日期」(start_date)設成2018-01-01、掃描股票數量(max_stocks)設成0重跑。"
+            "下面的數字只能看看，不能拿來決定要不要改出場方式。",
+            "!" * 100,
+        ]
+
+    lines += [
+        "",
+        "【事先登錄的規則(在看任何結果之前就定好，程式機械式執行，不會因為結果改規則)】",
+        f"  基準：N2(停損{SQUEEZE_KDJ_EXITS_STOP_MULT:.1f}倍ATR／停利3.0倍ATR、不加濾網)——--squeeze-kdj-stops裡兩段都贏過"
+        "目前實盤N1、但還沒通過驗證的那一組。",
+        "  5個變體，事先登錄(全部可以被挑選，沒有其他參數)：",
+        *[f"    {vid}({name})：{desc}" for vid, name, _, _, _, _, desc in SQUEEZE_KDJ_EXIT_VARIANTS],
+        "  為什麼是這5個：N2的交易只有約32%打到停利、約17%持有20天到期出場(平均約+NT$1,000)，所以測停利近一點(E1)、"
+        "遠一點(E2)、漲1R後保本(E3)；E4(週五不進場)是看N2依「進場星期幾」分組的結果(28筆跳空停損裡10筆是週五進場)"
+        "才想到的——這是用同一份資料挖出來的規則(資料挖掘)，先驗最弱。",
+        "  5個變體 = 多重比較：就算出場方式完全沒差，5個裡挑挑選期最好的，驗證期也有一定機率剛好比E0好。",
+        f"  期間：挑選期 {SQUEEZE_KDJ_FILTER_TRAIN_START}~{SQUEEZE_KDJ_FILTER_TRAIN_END}"
+        f"(實際{len(train_cal)}個交易日)；驗證期 {SQUEEZE_KDJ_FILTER_TEST_START}~結束(實際{len(test_cal)}個交易日)。"
+        "兩段各自從空帳戶獨立重跑一次。",
+        f"  挑選規則：只看挑選期、最多同時持有{SQUEEZE_KDJ_FILTER_MAX_POSITIONS}檔的結果。5個變體裡挑選期交易筆數"
+        f">={SQUEEZE_KDJ_FILTER_MIN_TRAIN_TRADES}的，挑選期PF最高者勝出(同分比挑選期總損益，再同分依E0,E1,E2,E3,E4順序)。"
+        "選定之後才看驗證期。",
+        f"  通過標準(只判定選出的那一個)：驗證期PF>1 且 驗證期bootstrap(1000次、seed=42)正報酬比例>"
+        f"{SQUEEZE_KDJ_BOOTSTRAP_PASS_PCT_POSITIVE:.0f}% 且 驗證期PF比E0(=N2)高。三個都成立才算「通過」。",
+        f"  最多同時持有{SQUEEZE_KDJ_FILTER_SENSITIVITY_MAX_POSITIONS}檔的結果只當敏感度對照，不參與挑選。",
+        "  保本(E3)的細節：用「收盤」判斷，觸發當天不改停損，隔天起停損 = 進場成交價(限價1檔模型下保本停損出場"
+        "一樣多付1檔，所以保本停損其實是小賠)；出場原因另外標成「保本停損」。",
+        "",
+        "【交易成本假設】",
+        f"  本次：{_fmt_cost_assumption(commission, tax_rate)}。",
+        "  「每口50元」這裡解讀成單邊(一進一出共100元/口)；如果你的50元已經是來回，請把commission_per_lot_side改成25重跑。",
+        "",
+        "#" * 100,
+        "【挑選結果與判定】",
+        "#" * 100,
+        f"  挑選(只看挑選期)：{selection_reason}",
+        f"  → 選出：{squeeze_kdj_exit_variant_label(selected) if selected else '無'}",
+    ]
+    if selected:
+        lines.append(f"    挑選期：{_fmt_filter_seg_line(main_res[selected]['train'])}")
+        lines.append(f"    驗證期：{_fmt_filter_seg_line(main_res[selected]['test'])}")
+        lines.append(f"    E0驗證期(對照，=N2)：{_fmt_filter_seg_line(main_res[SQUEEZE_KDJ_EXIT_BASELINE]['test'])}")
+    lines.append("  判定條件：")
+    for txt, ok in verdict["checks"]:
+        lines.append(f"    {'✅' if ok else '❌'} {txt}")
+    lines.append(f"  ★ 結論：{verdict['text']}")
+    lines.append("")
+    lines.append("【兩段都變好？每個變體跟E0(=N2)比(勝率、PF；挑選期、驗證期)】")
+    for r in improvements:
+        def mark(b):
+            return "✅" if b else "❌"
+        lines.append(
+            f"  {squeeze_kdj_exit_variant_label(r['variant']):<22}：挑選期 勝率{mark(r['train_win_rate_better'])} "
+            f"PF{mark(r['train_pf_better'])}｜驗證期 勝率{mark(r['test_win_rate_better'])} PF{mark(r['test_pf_better'])}"
+            f"｜{'兩段都變好' if r['both_periods_better'] else '沒有兩段都變好'}")
+    lines.append("  (「兩段都變好」只是一致性檢查，不取代上面的事先登錄挑選規則；停利遠近本來就會讓勝率跟PF往反方向動。)")
+
+    for max_pos, title in ((SQUEEZE_KDJ_FILTER_MAX_POSITIONS, "主要：最多同時持有2檔(用來挑選)"),
+                           (SQUEEZE_KDJ_FILTER_SENSITIVITY_MAX_POSITIONS, "敏感度對照：最多同時持有1檔(不用來挑選)")):
+        if max_pos not in results:
+            continue
+        lines += ["", f"【並排總表｜{title}】"]
+        for vid in order:
+            lines.append(_fmt_table_row(vid, results[max_pos][vid]["train"], results[max_pos][vid]["test"],
+                                        label=squeeze_kdj_exit_variant_label(vid)))
+
+    lines += ["", f"【出場結構對照(最多同時持有{SQUEEZE_KDJ_FILTER_MAX_POSITIONS}檔)：停利命中/到期出場/保本停損/"
+                  "持有<=3天出場比例/平均持有天數】"]
+    for vid in order:
+        lines.append(_fmt_exit_structure_row(vid, main_res[vid]["train"], main_res[vid]["test"]))
+
+    lines += ["", "【各變體明細｜最多同時持有2檔】"]
+    for vid in order:
+        r = main_res[vid]
+        desc = _squeeze_kdj_exit_variant(vid)[6]
+        lines.append("-" * 100)
+        lines.append(f"### {squeeze_kdj_exit_variant_label(vid)}：{desc}{'  ← 挑選規則選中' if vid == selected else ''}")
+        for period, period_label in SQUEEZE_KDJ_FILTER_PERIODS:
+            seg = r[period]
+            lines.append(f"  {period_label}：{_fmt_filter_seg_line(seg)}")
+            lines.append(f"    bootstrap 5%~95%區間=[NT${seg['bootstrap']['p5']:,.0f}, NT${seg['bootstrap']['p95']:,.0f}]"
+                         f"，每月候選訊號{seg['candidates_per_month']:.1f}個")
+            lines += _fmt_stop_detail_lines(seg, SQUEEZE_KDJ_EXITS_EXIT_REASONS)
+            lines += _fmt_exit_extra_lines(seg)
+            lines.append(f"    [診斷] {_fmt_filter_diag_line(seg['diagnostics'], show_weekday=True)}")
+        lines.append("  逐年(依出場日)：")
+        yearly = _squeeze_kdj_filter_yearly(r, starting_capital)
+        if not yearly:
+            lines.append("    (沒有任何交易)")
+        for y in yearly:
+            lines.append(f"    {y['year']}年[{y['period']}]：{y['trade_count']}筆, PF={_fmt_pf(y['profit_factor'])}, "
+                         f"勝率={y['win_rate']:.1f}%, 總損益NT${y['total_pnl_ntd']:,.0f}, "
+                         f"年內最大回撤NT${y['max_drawdown_ntd']:,.0f}, 拿掉最大3筆後NT${y['pnl_excluding_top3_ntd']:,.0f}")
+
+    lines += [
+        "",
+        "【每日掃描不會跟著改】",
+        f"  每日訊號掃描(daily_squeeze_signals.py)仍然沿用SQUEEZE_KDJ_FIXED_SETTING：停損{s['atr_stop_mult']:.1f}倍ATR、"
+        f"停利{s['atr_target_mult']:.1f}倍ATR、不保本、每天都可進場。這個模式只是回測，不會改掃描器或實盤設定的任何東西，"
+        "要不要換成N2或改出場方式，等你看完結果自己決定。",
+        "",
+        SQUEEZE_KDJ_EXITS_CAVEATS_TEXT, "",
+        "輸出：squeeze_kdj_exits_summary.csv(變體x期間x最多持倉數)、squeeze_kdj_exits_yearly.csv(逐年)、"
+        "squeeze_kdj_exits_trades.csv(全部交易，含進場星期/是否觸發保本/手續費/期交稅)。",
+    ]
+
+    summary_text = "\n".join(lines)
+    print(summary_text)
+    summary_path = os.path.join(RESULTS_DIR, "summary.txt")
+    with open(summary_path, "w", encoding="utf-8") as f:
+        f.write(summary_text + "\n")
+    print(f"\n已輸出：{summary_path}")
+    return {"results": results, "selected": selected, "verdict": verdict, "improvements": improvements,
+            "validity_warnings": validity, "commission_per_lot_side": commission, "futures_tax_rate": tax_rate}
 
 
 def evaluate_combo(label, price_data, indicators_by_code, regime_series, is_calendar, oos_calendar,
@@ -4044,13 +4497,24 @@ def main():
                               "--max-stocks 0；股價往前多抓200個日曆天當均線暖身。輸出squeeze_kdj_stops_summary.csv/"
                               "squeeze_kdj_stops_yearly.csv/squeeze_kdj_stops_trades.csv+summary.txt。"
                               "跟其他squeeze模式互斥(main()依序檢查，前面的若同時開啟會先執行並直接return)")
+    parser.add_argument("--squeeze-kdj-exits", action="store_true",
+                         help="squeeze+KDJ事先登錄的出場方式小測試(--squeeze-kdj-exits)，以N2(停損1.5倍ATR、停利3.0倍ATR、"
+                              "不加濾網)為基準的5個變體：E0=N2、E1停利2.25倍ATR(1.5R)、E2停利4.5倍ATR(3R)、"
+                              "E3停利3.0倍+收盤漲到進場價+1.5倍ATR(1R)後隔天起停損移到進場價(保本)、"
+                              "E4停利3.0倍+進場日是週五就不進場(看N2依星期分組結果才想到的，資料挖掘、先驗最弱)，全部可被挑選。"
+                              "執行設定/期間/挑選規則跟--squeeze-kdj-stops相同(1口、最多2檔+1檔敏感度對照、限價1檔、top_n=3；"
+                              "挑選期2018~2022選PF最高且筆數>=60者；驗證期PF>1、bootstrap正報酬>80%%、PF勝過E0)。"
+                              "交易成本用--commission-per-lot-side/--futures-tax-rate。必須--start 2018-01-01，建議"
+                              "--max-stocks 0；股價往前多抓200個日曆天當暖身。輸出squeeze_kdj_exits_summary.csv/"
+                              "squeeze_kdj_exits_yearly.csv/squeeze_kdj_exits_trades.csv+summary.txt。"
+                              "跟其他squeeze模式互斥(main()依序檢查，前面的若同時開啟會先執行並直接return)")
     parser.add_argument("--commission-per-lot-side", type=float,
                          default=SQUEEZE_KDJ_STOPS_DEFAULT_COMMISSION_PER_LOT_SIDE,
                          help="每口「單邊」手續費(新台幣)，一進一出付兩次；預設50(=來回100元/口)。"
-                              "目前只有--squeeze-kdj-stops使用，其他模式仍是舊假設200元/口/單邊")
+                              "目前只有--squeeze-kdj-stops/--squeeze-kdj-exits使用，其他模式仍是舊假設200元/口/單邊")
     parser.add_argument("--futures-tax-rate", type=float, default=SQUEEZE_KDJ_STOPS_DEFAULT_FUTURES_TAX_RATE,
                          help="期貨交易稅率(每一邊、按契約價值)，預設0.00002(十萬分之二，我們對股票期貨稅率的理解)。"
-                              "目前只有--squeeze-kdj-stops使用")
+                              "目前只有--squeeze-kdj-stops/--squeeze-kdj-exits使用")
     parser.add_argument("--fixed-combo-walkforward-folds", type=int, default=0,
                          help="測試幾組「固定死不重新挑選」的候選規則(FIXED_WALKFORWARD_COMBO_VARIANTS，"
                               "基準+只改一個維度的變體)跨N個獨立、不重疊歷史區塊的表現，0代表不啟用(預設)。"
@@ -4070,11 +4534,12 @@ def main():
         if INDEX_PROXY_CODE not in universe:
             universe[INDEX_PROXY_CODE] = STOCK_FUTURES_UNIVERSE[INDEX_PROXY_CODE]
 
-    # --squeeze-kdj-filters/--squeeze-kdj-stops：股價往前多抓SQUEEZE_KDJ_FILTER_LOOKBACK_DAYS個日曆天當均線/BB/KC/ATR暖身
+    # --squeeze-kdj-filters/--squeeze-kdj-stops/--squeeze-kdj-exits：股價往前多抓SQUEEZE_KDJ_FILTER_LOOKBACK_DAYS個日曆天當均線/BB/KC/ATR暖身
     # (個股120日均線在回測第一天就算得出來)，交易日曆之後再切回從--start開始。其他模式完全不變。
     load_start = args.start
-    if args.squeeze_kdj_filters or args.squeeze_kdj_stops:
-        mode_flag = "--squeeze-kdj-filters" if args.squeeze_kdj_filters else "--squeeze-kdj-stops"
+    if args.squeeze_kdj_filters or args.squeeze_kdj_stops or args.squeeze_kdj_exits:
+        mode_flag = ("--squeeze-kdj-filters" if args.squeeze_kdj_filters
+                     else "--squeeze-kdj-stops" if args.squeeze_kdj_stops else "--squeeze-kdj-exits")
         load_start = (pd.Timestamp(args.start) - pd.Timedelta(days=SQUEEZE_KDJ_FILTER_LOOKBACK_DAYS)).date().isoformat()
         print(f"{mode_flag}：股價從{load_start}開始下載(比--start多{SQUEEZE_KDJ_FILTER_LOOKBACK_DAYS}"
               f"個日曆天，當均線暖身用，不會被拿來交易)")
@@ -4162,6 +4627,11 @@ def main():
 
     if args.squeeze_kdj_stops:
         run_squeeze_kdj_stops_mode(args, price_data, universe,
+                                   master_calendar[master_calendar >= pd.Timestamp(args.start)])
+        return
+
+    if args.squeeze_kdj_exits:
+        run_squeeze_kdj_exits_mode(args, price_data, universe,
                                    master_calendar[master_calendar >= pd.Timestamp(args.start)])
         return
 

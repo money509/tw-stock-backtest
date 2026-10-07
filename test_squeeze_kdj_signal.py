@@ -1824,3 +1824,204 @@ class TestCustomTradeCostsHandComputed:
         trades, _ = _run_limit(df, features, code=MINI_CODE, max_hold_days=3, **self.COSTS)
         assert len(trades) == 2
         assert seen[-1] == [pytest.approx(1200 - 200 - 0.828)]
+
+
+# ============================================================================
+# --squeeze-kdj-exits：保本停損(breakeven_trigger_atr) / 進場星期濾網(skip_entry_weekdays)
+# ============================================================================
+from squeeze_kdj_signal import BREAKEVEN_STOP_REASON, BREAKEVEN_STOP_GAP_REASON
+
+
+def _set(df, i, **cols):
+    for c, v in cols.items():
+        df.iloc[i, df.columns.get_loc(c)] = v
+
+
+class TestBreakevenStop:
+    """持平100(ATR=2)，idx21開盤100 → 限價1檔成交100.5；停損1.5倍 → 97.5、停利3.0倍 → 106.5；
+    保本觸發 = 100.5 + 1.5x2 = 103.5(收盤要 >= 103.5)。迷你契約(乘數100)、1口、手續費50/口/單邊、期交稅0.002%/邊。"""
+    COSTS = dict(commission_per_lot_side=50, futures_tax_rate=0.00002)
+    KW = dict(atr_stop_mult=1.5, atr_target_mult=3.0, lots=1, max_hold_days=30)
+
+    def _df_features(self, n=40):
+        df = _limit_df(n=n)
+        return df, _make_fixed_features(df, entry_idx=20, prior_low=np.nan)
+
+    def _spy_stops(self, monkeypatch):
+        seen = []
+
+        def _spy(position, row, date, trades, max_hold_days, cooldown_until, slippage_pct=0.0):
+            seen.append((date, position["stop_price"]))
+            return _process_mr_day(position, row, date, trades, max_hold_days, cooldown_until,
+                                   slippage_pct=slippage_pct)
+        monkeypatch.setattr(skd, "_process_mr_day", _spy)
+        return seen
+
+    def test_stop_moves_to_entry_only_from_day_after_trigger_and_hand_computed_pnl(self, monkeypatch):
+        df, features = self._df_features()
+        _set(df, 22, Close=104.0, High=105.0)          # idx22收盤104 >= 103.5 → 觸發；當天Low=99已低於100.5但停損還是97.5
+        _set(df, 23, Open=103.0, High=104.0, Low=100.0, Close=101.0)  # idx23盤中碰到100.5 → 保本停損
+        seen = self._spy_stops(monkeypatch)
+        trades, _ = _run_limit(df, features, code=MINI_CODE, breakeven_trigger_atr=1.5, **self.KW, **self.COSTS)
+        assert len(trades) == 1
+        t = trades[0]
+        assert [s for _, s in seen] == [pytest.approx(97.5), pytest.approx(97.5), pytest.approx(100.5)]
+        assert t["exit_date"] == df.index[23] and t["exit_reason"] == BREAKEVEN_STOP_REASON
+        assert t["e_price"] == pytest.approx(100.5)
+        assert t["exit_price"] == pytest.approx(100.0)  # 保本停損是市價型出場：100.5 - 1檔(0.5)
+        # 價差 (100.0-100.5)x100x1 = -50；手續費50x1x2 = 100；稅 0.00002x(100.5+100.0)x100 = 0.401
+        assert t["commission_ntd"] == pytest.approx(100.0) and t["tax_ntd"] == pytest.approx(0.401)
+        assert t["pnl_ntd"] == pytest.approx(-150.401)
+        assert t["breakeven_triggered"] is True
+        # 同一份資料不保本：idx23的Low=100沒碰到97.5，不會出場
+        no_be, _ = _run_limit(df, features, code=MINI_CODE, **{**self.KW, "max_hold_days": 10}, **self.COSTS)
+        assert len(no_be) == 1 and no_be[0]["exit_reason"] == "forced_close" and no_be[0]["exit_date"] == df.index[30]
+        assert "breakeven_triggered" not in no_be[0]
+
+    def test_breakeven_gap_exit(self):
+        df, features = self._df_features()
+        _set(df, 22, Close=104.0, High=105.0)
+        _set(df, 23, Open=100.0, High=101.0, Low=99.0, Close=100.0)  # 開盤就低於100.5
+        trades, _ = _run_limit(df, features, code=MINI_CODE, breakeven_trigger_atr=1.5, **self.KW, **self.COSTS)
+        t = trades[0]
+        assert t["exit_reason"] == BREAKEVEN_STOP_GAP_REASON
+        assert t["exit_price"] == pytest.approx(99.5)  # 開盤100 - 1檔(0.5)
+        assert t["pnl_ntd"] == pytest.approx((99.5 - 100.5) * 100 - 100 - 0.00002 * (100.5 + 99.5) * 100)
+
+    def test_trigger_on_entry_day_close(self, monkeypatch):
+        df, features = self._df_features()
+        _set(df, 21, Close=103.5, High=104.0)  # 進場當天收盤剛好等於觸發價(>=)
+        _set(df, 22, Open=101.0)                 # 隔天開盤在100.5之上、盤中Low=99碰到
+        seen = self._spy_stops(monkeypatch)
+        trades, _ = _run_limit(df, features, code=MINI_CODE, breakeven_trigger_atr=1.5, **self.KW)
+        # idx22 Low=99 <= 100.5 → 隔天就保本停損
+        assert [s for _, s in seen] == [pytest.approx(97.5), pytest.approx(100.5)]
+        assert trades[0]["exit_reason"] == BREAKEVEN_STOP_REASON and trades[0]["exit_date"] == df.index[22]
+
+    def test_never_moves_down_after_trigger(self, monkeypatch):
+        df, features = self._df_features()
+        _set(df, 22, Close=104.0, High=105.0)
+        for i in range(23, 27):  # 之後收盤都回到觸發價以下，但盤中都在100.5之上
+            _set(df, i, Open=102.0, High=103.0, Low=101.0, Close=102.0)
+        seen = self._spy_stops(monkeypatch)
+        trades, _ = _run_limit(df, features, code=MINI_CODE, breakeven_trigger_atr=1.5,
+                               **{**self.KW, "max_hold_days": 6})
+        stops = [s for _, s in seen]
+        assert stops[:2] == [pytest.approx(97.5), pytest.approx(97.5)]
+        assert all(s == pytest.approx(100.5) for s in stops[2:]) and len(stops) == 6
+        assert trades[0]["exit_reason"] == "forced_close" and trades[0]["breakeven_triggered"] is True
+
+    def test_not_triggered_when_close_stays_below_threshold(self, monkeypatch):
+        df, features = self._df_features()
+        _set(df, 22, Close=103.45, High=106.0)  # 收盤差一點點(盤中最高超過觸發價也不算)
+        _set(df, 23, Open=102.0, High=103.0, Low=100.0, Close=101.0)
+        seen = self._spy_stops(monkeypatch)
+        trades, _ = _run_limit(df, features, code=MINI_CODE, breakeven_trigger_atr=1.5,
+                               **{**self.KW, "max_hold_days": 4})
+        assert all(s == pytest.approx(97.5) for _, s in seen)
+        t = trades[0]
+        assert t["exit_reason"] == "forced_close" and t["breakeven_triggered"] is False
+        ref, _ = _run_limit(df, features, code=MINI_CODE, **{**self.KW, "max_hold_days": 4})
+        assert {k: v for k, v in t.items() if k != "breakeven_triggered"} == ref[0]
+
+    def test_existing_higher_trailing_stop_is_kept_and_labelled_plain_stop(self, monkeypatch):
+        df, features = self._df_features()
+        _set(df, 22, Close=110.0, High=110.5)   # B_trail：停損 = 110 - 1.0x2 = 108 > 進場價
+        _set(df, 23, Open=109.0, High=109.5, Low=107.0, Close=108.0)
+        seen = self._spy_stops(monkeypatch)
+        trades, _ = _run_limit(df, features, code=MINI_CODE, variant="B_trail", trailing_atr_mult=1.0,
+                               breakeven_trigger_atr=1.5, **self.KW)
+        assert seen[-1][1] == pytest.approx(108.0)  # 沒有被保本拉回100.5
+        assert trades[0]["exit_reason"] == "stop" and trades[0]["breakeven_triggered"] is True
+
+    def test_cooldown_after_breakeven_stop(self):
+        df, features = self._df_features()
+        _set(df, 22, Close=104.0, High=105.0)
+        _set(df, 23, Open=103.0, High=104.0, Low=100.0, Close=101.0)
+        features.iloc[24, features.columns.get_loc("EntryFlag")] = True  # idx25想再進場 → 冷卻期內
+        trades, _ = _run_limit(df, features, code=MINI_CODE, breakeven_trigger_atr=1.5, **self.KW)
+        assert len(trades) == 1
+
+    @pytest.mark.parametrize("scenario", _SNAPSHOT_SCENARIOS[:4])
+    def test_defaults_identical_to_legacy(self, scenario):
+        seed, variant, mcp, lots, capital, slip, top_n, hold, cal = scenario
+        price_data, universe, idx = _make_synthetic_market(seed=seed)
+        calendar = {"full": idx, "is": idx[:280], "oos": idx[280:]}[cal]
+        features_by_code = precompute_squeeze_kdj_features_by_code(price_data, universe)
+        kwargs = dict(variant=variant, lots=lots, top_n=top_n, max_concurrent_positions=mcp,
+                      max_hold_days=hold, slippage_pct=slip, features_by_code=features_by_code)
+        legacy = _legacy_capital_constrained_backtest(price_data, universe, calendar, capital, **kwargs)
+        new, diag = run_squeeze_kdj_capital_constrained_backtest(
+            price_data, universe, calendar, capital, breakeven_trigger_atr=None, skip_entry_weekdays=(),
+            return_diagnostics=True, **kwargs)
+        assert len(legacy) > 0 and new == legacy
+        assert all("breakeven_triggered" not in t for t in new) and diag["skipped_weekday"] == 0
+
+    def test_synthetic_market_breakeven_changes_only_some_exits(self):
+        price_data, universe, idx = _make_synthetic_market(seed=0)
+        kw = dict(variant="B", lots=1, top_n=3, max_concurrent_positions=2, max_hold_days=20,
+                  atr_stop_mult=1.5, atr_target_mult=3.0, execution_model="limit_1tick")
+        be = run_squeeze_kdj_capital_constrained_backtest(price_data, universe, idx, 1_000_000,
+                                                          breakeven_trigger_atr=1.5, **kw)
+        assert any(t["exit_reason"] in (BREAKEVEN_STOP_REASON, BREAKEVEN_STOP_GAP_REASON) for t in be)
+        for t in be:
+            if t["exit_reason"] in (BREAKEVEN_STOP_REASON, BREAKEVEN_STOP_GAP_REASON):
+                assert t["breakeven_triggered"] and t["exit_price"] < t["e_price"]
+
+    @pytest.mark.parametrize("bad", [dict(breakeven_trigger_atr=1.5, variant="A"),
+                                     dict(breakeven_trigger_atr=-1.0), dict(breakeven_trigger_atr=float("nan")),
+                                     dict(skip_entry_weekdays=(7,)), dict(skip_entry_weekdays=("Fri",)),
+                                     dict(skip_entry_weekdays=(True,))])
+    def test_invalid_params_raise(self, bad):
+        df, features = self._df_features()
+        with pytest.raises(ValueError):
+            _run_limit(df, features, **bad)
+
+
+class TestSkipEntryWeekdays:
+    """idx24 = 2022-02-04(週五)、idx25 = 2022-02-07(週一)。A檔在idx23觸發(週五進場)，B檔在idx24觸發(週一進場)。"""
+
+    def _market(self):
+        df_a, df_b = _limit_df(n=45), _limit_df(n=45)
+        feats = {"1101": _make_fixed_features(df_a, entry_idx=23, prior_low=np.nan),
+                 "1102": _make_fixed_features(df_b, entry_idx=24, prior_low=np.nan)}
+        assert df_a.index[24].weekday() == 4 and df_a.index[25].weekday() == 0
+        return {"1101": df_a, "1102": df_b}, feats
+
+    def _run(self, **kw):
+        price_data, feats = self._market()
+        idx = price_data["1101"].index
+        return run_squeeze_kdj_capital_constrained_backtest(
+            price_data, {c: {} for c in price_data}, idx, 1_000_000, variant="B", atr_stop_mult=1.5,
+            atr_target_mult=3.0, max_concurrent_positions=1, top_n=1, max_hold_days=10, lots=1,
+            execution_model="limit_1tick", features_by_code=feats, return_diagnostics=True, **kw)
+
+    def test_friday_entry_skipped_and_slot_goes_to_next_candidate(self):
+        base, diag0 = self._run()
+        assert [(t["code"], t["entry_date"].weekday()) for t in base] == [("1101", 4)]
+        assert diag0["skipped_no_slot"] == 1 and diag0["skipped_weekday"] == 0  # 週一那檔沒名額
+        skip, diag = self._run(skip_entry_weekdays=(4,))
+        assert [(t["code"], t["entry_date"].weekday()) for t in skip] == [("1102", 0)]
+        assert diag["skipped_weekday"] == 1 and diag["skipped_no_slot"] == 0
+        assert diag["candidates_total"] == diag0["candidates_total"] == 2
+
+    def test_other_days_unaffected(self):
+        base, _ = self._run()
+        for wds in [(0,), (1, 2, 3)]:
+            # 週五那筆照樣進場；週一的候選本來就因為沒名額進不去 → 交易完全相同
+            got, diag = self._run(skip_entry_weekdays=wds)
+            assert got == base
+        # 星期濾網排在名額檢查之前：週一的候選改記在skipped_weekday(每個候選只記一個原因)
+        _, diag = self._run(skip_entry_weekdays=(0,))
+        assert diag["skipped_weekday"] == 1 and diag["skipped_no_slot"] == 0
+
+    def test_synthetic_market_no_friday_entries(self):
+        price_data, universe, idx = _make_synthetic_market(seed=1)
+        kw = dict(variant="B", lots=1, top_n=3, max_concurrent_positions=2, max_hold_days=20,
+                  atr_stop_mult=1.5, atr_target_mult=3.0, execution_model="limit_1tick", return_diagnostics=True)
+        base, d0 = run_squeeze_kdj_capital_constrained_backtest(price_data, universe, idx, 1_000_000, **kw)
+        got, d = run_squeeze_kdj_capital_constrained_backtest(price_data, universe, idx, 1_000_000,
+                                                              skip_entry_weekdays=(4,), **kw)
+        assert any(t["entry_date"].weekday() == 4 for t in base)
+        assert all(t["entry_date"].weekday() != 4 for t in got) and d["skipped_weekday"] > 0
+        assert d["candidates_total"] >= d["skipped_weekday"]

@@ -380,6 +380,8 @@ def simulate_variant_b_trades(df: pd.DataFrame, features: pd.DataFrame,
 # 再後續(--squeeze-kdj-filters)新增、預設關閉的選項：entry_filter="market_ma60"(大盤在季線上)/
 # "stock_ma120"(個股在半年線上)/"market_ma60_and_stock_ma120"(兩者皆是)，以及給大盤濾網用的
 # market_series參數；判斷邏輯另外拆成純函式squeeze_kdj_entry_filter_allows()，每日掃描之後可以直接接。
+# 再後續(--squeeze-kdj-exits)新增、預設關閉的選項：breakeven_trigger_atr(收盤漲到進場價+N倍ATR後，
+# 隔天起停損移到進場價，出場原因「保本停損」)、skip_entry_weekdays(進場日是指定星期幾就不進場，診斷skipped_weekday)。
 # ============================================================================
 
 MAX_HOLD_DAYS_CAPITAL_CONSTRAINED_DEFAULT = 60
@@ -502,6 +504,8 @@ CAPITAL_CONSTRAINED_DIAGNOSTIC_KEYS = (
     # 所以兩個細項相加可能 > skipped_entry_filter(合計那個每個候選只記1次)。
     "skipped_filter_market",
     "skipped_filter_stock_trend",
+    # --squeeze-kdj-exits新增：進場日(t+1)的星期幾在skip_entry_weekdays裡，在排名之前就略過(預設()=永遠是0)
+    "skipped_weekday",
 )
 
 
@@ -609,6 +613,11 @@ def _market_ok_by_code(per_code: dict, market_series: pd.Series) -> dict:
 # ----------------------------------------------------------------------------
 VALID_EXECUTION_MODELS = ("open", "limit_1tick")
 
+# --squeeze-kdj-exits新增的出場原因：停損已經依breakeven_trigger_atr移到進場價之後才被打到的停損。
+# 跟一般停損分開標示，出場原因統計才看得出「保本停損」佔多少、賠多少(限價1檔模型下仍會賠1檔+成本)。
+BREAKEVEN_STOP_REASON = "breakeven_stop"          # 盤中碰到保本停損價(=進場價)
+BREAKEVEN_STOP_GAP_REASON = "breakeven_stop_gap"  # 開盤就跳空低於保本停損價，用開盤價出場
+
 # 台股(上市/上櫃普通股)的最小升降單位(tick)表：(價格上限(不含), tick)，依序比對。
 # 證交所/櫃買中心現行規定：未滿10元0.01、10~未滿50元0.05、50~未滿100元0.1、
 # 100~未滿500元0.5、500~未滿1000元1、1000元以上5。
@@ -652,8 +661,9 @@ def _is_market_type_exit(reason: str, variant: str) -> bool:
     停損(stop，含移動停利的停損)、跳空停損(stop_gap)、持有天數到期強制平倉(forced_close)
     一律是市價；變體A的停利(target)是「K跌破80那天收盤後」才確認的訊號、用收盤價出場，
     沒有事先掛好的價位，實務上是市價單，也算市價型。只有變體B的固定價位停利(target)是
-    事先掛好的限價單(resting limit order)，碰到就用掛單價成交，不加滑價。"""
-    if reason in ("stop", "stop_gap", "forced_close"):
+    事先掛好的限價單(resting limit order)，碰到就用掛單價成交，不加滑價。
+    保本停損(breakeven_stop/breakeven_stop_gap，見breakeven_trigger_atr)本質上就是停損單，一樣是市價型。"""
+    if reason in ("stop", "stop_gap", "forced_close", BREAKEVEN_STOP_REASON, BREAKEVEN_STOP_GAP_REASON):
         return True
     if reason == "target":
         return variant == "A"
@@ -838,7 +848,9 @@ def run_squeeze_kdj_capital_constrained_backtest(price_data: dict, universe: dic
                                                    execution_model: str = "open",
                                                    market_series: pd.Series = None,
                                                    commission_per_lot_side: float = None,
-                                                   futures_tax_rate: float = 0.0):
+                                                   futures_tax_rate: float = 0.0,
+                                                   breakeven_trigger_atr: float = None,
+                                                   skip_entry_weekdays: tuple = ()):
     """
     擠壓+KDJ訊號的「資金/部位受限版」完整day-by-day walk-forward回測，只做多方
     (見模組docstring)。跟run_squeeze_kdj_exit_style_comparison()/
@@ -1001,6 +1013,27 @@ def run_squeeze_kdj_capital_constrained_backtest(price_data: dict, universe: dic
         commission_per_lot_side=None但有給futures_tax_rate時，手續費仍是200元/口/單邊。
         公式與期交稅(十萬分之二、每邊各一次)的說明見apply_squeeze_kdj_trade_costs()。
 
+    保本停損(breakeven_trigger_atr，--squeeze-kdj-exits新增，預設None=完全不動，跟舊版逐筆相同)：
+      只適用ATR變體(B/B_trail；變體A的停損是PriorLow不是ATR距離，給了直接丟ValueError)。
+      進場時記下觸發價 = 進場成交價(e_price，limit_1tick時是含1檔滑價的成交價) + breakeven_trigger_atr x
+      進場當下的ATR(跟算停損/停利同一個ATR)。每天的出場判定(_process_mr_day)做完、部位還在的話，
+      看「這天的收盤價」是否 >= 觸發價(進場當天也算)；一旦成立，停損價改成max(原停損價, 進場價)，
+      而且從「下一個交易日」才開始用新的停損價判定(今天的出場判定已經用舊停損做完了)；之後不會再往下移
+      (變體B的停損本來就不會動；B_trail的移動停利也只會往上)。不修改mean_reversion_engine：
+      刻意不用它既有的breakeven_after_profit(那個是「收盤>進場價就立刻移」，不是這裡要的「漲1R才移」)。
+      停損移到進場價之後被打到的出場，出場原因標成BREAKEVEN_STOP_REASON("breakeven_stop"，保本停損)/
+      BREAKEVEN_STOP_GAP_REASON("breakeven_stop_gap"，開盤跳空低於進場價)；判斷方式：部位已觸發保本、
+      且出場當下的停損價正好等於進場價(B_trail的移動停利已經把停損拉到進場價之上時，仍標成一般"stop")。
+      保本停損是市價型出場：limit_1tick時一樣多付1檔(出場價 = 進場價 - 1檔)，冷卻期也跟一般停損一樣。
+      有給breakeven_trigger_atr時，每筆交易另外多一個breakeven_triggered欄位(這筆有沒有觸發過、停損有沒有
+      移到進場價)；沒給時trade dict完全不多欄位。
+
+    進場星期濾網(skip_entry_weekdays，--squeeze-kdj-exits新增，預設()=不過濾)：
+      進場日(t+1，也就是逐日迴圈的date)的weekday()(0=週一…4=週五)在這個tuple裡的候選，在排名之前就略過，
+      記在診斷計數器skipped_weekday(排在「持倉中/冷卻期」排除之後、進場濾網之前；不佔排名/名額)。
+      同一天的候選進場日都是同一天，所以實際效果是「那天整天不開新倉」，名額留給之後的訊號。
+      只看進場日本身是星期幾，不考慮連假(例如週四進場、週五放假的長週末不會被擋)。
+
     回傳：trades list(或見return_diagnostics)，每筆trade dict的形狀跟
     mean_reversion_engine._close_mr_trade()產生的完全一樣(code/side/entry_date/exit_date/
     e_price/exit_price/exit_reason/lots/pnl_ntd/return_pct/hold_days)，可以直接餵
@@ -1028,6 +1061,16 @@ def run_squeeze_kdj_capital_constrained_backtest(price_data: dict, universe: dic
     if not (np.isfinite(futures_tax_rate) and futures_tax_rate >= 0):
         raise ValueError(f"futures_tax_rate必須是>=0的數字，收到{futures_tax_rate!r}")
     custom_costs = commission_per_lot_side is not None or futures_tax_rate != 0
+    if breakeven_trigger_atr is not None:
+        if variant not in ("B", "B_trail"):
+            raise ValueError(f"breakeven_trigger_atr只適用ATR變體(B/B_trail)，variant={variant!r}")
+        if not (np.isfinite(breakeven_trigger_atr) and breakeven_trigger_atr >= 0):
+            raise ValueError(f"breakeven_trigger_atr必須是>=0的數字或None，收到{breakeven_trigger_atr!r}")
+    skip_entry_weekdays = tuple(skip_entry_weekdays or ())
+    if any(not isinstance(w, (int, np.integer)) or isinstance(w, bool) or not 0 <= w <= 6
+           for w in skip_entry_weekdays):
+        raise ValueError(f"skip_entry_weekdays只能是0(週一)~6(週日)的整數，收到{skip_entry_weekdays!r}")
+    skip_weekday_set = frozenset(int(w) for w in skip_entry_weekdays)
 
     if precomputed is None:
         if features_by_code is None:
@@ -1063,6 +1106,13 @@ def run_squeeze_kdj_capital_constrained_backtest(price_data: dict, universe: dic
         else:
             updated = _process_mr_day(position, row, date, trades, max_hold_days, cooldown_until,
                                       slippage_pct=slippage_pct)
+        closed_today = updated is None and len(trades) == n_trades_before + 1
+        if closed_today and position.get("breakeven_triggered") \
+                and trades[-1]["exit_reason"] in ("stop", "stop_gap") \
+                and position["stop_price"] == position["e_price"]:
+            # 停損已經移到進場價(保本)之後被打到：改標成保本停損(下面limit_1tick重算會沿用這個原因)
+            trades[-1]["exit_reason"] = (BREAKEVEN_STOP_REASON if trades[-1]["exit_reason"] == "stop"
+                                         else BREAKEVEN_STOP_GAP_REASON)
         if limit_1tick and updated is None and len(trades) == n_trades_before + 1:
             # 市價型出場多付1檔：拿掉剛剛那筆，用調整後的價格經同一個_close_mr_trade()重算損益。
             # 冷卻期已經在上面的出場函式裡設定過(只設一次)，這裡不再碰cooldown_until。
@@ -1075,6 +1125,16 @@ def run_squeeze_kdj_capital_constrained_backtest(price_data: dict, universe: dic
         if custom_costs and len(trades) == n_trades_before + 1:
             # 出場當下立刻換成自訂交易成本(在上面limit_1tick重算之後，所以用的是最終成交價)
             apply_squeeze_kdj_trade_costs(trades[-1], commission_per_lot_side, futures_tax_rate)
+        if breakeven_trigger_atr is not None:
+            if closed_today:
+                trades[-1]["breakeven_triggered"] = bool(position.get("breakeven_triggered"))
+            elif updated is not None and not updated.get("breakeven_triggered") \
+                    and row["Close"] >= updated["breakeven_trigger_price"]:
+                # 今天收盤漲到進場價+N倍ATR：停損移到進場價(只往上、不往下)，今天的出場判定已經做完，
+                # 所以新停損從下一個交易日才生效
+                updated["breakeven_triggered"] = True
+                if updated["e_price"] > updated["stop_price"]:
+                    updated["stop_price"] = updated["e_price"]
         return updated
 
     for date in master_calendar:
@@ -1109,6 +1169,9 @@ def run_squeeze_kdj_capital_constrained_backtest(price_data: dict, universe: dic
             if until is not None and date < until:
                 continue
             diag["candidates_total"] += 1
+            if skip_weekday_set and date.weekday() in skip_weekday_set:
+                diag["skipped_weekday"] += 1
+                continue
             arrs = per_code[code]
             if entry_filter == "above_ma60" and not arrs["above_ma60"][i]:
                 diag["skipped_entry_filter"] += 1
@@ -1206,6 +1269,9 @@ def run_squeeze_kdj_capital_constrained_backtest(price_data: dict, universe: dic
                 "e_price": e_price, "target_price": target_price, "stop_price": stop_price,
                 "lots": lots_to_use, "hold_days": 1, "margin_used": margin_needed,
             }
+            if breakeven_trigger_atr is not None:
+                position["breakeven_trigger_price"] = e_price + breakeven_trigger_atr * atr_at_signal
+                position["breakeven_triggered"] = False
             if variant == "A":
                 position["target_armed"] = False
             elif variant == "B_trail":

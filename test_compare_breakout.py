@@ -2021,3 +2021,303 @@ class TestSqueezeKdjStopsCliMode:
         assert "這次測試無效" in summary and "2018-01-01" in summary
         assert summary.index("這次測試無效") < summary.index("【挑選結果與判定】")
         assert out["validity_warnings"]
+
+
+# ============================================================================
+# --squeeze-kdj-exits：以N2為基準的出場方式小測試(E0~E4)
+# ============================================================================
+def _exit_key(kw):
+    return (kw["atr_target_mult"], kw["breakeven_trigger_atr"], tuple(kw["skip_entry_weekdays"]))
+
+
+EXIT_KEYS = {"E0": (3.0, None, ()), "E1": (2.25, None, ()), "E2": (4.5, None, ()),
+             "E3": (3.0, 1.5, ()), "E4": (3.0, None, (4,))}
+
+
+class TestSqueezeKdjExitsSelectionRule:
+    def test_variants_are_exactly_the_five_preregistered(self):
+        assert [(v[0], v[2], v[3], v[4]) for v in cb.SQUEEZE_KDJ_EXIT_VARIANTS] == [
+            ("E0", 3.0, None, ()), ("E1", 2.25, None, ()), ("E2", 4.5, None, ()),
+            ("E3", 3.0, 1.5, ()), ("E4", 3.0, None, (4,))]
+        assert cb.SQUEEZE_KDJ_EXIT_SELECTABLE == ("E0", "E1", "E2", "E3", "E4")
+        assert cb.SQUEEZE_KDJ_EXIT_BASELINE == "E0" and cb.SQUEEZE_KDJ_EXITS_STOP_MULT == 1.5
+        assert cb.SQUEEZE_KDJ_EXIT_DATA_MINED == ("E4",)
+        for vid, key in EXIT_KEYS.items():
+            kw = cb._squeeze_kdj_exit_backtest_kwargs(vid)
+            assert _exit_key(kw) == key and kw["atr_stop_mult"] == 1.5 and kw["entry_filter"] is None
+
+    def _all(self, **override):
+        base = {v: _stats(100, 0.8) for v in cb.SQUEEZE_KDJ_EXIT_SELECTABLE}
+        base.update(override)
+        return base
+
+    def test_highest_train_pf_min_trades_and_ties(self):
+        sel, reason = cb.select_squeeze_kdj_exit_variant(self._all(E2=_stats(60, 1.3), E4=_stats(59, 5.0)))
+        assert sel == "E2" and "E4" in reason and "排除" in reason
+        sel, _ = cb.select_squeeze_kdj_exit_variant(self._all(E1=_stats(100, 1.1, pnl=100), E3=_stats(100, 1.1, pnl=300)))
+        assert sel == "E3"
+        tied = {v: _stats(100, 1.1, pnl=100) for v in cb.SQUEEZE_KDJ_EXIT_SELECTABLE}
+        assert cb.select_squeeze_kdj_exit_variant(tied)[0] == "E0"
+        tied["E0"] = _stats(10, 1.1, pnl=100)
+        assert cb.select_squeeze_kdj_exit_variant(tied)[0] == "E1"
+        assert cb.select_squeeze_kdj_exit_variant(self._all(N2=_stats(500, 9.0)))[0] == "E0"  # 不在名單的代號不會被選
+        sel, reason = cb.select_squeeze_kdj_exit_variant({v: _stats(59, 2.0) for v in cb.SQUEEZE_KDJ_EXIT_SELECTABLE})
+        assert sel is None and "無法挑選" in reason
+
+    def _seg(self, n, pf, pct):
+        return {"stats": _stats(n, pf), "bootstrap": {"pct_positive": pct, "p_value": 1 - pct / 100}}
+
+    def test_verdict_branches_vs_e0(self):
+        e0 = self._seg(80, 0.9, 30.0)
+        v = cb.squeeze_kdj_exit_verdict("E3", {"E0": e0, "E3": self._seg(70, 1.4, 90.0)})
+        assert v["passed"] and v["text"].startswith("✅") and "資料挖掘" not in v["text"]
+        v = cb.squeeze_kdj_exit_verdict("E1", {"E0": e0, "E1": self._seg(70, 1.4, 75.0)})
+        assert not v["passed"] and "bootstrap" in v["text"] and "PF>1" not in v["text"]
+        v = cb.squeeze_kdj_exit_verdict("E2", {"E0": self._seg(80, 1.6, 95.0), "E2": self._seg(70, 1.4, 90.0)})
+        assert not v["passed"] and "勝過E0" in v["text"]
+        v = cb.squeeze_kdj_exit_verdict("E2", {"E0": e0, "E2": self._seg(70, 0.8, 20.0)})
+        assert not v["passed"] and "PF>1" in v["text"]
+        v = cb.squeeze_kdj_exit_verdict("E0", {"E0": self._seg(80, 2.0, 99.0)})
+        assert not v["passed"] and "維持N2原樣" in v["text"]
+        assert cb.squeeze_kdj_exit_verdict(None, {"E0": e0})["passed"] is False
+        # E4通過也要標示資料挖掘、先驗最弱
+        v = cb.squeeze_kdj_exit_verdict("E4", {"E0": e0, "E4": self._seg(70, 1.4, 90.0)})
+        assert v["passed"] and "資料挖掘" in v["text"]
+        v = cb.squeeze_kdj_exit_verdict("E4", {"E0": e0, "E4": self._seg(70, 0.8, 20.0)})
+        assert not v["passed"] and "資料挖掘" in v["text"]
+
+    def test_improvement_table_vs_e0(self):
+        def seg(wr, pf):
+            return {"stats": {"trade_count": 10, "win_rate": wr, "profit_factor": pf}}
+        by = {"E0": {"train": seg(40, 0.8), "test": seg(45, 1.0)},
+              "E1": {"train": seg(42, 0.9), "test": seg(46, 1.1)},
+              "E2": {"train": seg(30, 0.9), "test": seg(46, 1.1)},
+              "E3": {"train": seg(40, 0.8), "test": seg(45, 1.0)},
+              "E4": {"train": seg(50, 1.0), "test": seg(40, 2.0)}}
+        rows = {r["variant"]: r for r in cb.squeeze_kdj_exit_improvement_table(by)}
+        assert set(rows) == {"E1", "E2", "E3", "E4"}
+        assert rows["E1"]["both_periods_better"] is True
+        assert rows["E2"]["both_periods_better"] is False and rows["E2"]["train_pf_better"] is True
+        assert rows["E3"]["both_periods_better"] is False and rows["E4"]["both_periods_better"] is False
+
+
+class TestSqueezeKdjExitExtraBreakdown:
+    def test_weekday_breakeven_and_time_exit(self):
+        def t(entry, reason, pnl, be=None):
+            d = _fixed_trade(entry, pd.Timestamp(entry) + pd.Timedelta(days=3), pnl)
+            d["exit_reason"] = reason
+            if be is not None:
+                d["breakeven_triggered"] = be
+            return d
+        trades = [t("2024-01-05", "stop_gap", -700),               # 週五
+                  t("2024-01-12", "forced_close", 300, be=True),   # 週五
+                  t("2024-01-08", "target", 1500, be=True),        # 週一
+                  t("2024-01-09", "breakeven_stop", -120, be=True),  # 週二
+                  t("2024-01-10", "forced_close", 900, be=False)]  # 週三
+        b = cb.squeeze_kdj_exit_extra_breakdown(trades)
+        assert b["weekday"][4] == {"count": 2, "pnl_ntd": -400.0, "profit_factor": pytest.approx(300 / 700),
+                                   "win_rate": 50.0}
+        assert b["weekday"][0]["profit_factor"] == float("inf") and b["weekday"][3]["count"] == 0
+        assert b["weekday"][3]["profit_factor"] == 0.0
+        assert b["breakeven_triggered_count"] == 3 and b["breakeven_triggered_then_target"] == 1
+        assert b["breakeven_triggered_pnl_ntd"] == pytest.approx(1680.0)
+        assert b["time_exit_count"] == 2 and b["time_exit_pnl_ntd"] == 1200.0 and b["time_exit_avg_pnl_ntd"] == 600.0
+        reasons = cb.squeeze_kdj_stop_trade_breakdown(trades, cb.SQUEEZE_KDJ_EXITS_EXIT_REASONS)["reasons"]
+        assert reasons["breakeven_stop"]["count"] == 1 and reasons["other"]["count"] == 0
+        # stops模式的預設出場原因清單不變：保本停損會落在other
+        assert cb.squeeze_kdj_stop_trade_breakdown(trades)["reasons"]["other"]["count"] == 1
+
+
+class TestSqueezeKdjExitsModeSelectionIgnoresTest:
+    TRAIN = {"E0": (300, 0.9), "E1": (100, 1.1), "E2": (40, 9.0), "E3": (100, 1.2), "E4": (59, 4.0)}
+
+    def _run(self, monkeypatch, tmp_path, test_pf, **arg_extra):
+        """假回測：挑選期E2/E4 PF最高但筆數不足 → 符合資格裡PF最高的是E3；驗證期由test_pf決定。"""
+        calls = []
+        by_key = {v: k for k, v in EXIT_KEYS.items()}
+
+        def _fake_backtest(**kw):
+            calls.append(kw)
+            vid = by_key[_exit_key(kw)]
+            if kw["master_calendar"][0] < pd.Timestamp("2023-01-01"):
+                n, pf = self.TRAIN[vid]
+                trades = _make_pf_trades(n, pf, 2019)
+            else:
+                trades = _make_pf_trades(80, test_pf[vid], 2024)
+            return trades, dict.fromkeys(cb.CAPITAL_CONSTRAINED_DIAGNOSTIC_KEYS, 0)
+        monkeypatch.setattr(cb, "run_squeeze_kdj_capital_constrained_backtest", _fake_backtest)
+
+        def _boom(*a, **k):
+            raise AssertionError("--squeeze-kdj-exits不需要大盤指數")
+        monkeypatch.setattr(cb, "load_index_series", _boom)
+        monkeypatch.setattr(cb, "load_squeeze_kdj_market_index", _boom)
+        monkeypatch.setattr(cb, "RESULTS_DIR", str(tmp_path))
+        codes = ["1101", "2330"]
+        price_data, idx = _make_regime_switching_market(codes, start="2018-01-01", n_days=2300)
+        universe = {c: STOCK_FUTURES_UNIVERSE[c] for c in codes}
+        out = cb.run_squeeze_kdj_exits_mode(_stops_args(**arg_extra), price_data, universe, idx)
+        return out, calls
+
+    def test_selection_uses_train_only(self, monkeypatch, tmp_path):
+        # 驗證期E1/E2/E4遠遠最好、E3最差 → 照樣選E3，不通過
+        bad = {"E0": 1.0, "E1": 5.0, "E2": 5.0, "E3": 0.5, "E4": 5.0}
+        out, calls = self._run(monkeypatch, tmp_path, bad)
+        assert out["selected"] == "E3" and not out["verdict"]["passed"]
+        assert len(calls) == 2 * 5 * 2  # 主要+敏感度 x 5變體 x 2期間
+        for kw in calls:
+            assert kw["lots"] == 1 and kw["top_n"] == 3 and kw["execution_model"] == "limit_1tick"
+            assert kw["variant"] == "B" and kw["atr_stop_mult"] == 1.5 and kw["entry_filter"] is None
+            assert kw["max_hold_days"] == 20 and kw["atr_period"] == 14 and kw["ranking_rule"] == "trigger_return"
+            assert kw["max_concurrent_positions"] in (1, 2) and "slippage_pct" not in kw
+            assert kw["commission_per_lot_side"] == 50.0 and kw["futures_tax_rate"] == 0.00002
+            assert "market_series" not in kw
+        assert {_exit_key(kw) for kw in calls} == set(EXIT_KEYS.values())
+        train_cals = [kw["master_calendar"] for kw in calls if kw["master_calendar"][0] < pd.Timestamp("2023-01-01")]
+        assert len(train_cals) == 10 and all(c[-1] <= pd.Timestamp("2022-12-31") for c in train_cals)
+        # 驗證期換成E3好過E0 → 選擇不變、通過
+        out2, _ = self._run(monkeypatch, tmp_path, {"E0": 1.2, "E1": 0.5, "E2": 0.5, "E3": 3.0, "E4": 0.5})
+        assert out2["selected"] == "E3" and out2["verdict"]["passed"]
+        assert "✅ 通過" in (tmp_path / "summary.txt").read_text(encoding="utf-8")
+        # 驗證期E3 PF>1但沒勝過E0 → 不通過
+        out3, _ = self._run(monkeypatch, tmp_path, {"E0": 4.0, "E1": 0.5, "E2": 0.5, "E3": 3.0, "E4": 0.5})
+        assert out3["selected"] == "E3" and not out3["verdict"]["passed"] and "勝過E0" in out3["verdict"]["text"]
+
+    def test_e0_selected_when_it_has_best_train_pf(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(self, "TRAIN", {"E0": (300, 1.5), "E1": (100, 1.1), "E2": (100, 1.2),
+                                            "E3": (100, 1.4), "E4": (100, 1.45)})
+        out, _ = self._run(monkeypatch, tmp_path, {v: 2.0 for v in EXIT_KEYS})
+        assert out["selected"] == "E0" and not out["verdict"]["passed"] and "維持N2原樣" in out["verdict"]["text"]
+
+    def test_custom_commission_from_args(self, monkeypatch, tmp_path):
+        out, calls = self._run(monkeypatch, tmp_path, {v: 1.0 for v in EXIT_KEYS},
+                               commission_per_lot_side=25.0, futures_tax_rate=0.0)
+        assert out["commission_per_lot_side"] == 25.0 and out["futures_tax_rate"] == 0.0
+        assert all(kw["commission_per_lot_side"] == 25.0 and kw["futures_tax_rate"] == 0.0 for kw in calls)
+        assert "每口單邊NT$25(一進一出共NT$50/口)" in (tmp_path / "summary.txt").read_text(encoding="utf-8")
+
+
+class TestSqueezeKdjExitsCliMode:
+    def test_skips_full_pipeline_writes_outputs_without_scipy(self, monkeypatch, tmp_path):
+        import data_loader
+        import chip_data_loader
+        monkeypatch.setitem(sys.modules, "scipy", None)
+        monkeypatch.setitem(sys.modules, "scipy.stats", None)
+
+        codes = list(STOCK_FUTURES_UNIVERSE)[:12]
+        price_data, idx = _make_regime_switching_market(codes + ["2330"], start="2017-06-15", n_days=1950, seed=3)
+        load_calls = []
+
+        def _fake_load(universe, start, end, refresh=False):
+            load_calls.append((start, end))
+            return price_data
+        monkeypatch.setattr(cb, "load_price_data", _fake_load)
+
+        def _boom(*args, **kwargs):
+            raise AssertionError("--squeeze-kdj-exits模式不該呼叫這個")
+        monkeypatch.setattr(cb, "load_index_series", _boom)
+        monkeypatch.setattr(data_loader, "load_price_data", _boom)
+        monkeypatch.setattr(data_loader, "load_index_series", _boom)
+        monkeypatch.setattr(chip_data_loader, "load_chip_data", _boom)
+        TestSqueezeKdjFixedCliMode()._patch_heavy_stages_to_explode(monkeypatch)
+        for name in ("run_squeeze_kdj_fixed_mode", "run_squeeze_kdj_filters_mode", "run_squeeze_kdj_stops_mode",
+                     "run_squeeze_kdj_only_mode", "run_squeeze_kdj_capital_constrained_mode",
+                     "run_squeeze_kdj_grid_mode"):
+            monkeypatch.setattr(cb, name, _boom)
+        monkeypatch.setattr(cb, "RESULTS_DIR", str(tmp_path))
+
+        mode_calls = []
+        real_mode = cb.run_squeeze_kdj_exits_mode
+
+        def _spy(*args, **kwargs):
+            mode_calls.append(args)
+            return real_mode(*args, **kwargs)
+        monkeypatch.setattr(cb, "run_squeeze_kdj_exits_mode", _spy)
+
+        argv = ["compare_breakout.py", "--squeeze-kdj-exits", "--max-stocks", "12",
+                "--start", "2018-01-01", "--end", "2024-11-15", "--starting-capital", "1000000"]
+        monkeypatch.setattr(sys, "argv", argv)
+        cb.main()
+
+        assert load_calls == [("2017-06-15", "2024-11-15")]  # 股價往前多抓200個日曆天
+        assert len(mode_calls) == 1
+        args, cal = mode_calls[0][0], mode_calls[0][3]
+        assert args.commission_per_lot_side == 50.0 and args.futures_tax_rate == 0.00002
+        assert cal.equals(idx[idx >= pd.Timestamp("2018-01-01")])
+
+        summ = pd.read_csv(tmp_path / "squeeze_kdj_exits_summary.csv", encoding="utf-8-sig")
+        assert len(summ) == 20  # 2種最多持倉數 x 5變體 x 2期間
+        for col in ("最多同時持倉數", "用途", "變體代號", "可被挑選", "停損ATR倍數", "停利ATR倍數",
+                    "保本觸發(收盤>=進場價+N倍ATR)", "不進場的星期", "資料挖掘(先驗最弱)", "期間", "交易筆數",
+                    "勝率(%)", "獲利因子PF", "總損益(NT$)", "平均獲利(NT$/筆)", "平均虧損(NT$/筆)", "最大回撤(NT$)",
+                    "拿掉最大3筆後損益(NT$)", "平均持有天數", "手續費合計(NT$)", "期交稅合計(NT$)",
+                    "持有<=1天出場筆數", "持有<=3天出場比例(%)", "持有<=5天出場損益(NT$)", "出場_停利筆數",
+                    "出場_保本停損筆數", "出場_保本跳空停損筆數", "出場_到期筆數", "出場_到期損益(NT$)",
+                    "到期出場平均損益(NT$/筆)", "觸發保本筆數", "週五進場筆數", "週五進場PF",
+                    "bootstrap正報酬比例(%)", "診斷_進場星期略過", "被挑選規則選中"):
+            assert col in summ.columns, col
+        assert set(summ["變體代號"]) == set(cb.SQUEEZE_KDJ_EXIT_SELECTABLE) and summ["可被挑選"].all()
+        assert (summ["停損ATR倍數"] == 1.5).all()
+        assert summ["被挑選規則選中"].sum() <= 1
+        assert summ["交易筆數"].sum() > 0, "合成資料要有交易，測試才有意義"
+        by = {vid: g for vid, g in summ.groupby("變體代號")}
+        # 只有E4擋週五：E4沒有週五進場、有進場星期略過；其他變體略過=0
+        assert (by["E4"]["週五進場筆數"] == 0).all() and by["E4"]["診斷_進場星期略過"].sum() > 0
+        assert all((by[v]["診斷_進場星期略過"] == 0).all() for v in ("E0", "E1", "E2", "E3"))
+        assert by["E0"]["週五進場筆數"].sum() > 0
+        # 只有E3會有保本停損/觸發保本
+        assert by["E3"]["觸發保本筆數"].sum() > 0
+        for v in ("E0", "E1", "E2", "E4"):
+            assert (by[v]["觸發保本筆數"] == 0).all()
+            assert (by[v]["出場_保本停損筆數"] + by[v]["出場_保本跳空停損筆數"] == 0).all()
+        reason_cols = [f"出場_{lab}筆數" for _, lab in cb.SQUEEZE_KDJ_EXITS_EXIT_REASONS]
+        assert (summ[reason_cols].sum(axis=1) == summ["交易筆數"]).all()
+        assert (summ["手續費合計(NT$)"] == 100.0 * summ["交易筆數"]).all()
+
+        yearly = pd.read_csv(tmp_path / "squeeze_kdj_exits_yearly.csv", encoding="utf-8-sig")
+        assert list(yearly.columns) == cb.SQUEEZE_KDJ_FILTER_YEARLY_COLUMNS and len(yearly) > 0
+        trades = pd.read_csv(tmp_path / "squeeze_kdj_exits_trades.csv", encoding="utf-8-sig")
+        assert list(trades.columns) == cb.SQUEEZE_KDJ_EXITS_TRADE_COLUMNS
+        assert len(trades) == summ["交易筆數"].sum()
+        assert "週五" not in set(trades.loc[trades["變體代號"] == "E4", "進場星期"])
+        assert trades.loc[trades["變體代號"] == "E3", "是否觸發保本(停損移到進場價)"].any()
+        assert not trades.loc[trades["變體代號"] != "E3", "是否觸發保本(停損移到進場價)"].any()
+        assert set(trades.loc[trades["變體代號"] != "E3", "出場原因"]) <= {
+            "停利", "停損", "跳空停損(開盤價出場)", "持有天數到期強制平倉"}
+
+        summary = (tmp_path / "summary.txt").read_text(encoding="utf-8")
+        assert "--squeeze-kdj-exits模式" in summary
+        assert (summary.index("【事先登錄的規則") < summary.index("【交易成本假設】")
+                < summary.index("【挑選結果與判定】") < summary.index("【並排總表"))
+        assert "資料挖掘" in summary and "多重比較" in summary and "5個變體" in summary
+        assert "保本停損" in summary and "依進場星期" in summary and "進場星期略過" in summary
+        assert "【出場結構對照" in summary and "兩段都變好" in summary and "結論：" in summary
+        table = summary[summary.index("【並排總表｜敏感度對照"):summary.index("【出場結構對照")]
+        assert sum(f"{v}(" in table for v in cb.SQUEEZE_KDJ_EXIT_SELECTABLE) == 5
+        assert "倖存者偏差" in summary and "偏樂觀" in summary and "基差" in summary
+        assert "daily_squeeze_signals.py" in summary
+        assert "這次測試無效" not in summary and "[階段0]" not in summary
+
+    def test_invalid_start_prints_big_warning(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(cb, "RESULTS_DIR", str(tmp_path))
+        codes = ["1101", "2330"]
+        price_data, idx = _make_regime_switching_market(codes, start="2021-06-01", n_days=600)
+        universe = {c: STOCK_FUTURES_UNIVERSE[c] for c in codes}
+        out = cb.run_squeeze_kdj_exits_mode(_stops_args(start="2021-06-01", end="2023-09-01"),
+                                            price_data, universe, idx)
+        summary = (tmp_path / "summary.txt").read_text(encoding="utf-8")
+        assert "這次測試無效" in summary and "2018-01-01" in summary
+        assert summary.index("這次測試無效") < summary.index("【挑選結果與判定】")
+        assert out["validity_warnings"]
+
+
+class TestWorkflowInputsWithinGithubLimit:
+    def test_at_most_25_inputs_and_exits_wired(self):
+        import yaml
+        path = os.path.join(os.path.dirname(cb.__file__), ".github", "workflows", "momentum_breakout_backtest.yml")
+        with open(path, encoding="utf-8") as f:
+            text = f.read()
+        wf = yaml.safe_load(text)
+        inputs = wf[True]["workflow_dispatch"]["inputs"]  # PyYAML把on解析成True
+        assert len(inputs) <= 25
+        assert inputs["squeeze_kdj_exits"]["default"] == "false"
+        assert 'inputs.squeeze_kdj_exits }}" = "true"' in text and "--squeeze-kdj-exits" in text
