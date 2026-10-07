@@ -3270,8 +3270,8 @@ def run_squeeze_kdj_stops_mode(args, price_data, universe, master_calendar):
     lines += [
         "",
         "【每日掃描不會跟著改】",
-        f"  每日訊號掃描(daily_squeeze_signals.py)仍然沿用SQUEEZE_KDJ_FIXED_SETTING：停損{s['atr_stop_mult']:.1f}倍ATR、"
-        "不加濾網；其他回測模式仍然是舊的200元/口/單邊手續費假設。這個模式只是回測，不會改掃描器或實盤設定的任何東西，"
+        "  " + _squeeze_kdj_live_scanner_note(),
+        "  其他回測模式仍然是舊的200元/口/單邊手續費假設。這個模式只是回測，不會改掃描器或實盤設定的任何東西，"
         "要不要換停損寬度/加F2/改成本假設，等你看完結果自己決定。",
         "",
         SQUEEZE_KDJ_STOPS_CAVEATS_TEXT, "",
@@ -3681,8 +3681,8 @@ def run_squeeze_kdj_exits_mode(args, price_data, universe, master_calendar):
     lines += [
         "",
         "【每日掃描不會跟著改】",
-        f"  每日訊號掃描(daily_squeeze_signals.py)仍然沿用SQUEEZE_KDJ_FIXED_SETTING：停損{s['atr_stop_mult']:.1f}倍ATR、"
-        f"停利{s['atr_target_mult']:.1f}倍ATR、不保本、每天都可進場。這個模式只是回測，不會改掃描器或實盤設定的任何東西，"
+        "  " + _squeeze_kdj_live_scanner_note(),
+        "  這個模式只是回測，不會改掃描器或實盤設定的任何東西，"
         "要不要換成N2或改出場方式，等你看完結果自己決定。",
         "",
         SQUEEZE_KDJ_EXITS_CAVEATS_TEXT, "",
@@ -4166,8 +4166,8 @@ def run_squeeze_kdj_stop_target_grid_mode(args, price_data, universe, master_cal
     lines += [
         "",
         "【每日掃描不會跟著改】",
-        f"  每日訊號掃描(daily_squeeze_signals.py)仍然沿用SQUEEZE_KDJ_FIXED_SETTING：停損{s['atr_stop_mult']:.1f}倍ATR、"
-        f"停利{s['atr_target_mult']:.1f}倍ATR。這個模式只是回測，不會改掃描器或實盤設定的任何東西，"
+        "  " + _squeeze_kdj_live_scanner_note(),
+        "  這個模式只是回測，不會改掃描器或實盤設定的任何東西，"
         "要不要換停損/停利，等你看完地圖自己決定。",
         "",
         SQUEEZE_KDJ_ST_GRID_CAVEATS_TEXT, "",
@@ -4233,6 +4233,56 @@ SQUEEZE_KDJ_EXEC_GAP_BUCKETS = (
     ("gt_1pct", "超過+1%"),
 )
 SQUEEZE_KDJ_EXEC_GAP_ABOVE_1TICK = ("1_2ticks", "2ticks_1pct", "gt_1pct")  # = 目前習慣放棄的單
+
+
+# ============================================================================
+# 實盤設定(每日訊號掃描daily_squeeze_signals.py用的就是這一份)：使用者看完下面幾個模式的回測之後
+# 「自己選定」的設定，依「同時最多持有幾檔」(1或2)分成兩組。
+#
+# 誠實聲明：這兩組都是在2018~2026同一份資料上比過約SQUEEZE_KDJ_LIVE_CUMULATIVE_VARIANTS(~28)個變體之後才挑的，
+# 沒有任何一組通過專案事先登錄的驗證標準；數字一定偏樂觀，實盤是實驗。
+# 各項選擇的出處：
+#   - 停損1.5倍ATR(兩組都是)：--squeeze-kdj-stops選出N2(1.5倍)；--squeeze-kdj-stop-target-grid的
+#     停損x停利地圖裡，停損1.0倍那一列(=舊實盤N1那一列)不論停利/持倉數都是最差的。
+#   - 最多1檔 → 停利4.0倍ATR：停損x停利地圖(最多1檔)裡唯一「在高原上」的格子是G15_40(停損1.5/停利4.0)。
+#   - 最多2檔 → 停利3.0倍ATR：= N2(=E0=G15_30)，--squeeze-kdj-stops兩段都贏過舊實盤N1。
+#   - 限價 = 訊號日收盤+2檔(逐檔往上走，=回測execution_model="limit_ticks"、entry_limit_ticks=2)：
+#     --squeeze-kdj-execution的X1，2018–2025的PF不低於目前習慣(X0，+1檔)；X2(+1%)被否決，
+#     因為它的優勢幾乎全部來自2026年。
+#   - 其餘沿用舊設定：變體B、ATR14、最長20個交易日、觸發K棒漲幅排名、不加濾網、top_n=3、1口、
+#     停損後10個日曆天冷卻、單筆保證金不超過資金35%。
+# 不要改SQUEEZE_KDJ_FIXED_SETTING：--squeeze-kdj-fixed等舊模式依賴它(那是舊實盤設定，不是這一份)。
+# ============================================================================
+_SQUEEZE_KDJ_LIVE_COMMON = {
+    "variant": "B", "atr_stop_mult": 1.5, "max_hold_days": 20,
+    "ranking_rule": "trigger_return", "entry_filter": None,
+    "top_n": 3, "atr_period": 14, "lots": 1,
+    "execution_model": "limit_ticks", "entry_limit_ticks": 2,
+}
+SQUEEZE_KDJ_LIVE_SETTINGS = {
+    # key = 同時最多持有幾檔(max_concurrent_positions)
+    1: {**_SQUEEZE_KDJ_LIVE_COMMON, "atr_target_mult": 4.0, "max_concurrent_positions": 1},
+    2: {**_SQUEEZE_KDJ_LIVE_COMMON, "atr_target_mult": 3.0, "max_concurrent_positions": 2},
+}
+SQUEEZE_KDJ_LIVE_DEFAULT_POSITIONS = 1
+# 限價+2檔的設定在2018–2025的回測PF(使用者看過的結果，只當說明文字用，不是程式算出來的)：
+SQUEEZE_KDJ_LIVE_REFERENCE_PF_2018_2025 = {1: 1.33, 2: 1.09}
+# 累計在同一份資料上比過的變體數：之前24個(濾網4+停損6+出場5+停損停利9) + --squeeze-kdj-execution的4個
+SQUEEZE_KDJ_LIVE_CUMULATIVE_VARIANTS = SQUEEZE_KDJ_EXEC_PRIOR_VARIANTS + len(SQUEEZE_KDJ_EXEC_VARIANTS)
+
+
+def squeeze_kdj_live_setting_label(positions: int) -> str:
+    """一行白話描述實盤設定，例：「同時最多1檔｜停損1.5倍ATR｜停利4.0倍ATR｜限價收盤+2檔」。"""
+    s = SQUEEZE_KDJ_LIVE_SETTINGS[positions]
+    return (f"同時最多{s['max_concurrent_positions']}檔｜停損{s['atr_stop_mult']:.1f}倍ATR｜"
+            f"停利{s['atr_target_mult']:.1f}倍ATR｜限價收盤+{s['entry_limit_ticks']}檔")
+
+
+def _squeeze_kdj_live_scanner_note() -> str:
+    """舊回測模式報告裡「每日掃描不會跟著改」那一段用：說明掃描器現在用的是哪一份設定。"""
+    return ("每日訊號掃描(daily_squeeze_signals.py)用的是SQUEEZE_KDJ_LIVE_SETTINGS(使用者選定的實盤設定："
+            + "；".join(squeeze_kdj_live_setting_label(p) for p in sorted(SQUEEZE_KDJ_LIVE_SETTINGS))
+            + ")，不是這個模式的任何變體。")
 
 
 def _squeeze_kdj_exec_variant(vid: str) -> tuple:
@@ -4727,7 +4777,8 @@ def run_squeeze_kdj_execution_mode(args, price_data, universe, master_calendar):
     lines += [
         "",
         "【每日掃描不會跟著改】",
-        "  每日訊號掃描(daily_squeeze_signals.py)跟其他回測模式都不受影響。這個模式只是回測，"
+        "  " + _squeeze_kdj_live_scanner_note(),
+        "  其他回測模式不受影響。這個模式只是回測，"
         "要不要改成追價/放寬限價，等你看完跳空分組自己決定。",
         "",
         SQUEEZE_KDJ_EXEC_CAVEATS_TEXT, "",

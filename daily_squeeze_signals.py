@@ -1,22 +1,26 @@
 """
-daily_squeeze_signals.py —— 擠壓+KDJ(--squeeze-kdj-fixed選定設定)每日訊號掃描器。
+daily_squeeze_signals.py —— 擠壓+KDJ(實盤設定SQUEEZE_KDJ_LIVE_SETTINGS)每日訊號掃描器。
 
 用途：每個交易日收盤後(GitHub Actions排程，台北時間19:00)掃一次全部股票期貨標的，
 列出「明天開盤要不要掛單、掛哪幾檔、掛多少錢、成交後停損/停利掛多少」。使用者隔天開盤前
 打開 signals/latest.md：有訊號就照做，沒訊號就什麼都不做。
 
-跟回測(compare_breakout.py --squeeze-kdj-fixed，SQUEEZE_KDJ_FIXED_SETTING + execution_model=
-"limit_1tick")用的是「同一套」程式碼與規則，不另外重寫一份：
+設定來自compare_breakout.SQUEEZE_KDJ_LIVE_SETTINGS，依--positions(同時最多持有幾檔，1或2)二選一：
+  --positions 1(預設)：停損1.5倍ATR、停利4.0倍ATR、同時最多1檔；
+  --positions 2      ：停損1.5倍ATR、停利3.0倍ATR、同時最多2檔；
+兩組都是限價 = 訊號日收盤+2檔(回測execution_model="limit_ticks"、entry_limit_ticks=2)。
+跟回測(run_squeeze_kdj_capital_constrained_backtest + 上面的設定)用的是「同一套」程式碼與規則，不另外重寫一份：
   - 進場訊號：squeeze_kdj_signal.compute_squeeze_kdj_features()的EntryFlag(同一個狀態機)，
     「最後一根K棒(=as_of那天)EntryFlag=True」就是訊號，隔天(下一個交易日)進場。
   - 排名：觸發K棒當天漲幅(close_t/close_(t-1)-1)由大到小，同分時維持universe順序(跟回測的
     穩定排序一致)。
-  - 限價：觸發K棒收盤 + 1檔(squeeze_kdj_signal.taiwan_tick_size，tick用收盤價的級距)，
+  - 限價：觸發K棒收盤往上走2檔(squeeze_kdj_signal.squeeze_kdj_entry_limit_price(..., "limit_ticks",
+    entry_limit_ticks=2)，跟回測同一個函式；逐檔走，跨價位級距時tick跟著變，例如49.95+2檔=50.1)，
     開盤高於限價不追(回測的skipped_limit_not_filled)。
   - ATR：mean_reversion_engine.compute_atr_correct(df, period=14)在t日(觸發K棒)的值——回測的
     precompute把ATR shift(1)對齊到進場日(t+1)那一列，查到的就是t日的ATR，同一個數字。
-  - 停損 = 成交價 - 1.0 x ATR；停利 = 成交價 + 3.0 x ATR；最長持有20個交易日(進場日算第1天，
-    第20天收盤平倉)；同時最多3檔(使用者實際打算1~2檔)；單筆保證金不超過資金35%。
+  - 停損 = 成交價 - 1.5 x ATR；停利 = 成交價 + 4.0(1檔)/3.0(2檔) x ATR；最長持有20個交易日
+    (進場日算第1天，第20天收盤平倉)；同時最多1或2檔；單筆保證金不超過資金35%。
   一致性由 test_daily_squeeze_signals.py 用長段合成資料逐日比對回測的事件表來保證。
 
 唯一刻意的差異(誠實聲明)：價格欄位(OHLC)有NaN的列，這裡直接丟掉再算指標；回測的
@@ -28,6 +32,7 @@ precompute是「保留這些列算指標、只是當天不交易」(NaN會讓BB/
 使用：
   python daily_squeeze_signals.py                      # 今天(台北時間)
   python daily_squeeze_signals.py --as-of 2026-10-02   # 回補/測試某一天
+  python daily_squeeze_signals.py --positions 2        # 同時最多2檔(停利3.0倍ATR)
 """
 import argparse
 import datetime
@@ -42,19 +47,27 @@ import pandas as pd
 
 from data_loader import load_price_data, STOCK_FUTURES_WHITELIST
 from mean_reversion_engine import compute_atr_correct, DEFAULT_MARGIN_CAP_RATIO, STOP_LOSS_COOLDOWN_DAYS
-from squeeze_kdj_signal import compute_squeeze_kdj_features, taiwan_tick_size
+from squeeze_kdj_signal import compute_squeeze_kdj_features, taiwan_tick_size, squeeze_kdj_entry_limit_price
 from taifex_universe import STOCK_FUTURES_UNIVERSE, estimate_margin, get_contract_multiplier
-from compare_breakout import SQUEEZE_KDJ_FIXED_SETTING
+from compare_breakout import (
+    SQUEEZE_KDJ_LIVE_SETTINGS, SQUEEZE_KDJ_LIVE_DEFAULT_POSITIONS, SQUEEZE_KDJ_LIVE_REFERENCE_PF_2018_2025,
+    SQUEEZE_KDJ_LIVE_CUMULATIVE_VARIANTS, squeeze_kdj_live_setting_label,
+)
 
-FIXED = SQUEEZE_KDJ_FIXED_SETTING
-ATR_PERIOD = FIXED["atr_period"]            # 14
-ATR_STOP_MULT = FIXED["atr_stop_mult"]      # 1.0
-ATR_TARGET_MULT = FIXED["atr_target_mult"]  # 3.0
-MAX_HOLD_DAYS = FIXED["max_hold_days"]      # 20
-TOP_N = FIXED["top_n"]                      # 3
-MAX_CONCURRENT = FIXED["max_concurrent_positions"]  # 3
+VALID_POSITIONS = tuple(sorted(SQUEEZE_KDJ_LIVE_SETTINGS))  # (1, 2)
+DEFAULT_POSITIONS = SQUEEZE_KDJ_LIVE_DEFAULT_POSITIONS      # 1
+# 兩組共用的欄位(變體B、ATR14、最長20天、top_n=3、限價+2檔)直接從設定讀；停利/持倉數依positions。
+_COMMON = SQUEEZE_KDJ_LIVE_SETTINGS[DEFAULT_POSITIONS]
+ATR_PERIOD = _COMMON["atr_period"]            # 14
+ATR_STOP_MULT = _COMMON["atr_stop_mult"]      # 1.5(兩組相同)
+MAX_HOLD_DAYS = _COMMON["max_hold_days"]      # 20
+TOP_N = _COMMON["top_n"]                      # 3
+EXECUTION_MODEL = _COMMON["execution_model"]  # "limit_ticks"
+ENTRY_LIMIT_TICKS = _COMMON["entry_limit_ticks"]  # 2
+assert all(s[k] == _COMMON[k] for s in SQUEEZE_KDJ_LIVE_SETTINGS.values()
+           for k in ("atr_period", "atr_stop_mult", "max_hold_days", "top_n", "execution_model",
+                     "entry_limit_ticks", "variant", "ranking_rule", "entry_filter", "lots"))
 COOLDOWN_CALENDAR_DAYS = STOP_LOSS_COOLDOWN_DAYS * 2  # 回測：停損出場日 + 10個日曆天之前不再進場
-TOTAL_MARGIN_CAP_RATIO = min(DEFAULT_MARGIN_CAP_RATIO * MAX_CONCURRENT, 0.9)  # 回測的整體保證金上限
 MIN_BARS = 60  # 跟precompute_squeeze_kdj_features_by_code()同一個門檻：資料太短的股票不算
 REFERENCE_CODE = "2330"
 STALE_SHARE_WARN = 0.10  # 超過10%的股票最新一根不是as_of，額外提醒
@@ -72,6 +85,24 @@ DEFAULT_LOOKBACK_DAYS = 400
 #  - 多抓一點完全不花成本(一檔一年的日K只有幾KB)，所以取比60根寬很多的值。
 
 TAIPEI_TZ = "Asia/Taipei"
+
+
+def live_setting(positions: int) -> dict:
+    """依「同時最多持有幾檔」取實盤設定；只接受1或2(其他值直接ValueError，不默默套用別的設定)。"""
+    if isinstance(positions, bool) or positions not in SQUEEZE_KDJ_LIVE_SETTINGS:
+        raise ValueError(f"positions必須是{VALID_POSITIONS}其中之一，收到{positions!r}")
+    return SQUEEZE_KDJ_LIVE_SETTINGS[positions]
+
+
+def setting_label(positions: int) -> str:
+    """報告/Telegram最上面那一行：「設定：同時最多1檔｜停損1.5倍ATR｜停利4.0倍ATR｜限價收盤+2檔」。"""
+    live_setting(positions)
+    return "設定：" + squeeze_kdj_live_setting_label(positions)
+
+
+def total_margin_cap_ratio(positions: int) -> float:
+    """回測的整體保證金上限：min(35% x 最多持倉數, 90%)。"""
+    return min(DEFAULT_MARGIN_CAP_RATIO * live_setting(positions)["max_concurrent_positions"], 0.9)
 WEEKDAY_ZH = "一二三四五六日"
 
 
@@ -88,7 +119,7 @@ def floor_to_tick(price: float) -> float:
 
 
 def round_to_tick(price: float) -> float:
-    """四捨五入到最接近的合法檔位(只用在「收盤+1檔」這種本來就該落在檔位上、只是有浮點雜訊的價格)。"""
+    """四捨五入到最接近的合法檔位(只用在「收盤+2檔」這種本來就該落在檔位上、只是有浮點雜訊的價格)。"""
     tick = taiwan_tick_size(price)
     return round(round(price / tick) * tick, 2)
 
@@ -140,9 +171,18 @@ def clean_price_df(df: pd.DataFrame) -> pd.DataFrame:
     return df.dropna(subset=["Open", "High", "Low", "Close"])
 
 
-def compute_signal_row(code: str, df: pd.DataFrame, capital: float) -> dict:
+def entry_limit_raw(close_t: float) -> float:
+    """回測的限價(未取整)：跟run_squeeze_kdj_capital_constrained_backtest同一個函式、同一組參數。"""
+    return squeeze_kdj_entry_limit_price(close_t, EXECUTION_MODEL, entry_limit_ticks=ENTRY_LIMIT_TICKS)
+
+
+def compute_signal_row(code: str, df: pd.DataFrame, capital: float,
+                       positions: int = DEFAULT_POSITIONS) -> dict:
     """df的最後一根K棒是觸發K棒(EntryFlag=True)時，算出這一檔的全部下單資訊；不是訊號回傳None。
-    df必須已經clean_price_df()過。"""
+    df必須已經clean_price_df()過。positions：同時最多持有幾檔(1或2)，決定停利倍數。"""
+    setting = live_setting(positions)
+    stop_mult = setting["atr_stop_mult"]
+    target_mult = setting["atr_target_mult"]
     if df is None or len(df) < MIN_BARS:
         return None
     features = compute_squeeze_kdj_features(df)
@@ -156,8 +196,8 @@ def compute_signal_row(code: str, df: pd.DataFrame, capital: float) -> dict:
         return None  # 回測：觸發K棒漲幅是NaN的事件會被丟掉
     atr = float(compute_atr_correct(df, period=ATR_PERIOD).iloc[-1])
 
-    tick = taiwan_tick_size(close_t)
-    limit_raw = close_t + tick                 # 回測的limit_price(未取整，用來比對一致性)
+    tick = taiwan_tick_size(close_t)           # 收盤價那一級的tick(只顯示用；+2檔逐檔走，可能跨級距)
+    limit_raw = entry_limit_raw(close_t)       # 回測的limit_price(未取整，用來比對一致性)
     limit = round_to_tick(limit_raw)           # 實際掛單價
 
     signal_date = pd.Timestamp(df.index[-1])
@@ -178,14 +218,18 @@ def compute_signal_row(code: str, df: pd.DataFrame, capital: float) -> dict:
         "limit_raw": limit_raw,
         "limit_price": limit,
         "atr": atr,
-        "stop_dist": ATR_STOP_MULT * atr if atr_ok else np.nan,
-        "target_dist": ATR_TARGET_MULT * atr if atr_ok else np.nan,
-        "stop_if_fill_at_limit": floor_to_tick(limit - ATR_STOP_MULT * atr) if atr_ok and limit - ATR_STOP_MULT * atr > 0 else np.nan,
-        "target_if_fill_at_limit": floor_to_tick(limit + ATR_TARGET_MULT * atr) if atr_ok else np.nan,
+        "positions": positions,
+        "atr_stop_mult": stop_mult,
+        "atr_target_mult": target_mult,
+        "entry_limit_ticks": ENTRY_LIMIT_TICKS,
+        "stop_dist": stop_mult * atr if atr_ok else np.nan,
+        "target_dist": target_mult * atr if atr_ok else np.nan,
+        "stop_if_fill_at_limit": floor_to_tick(limit - stop_mult * atr) if atr_ok and limit - stop_mult * atr > 0 else np.nan,
+        "target_if_fill_at_limit": floor_to_tick(limit + target_mult * atr) if atr_ok else np.nan,
         "contract": "小型" if mult == 100 else "標準",
         "multiplier": mult,
-        "stop_dist_ntd_per_lot": ATR_STOP_MULT * atr * mult if atr_ok else np.nan,
-        "target_dist_ntd_per_lot": ATR_TARGET_MULT * atr * mult if atr_ok else np.nan,
+        "stop_dist_ntd_per_lot": stop_mult * atr * mult if atr_ok else np.nan,
+        "target_dist_ntd_per_lot": target_mult * atr * mult if atr_ok else np.nan,
         "margin_est_1lot": margin,
         "margin_over_cap": bool(margin > margin_cap),
         "atr_invalid": not atr_ok,
@@ -197,8 +241,11 @@ def compute_signal_row(code: str, df: pd.DataFrame, capital: float) -> dict:
     return row
 
 
-def scan(price_data: dict, universe: dict, as_of, capital: float = DEFAULT_CAPITAL) -> dict:
-    """掃描全部標的，回傳結果dict(markdown/csv都從這裡產生)。as_of：訊號日(收盤那天)。"""
+def scan(price_data: dict, universe: dict, as_of, capital: float = DEFAULT_CAPITAL,
+         positions: int = DEFAULT_POSITIONS) -> dict:
+    """掃描全部標的，回傳結果dict(markdown/csv都從這裡產生)。as_of：訊號日(收盤那天)。
+    positions：同時最多持有幾檔(1或2)，決定用哪一組實盤設定。"""
+    live_setting(positions)  # 不合法的positions在下載/計算之前就擋掉
     as_of = pd.Timestamp(as_of).normalize()
     cleaned = {}
     for code in universe:
@@ -226,7 +273,7 @@ def scan(price_data: dict, universe: dict, as_of, capital: float = DEFAULT_CAPIT
     for code, df in cleaned.items():
         if pd.Timestamp(df.index[-1]).normalize() != as_of:
             continue  # 最後一根不是as_of(停牌/資料沒更新)：訊號只看「as_of那根」，舊的訊號不算
-        row = compute_signal_row(code, df, capital)
+        row = compute_signal_row(code, df, capital, positions=positions)
         if row is not None:
             signals.append(row)
 
@@ -238,6 +285,7 @@ def scan(price_data: dict, universe: dict, as_of, capital: float = DEFAULT_CAPIT
     return {
         "as_of": as_of,
         "capital": capital,
+        "positions": positions,
         "universe_size": len(universe),
         "downloaded": len([c for c in universe if price_data.get(c) is not None and not price_data[c].empty]),
         "failed_codes": [c for c in universe if price_data.get(c) is None or price_data[c].empty],
@@ -255,7 +303,8 @@ def scan(price_data: dict, universe: dict, as_of, capital: float = DEFAULT_CAPIT
 # 輸出
 # ----------------------------------------------------------------------------
 CSV_COLUMNS = [
-    "rank", "code", "name", "signal_date", "close", "prev_close", "trigger_return", "tick", "limit_price",
+    "rank", "code", "name", "signal_date", "positions", "atr_stop_mult", "atr_target_mult", "entry_limit_ticks",
+    "close", "prev_close", "trigger_return", "tick", "limit_price",
     "atr", "stop_dist", "target_dist", "stop_if_fill_at_limit", "target_if_fill_at_limit", "contract",
     "multiplier", "stop_dist_ntd_per_lot", "target_dist_ntd_per_lot", "margin_est_1lot", "margin_over_cap",
     "atr_invalid", "backtest_would_skip", "entry_date", "time_exit_date", "data_fresh",
@@ -267,22 +316,29 @@ def signals_frame(result: dict) -> pd.DataFrame:
     return pd.DataFrame(rows, columns=CSV_COLUMNS)
 
 
-def _rules_section() -> list:
+def _rules_section(positions: int) -> list:
+    st = live_setting(positions)
+    n = st["max_concurrent_positions"]
     cd = COOLDOWN_CALENDAR_DAYS
+    pf = SQUEEZE_KDJ_LIVE_REFERENCE_PF_2018_2025
+    t1, t2 = SQUEEZE_KDJ_LIVE_SETTINGS[1]["atr_target_mult"], SQUEEZE_KDJ_LIVE_SETTINGS[2]["atr_target_mult"]
     return [
         "## 每日操作規則",
         "",
+        f"目前{setting_label(positions)}(另一組：--positions {2 if positions == 1 else 1})",
+        "",
         "**掛單(開盤前)**",
-        "1. 每檔只做1口，價格用上面的「限價買進」，**開盤沒成交就不追**，等下一個訊號。",
-        f"2. 空位有N個，就從第1名往下取N檔；跳過：標⛔的、你已經持有的、停損出場後{cd}個日曆天內的"
-        f"(例：10/1停損，10/{1 + cd}起才能再進同一檔)。",
-        f"3. 回測最多同時{MAX_CONCURRENT}檔、你打算1~2檔：空位數用你自己的上限算。全部持倉保證金合計不超過資金的{TOTAL_MARGIN_CAP_RATIO:.0%}。",
+        f"1. 每檔只做1口，價格用上面的「限價買進」(=訊號日收盤**+{ENTRY_LIMIT_TICKS}檔**，逐檔往上走，跨價位級距時檔位跟著變)，"
+        "**開盤高於限價就不追**，等下一個訊號。",
+        f"2. 空位上限={n}檔(你設定的N檔)，空位有幾個就從第1名往下取幾檔；跳過：標⛔的、你已經持有的、"
+        f"停損出場後{cd}個日曆天內的(例：10/1停損，10/{1 + cd}起才能再進同一檔)。",
+        f"3. 全部持倉保證金合計不超過資金的{total_margin_cap_ratio(positions):.0%}，單筆不超過35%。",
         f"4. 回測裡如果排名較前的那檔開盤高於限價沒成交，會改試下一名(最多試到第{TOP_N}名，不含已持有/冷卻中)。"
         "實盤只能近似：開盤後下一名的價格如果還≤它的限價，可以改掛它；已經漲過限價就放棄。",
         "",
         "**成交後(馬上做)**",
-        f"5. 用**實際成交價**重算並立刻掛條件單：停損 = 成交價 − {ATR_STOP_MULT:g}×ATR，停利 = 成交價 + {ATR_TARGET_MULT:g}×ATR，"
-        "兩個都往下取到合法檔位。成交當天就生效(回測進場當天就會檢查停損/停利)。",
+        f"5. 用**實際成交價**重算並立刻掛條件單：停損 = 成交價 − {st['atr_stop_mult']:g}×ATR，"
+        f"停利 = 成交價 + {st['atr_target_mult']:g}×ATR，兩個都往下取到合法檔位。成交當天就生效(回測進場當天就會檢查停損/停利)。",
         f"6. 停損、停利都沒碰到：持有到「最長持有到期日」(進場日算第1天的第{MAX_HOLD_DAYS}個交易日)收盤前平倉。"
         "到期日是用週一~週五估的，遇到國定假日要往後順延。",
         "7. 回測細節：明天收盤就要到期平倉的部位，回測把它的名額算成明天可用。",
@@ -291,8 +347,11 @@ def _rules_section() -> list:
         "8. 帳戶從開始實盤累計虧損達 **NT$30,000** → 全部停止。",
         "9. 做滿 **30筆** 交易後，如果這30筆的獲利因子 **PF<1** → 全部停止。",
         "",
-        "⚠️ 這個策略**沒有通過回測驗證**(2018–2023 未見過區段、真實成交情境 PF≈0.67)，"
-        "實盤是實驗，部位保持最小。",
+        f"⚠️ 這組設定是在2018–2026的資料上比過約{SQUEEZE_KDJ_LIVE_CUMULATIVE_VARIANTS}個回測變體之後才挑的，"
+        "**從來沒有通過專案的正式驗證**，數字偏樂觀。"
+        f"限價+{ENTRY_LIMIT_TICKS}檔時，2018–2025的回測PF約{pf[1]:.2f}(最多1檔、停利{t1:g}倍)／"
+        f"約{pf[2]:.2f}(最多2檔、停利{t2:g}倍)；最近的成績有一大部分是2026年撐起來的。"
+        "部位保持最小，以實盤結果為準。",
     ]
 
 
@@ -314,12 +373,12 @@ def _signal_block(r: dict, data_fresh: bool) -> list:
         buy = f"{fmt_price(r['limit_price'])} ⛔"
     else:
         buy = f"**{fmt_price(r['limit_price'])}**"
-    lines.append(f"- 限價買進 {buy}(收盤+1檔{fmt_price(r['tick'])})，開盤高於此價不追")
+    lines.append(f"- 限價買進 {buy}(收盤{fmt_price(r['close'])}+{r['entry_limit_ticks']}檔)，開盤高於此價不追")
     if not r["atr_invalid"]:
         lines.append(f"- 若成交在 {fmt_price(r['limit_price'])}：停損 **{fmt_price(r['stop_if_fill_at_limit'])}**"
                      f"｜停利 **{fmt_price(r['target_if_fill_at_limit'])}**")
-        lines.append(f"- ATR14 = {r['atr']:.2f} → 停損 = 成交價 − {r['stop_dist']:.2f}，"
-                     f"停利 = 成交價 + {r['target_dist']:.2f}")
+        lines.append(f"- ATR14 = {r['atr']:.2f} → 停損 = 成交價 − {r['stop_dist']:.2f}({r['atr_stop_mult']:g}×ATR)，"
+                     f"停利 = 成交價 + {r['target_dist']:.2f}({r['atr_target_mult']:g}×ATR)")
         lines.append(f"- 每口：停損距離約 NT${r['stop_dist_ntd_per_lot']:,.0f}｜停利距離約 NT${r['target_dist_ntd_per_lot']:,.0f}")
     lines.append(f"- {r['contract']}契約 {r['multiplier']:,}股｜保證金約 NT${r['margin_est_1lot']:,.0f}")
     lines.append(f"- 最長持有到 {fmt_date(r['time_exit_date'])} 收盤(約略，遇假日順延)")
@@ -332,7 +391,8 @@ def render_markdown(result: dict) -> str:
     sigs = result["signals"]
     fresh = result["data_fresh"]
     latest = result["latest_date"]
-    lines = [f"# 擠壓+KDJ 每日訊號 {fmt_date(as_of)}", ""]
+    positions = result.get("positions", DEFAULT_POSITIONS)
+    lines = [f"# 擠壓+KDJ 每日訊號 {fmt_date(as_of)}", "", f"**{setting_label(positions)}**", ""]
 
     if not fresh:
         lines += [
@@ -373,7 +433,7 @@ def render_markdown(result: dict) -> str:
         for r in sigs:
             lines += _signal_block(r, data_fresh=fresh)
 
-    lines += ["---", ""] + _rules_section() + [""]
+    lines += ["---", ""] + _rules_section(positions) + [""]
     return "\n".join(lines)
 
 
@@ -388,7 +448,9 @@ def render_telegram(result: dict, link: str = None) -> str:
     sigs = result["signals"]
     fresh = result["data_fresh"]
     latest = result["latest_date"]
-    lines = [f"擠壓+KDJ 每日訊號 {fmt_date(as_of)}"]
+    positions = result.get("positions", DEFAULT_POSITIONS)
+    n_slots = live_setting(positions)["max_concurrent_positions"]
+    lines = [f"擠壓+KDJ 每日訊號 {fmt_date(as_of)}", setting_label(positions)]
 
     if not fresh:
         lines += [
@@ -404,7 +466,7 @@ def render_telegram(result: dict, link: str = None) -> str:
             lines.append(f"✅ 今天{len(sigs)}檔訊號都是⛔(回測會略過)，{fmt_date(result['entry_date'])} 不用下單。")
         else:
             lines.append(f"📌 {len(sigs)}檔訊號(可下單{n_actionable}檔)，{fmt_date(result['entry_date'])} 開盤前掛單，"
-                         "依名次取到你的空位數為止；已持有/停損後10天內的跳過。")
+                         f"依名次取到你的空位數為止(上限{n_slots}檔)；已持有/停損後{COOLDOWN_CALENDAR_DAYS}天內的跳過。")
         for r in sigs:
             name = f" {r['name']}" if r["name"] else ""
             lines.append("")
@@ -413,10 +475,11 @@ def render_telegram(result: dict, link: str = None) -> str:
                 lines.append(f"{r['rank']}. {r['code']}{name} ⛔ 不要下({why})")
                 continue
             lines.append(f"{r['rank']}. {r['code']}{name}｜{r['contract']}契約1口｜保證金約{r['margin_est_1lot']:,.0f}")
-            lines.append(f"限價買 {fmt_price(r['limit_price'])}(開盤高於此價不追)")
+            lines.append(f"限價買 {fmt_price(r['limit_price'])}(收盤+{r['entry_limit_ticks']}檔，開盤高於此價不追)")
             lines.append(f"若成交在{fmt_price(r['limit_price'])}：停損 {fmt_price(r['stop_if_fill_at_limit'])}"
                          f"｜停利 {fmt_price(r['target_if_fill_at_limit'])}")
-            lines.append(f"實際成交價不同就重算：停損=成交價−{r['stop_dist']:.2f}，停利=成交價+{r['target_dist']:.2f}")
+            lines.append(f"實際成交價不同就重算：停損=成交價−{r['stop_dist']:.2f}({r['atr_stop_mult']:g}×ATR)，"
+                         f"停利=成交價+{r['target_dist']:.2f}({r['atr_target_mult']:g}×ATR)")
             lines.append(f"最晚 {fmt_date(r['time_exit_date'])} 收盤前平倉(遇假日順延)")
 
     footer_text = f"\n\n完整說明與操作規則：{link}" if link else ""
@@ -470,7 +533,9 @@ def download_window(as_of: datetime.date, lookback_days: int):
 
 
 def parse_args(argv=None):
-    p = argparse.ArgumentParser(description="擠壓+KDJ(固定設定)每日訊號掃描")
+    p = argparse.ArgumentParser(description="擠壓+KDJ(實盤設定)每日訊號掃描")
+    p.add_argument("--positions", type=int, choices=VALID_POSITIONS, default=DEFAULT_POSITIONS,
+                   help="同時最多持有幾檔：1=停利4.0倍ATR(預設)、2=停利3.0倍ATR；停損都是1.5倍ATR、限價收盤+2檔")
     p.add_argument("--capital", type=float, default=DEFAULT_CAPITAL, help="帳戶資金(新台幣)，用來判斷單筆保證金35%%上限")
     p.add_argument("--as-of", default=None, help="訊號日YYYY-MM-DD，預設今天(台北時間)")
     p.add_argument("--max-stocks", type=int, default=0, help="只掃前N檔(0=全部)，測試用")
@@ -485,6 +550,7 @@ def main(argv=None) -> dict:
     as_of = datetime.date.fromisoformat(args.as_of) if args.as_of else today_in_taipei()
     universe = build_universe(args.max_stocks)
     start, end = download_window(as_of, args.lookback_days)
+    print(setting_label(args.positions), flush=True)
     print(f"掃描 {len(universe)} 檔，資料區間 {start} ~ {as_of.isoformat()}(yfinance end={end}，不含)", flush=True)
 
     # refresh=True + 暫存快取資料夾：保證一定重新下載(不會用到同一天稍早、資料還沒出來時存下的快取)，
@@ -495,7 +561,7 @@ def main(argv=None) -> dict:
     finally:
         shutil.rmtree(tmp_cache, ignore_errors=True)
 
-    result = scan(price_data, universe, as_of, capital=args.capital)
+    result = scan(price_data, universe, as_of, capital=args.capital, positions=args.positions)
     out = write_outputs(result, args.output_dir)
     print(out["markdown"], flush=True)
     print(f"已寫入：{out['latest']}、{out['md']}、{out['csv']}", flush=True)

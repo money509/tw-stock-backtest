@@ -2,7 +2,10 @@
 
 最重要的是 TestConsistencyWithBacktest：在長段合成資料上，對每一個訊號日d，用「只看得到d以前
 (含d)、而且只抓預設回看窗口」的資料跑掃描器，結果必須跟回測(precompute_squeeze_kdj_backtest_arrays，
-用完整歷史算)在下一個交易日的候選事件完全一致——代號、排名順序、限價(觸發K棒收盤+1檔)、ATR。"""
+用完整歷史算)在下一個交易日的候選事件完全一致——代號、排名順序、限價(觸發K棒收盤+2檔，跟回測
+execution_model="limit_ticks"、entry_limit_ticks=2同一個函式)、ATR。
+TestLimitMatchesBacktestAcrossTickBoundaries再用真的回測引擎在價位級距邊界上確認：掃描器的限價/停損/停利
+跟回測實際用的價格一模一樣。"""
 import datetime
 import os
 import subprocess
@@ -16,8 +19,10 @@ import pytest
 import daily_squeeze_signals as dss
 from squeeze_kdj_signal import (
     compute_squeeze_kdj_features, precompute_squeeze_kdj_features_by_code,
-    precompute_squeeze_kdj_backtest_arrays, taiwan_tick_size,
+    precompute_squeeze_kdj_backtest_arrays, taiwan_tick_size, taiwan_add_ticks,
+    squeeze_kdj_entry_limit_price, run_squeeze_kdj_capital_constrained_backtest,
 )
+import compare_breakout as cb
 from taifex_universe import STOCK_FUTURES_UNIVERSE, estimate_margin
 
 REPO_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -116,7 +121,10 @@ class TestConsistencyWithBacktest:
             for r, (code, strength, trig_close, atr) in zip(got, expected):
                 assert r["trigger_return"] == pytest.approx(strength, rel=1e-12)
                 assert r["close"] == pytest.approx(trig_close, rel=1e-12)
-                assert r["limit_raw"] == pytest.approx(trig_close + taiwan_tick_size(trig_close), rel=1e-12)
+                # 回測的限價(limit_ticks, N=2)：同一個函式、同一個輸入 → 逐位元相同
+                backtest_limit = squeeze_kdj_entry_limit_price(trig_close, "limit_ticks", entry_limit_ticks=2)
+                assert r["limit_raw"] == backtest_limit
+                assert r["limit_raw"] == taiwan_add_ticks(trig_close, 2)
                 # 掛單價 = 同一個價格取到合法檔位(真實資料的收盤本來就在檔位上，兩者相同；合成資料不在檔位上)
                 assert r["limit_price"] == dss.round_to_tick(r["limit_raw"])
                 assert r["atr"] == pytest.approx(atr, rel=1e-9)
@@ -243,31 +251,45 @@ class TestTickRounding:
         assert dss.floor_to_tick(price) == pytest.approx(expected, abs=1e-9)
         assert dss.floor_to_tick(price) <= price + 1e-9
 
-    @pytest.mark.parametrize("close,limit", [(9.99, 10.0), (49.95, 50.0), (99.9, 100.0), (499.5, 500.0),
-                                             (999.0, 1000.0), (123.5, 124.0), (1005.0, 1010.0), (35.2, 35.25)])
-    def test_limit_is_close_plus_one_tick(self, close, limit):
-        assert dss.round_to_tick(close + taiwan_tick_size(close)) == pytest.approx(limit, abs=1e-9)
+    @pytest.mark.parametrize("close,limit", [(9.98, 10.0), (9.99, 10.05), (49.95, 50.1), (99.9, 100.5),
+                                             (499.5, 501.0), (999.0, 1005.0), (123.5, 124.5), (1005.0, 1015.0),
+                                             (35.2, 35.3)])
+    def test_limit_is_close_plus_two_ticks_walked(self, close, limit):
+        """逐檔往上走2檔：跨級距時第2檔用新級距的tick(49.95 → 50.0 → 50.1，不是49.95+2x0.05)。"""
+        raw = dss.entry_limit_raw(close)
+        assert raw == squeeze_kdj_entry_limit_price(close, "limit_ticks", entry_limit_ticks=2)
+        assert dss.round_to_tick(raw) == pytest.approx(limit, abs=1e-9)
 
     def test_stop_and_target_rounded_down_from_limit_fill(self, market):
         price_data, universe, idx = market
         code, t = _find_signal(price_data)
         res = dss.scan({c: df[df.index <= idx[t]] for c, df in price_data.items()}, universe, idx[t])
         r = next(r for r in res["signals"] if r["code"] == code)
-        raw_stop = r["limit_price"] - 1.0 * r["atr"]
-        raw_target = r["limit_price"] + 3.0 * r["atr"]
+        raw_stop = r["limit_price"] - 1.5 * r["atr"]
+        raw_target = r["limit_price"] + 4.0 * r["atr"]  # 預設positions=1
         assert r["stop_if_fill_at_limit"] == dss.floor_to_tick(raw_stop)
         assert r["target_if_fill_at_limit"] == dss.floor_to_tick(raw_target)
         assert raw_stop - taiwan_tick_size(raw_stop) < r["stop_if_fill_at_limit"] <= raw_stop
         assert raw_target - taiwan_tick_size(raw_target) < r["target_if_fill_at_limit"] <= raw_target
 
 
+_SIGNAL_MARKET = None
+
+
 def _single_stock_signal_df(code_price=100.0):
-    """拿合成市場裡的一個訊號，把價格整體縮放到指定水準(訊號只看相對關係，縮放不改變EntryFlag)。"""
-    price_data, universe, idx = _make_market(seed=0)
-    code, t = _find_signal(price_data)
+    """拿合成市場裡的一個訊號，把價格整體縮放到指定水準(訊號只看相對關係，縮放不改變EntryFlag)。
+    最後一根收盤直接設成code_price(避免縮放的浮點誤差讓收盤不剛好落在級距邊界上)。"""
+    global _SIGNAL_MARKET
+    if _SIGNAL_MARKET is None:
+        price_data, universe, idx = _make_market(seed=0)
+        _SIGNAL_MARKET = (price_data, idx, _find_signal(price_data))
+    price_data, idx, (code, t) = _SIGNAL_MARKET
     df = price_data[code][price_data[code].index <= idx[t]].copy()
     scale = code_price / df["Close"].iloc[-1]
     df[["Open", "High", "Low", "Close"]] *= scale
+    df.iloc[-1, df.columns.get_loc("Close")] = code_price
+    df.iloc[-1, df.columns.get_loc("High")] = max(df["High"].iloc[-1], code_price)
+    df.iloc[-1, df.columns.get_loc("Low")] = min(df["Low"].iloc[-1], code_price)
     return df
 
 
@@ -277,8 +299,8 @@ class TestContractAndMargin:
         row = dss.compute_signal_row("2330", df, capital=200_000)  # 2330有小型契約
         assert row is not None
         assert row["multiplier"] == 100 and row["contract"] == "小型"
-        assert row["stop_dist_ntd_per_lot"] == pytest.approx(row["atr"] * 100)
-        assert row["target_dist_ntd_per_lot"] == pytest.approx(3 * row["atr"] * 100)
+        assert row["stop_dist_ntd_per_lot"] == pytest.approx(1.5 * row["atr"] * 100)
+        assert row["target_dist_ntd_per_lot"] == pytest.approx(4.0 * row["atr"] * 100)  # 預設positions=1
         assert row["margin_est_1lot"] == pytest.approx(estimate_margin("2330", row["limit_price"], 1))
 
     def test_standard_contract_2000_shares_and_margin_flag(self):
@@ -331,7 +353,8 @@ class TestOutputs:
         out = dss.main(["--as-of", quiet.date().isoformat(), "--output-dir", str(tmp_path / "sig")])
         md = out["markdown"]
         assert "今天沒有訊號，明天不用下單" in md
-        assert "每日操作規則" in md and "PF≈0.67" in md and "NT$30,000" in md
+        assert "每日操作規則" in md and "NT$30,000" in md and "PF<1" in md
+        assert "PF≈0.67" not in md and "+2檔" in md
         day = quiet.date().isoformat()
         assert (tmp_path / "sig" / "latest.md").read_text(encoding="utf-8") == md
         assert (tmp_path / "sig" / f"{day}.md").read_text(encoding="utf-8") == md
@@ -372,6 +395,9 @@ class TestWithoutScipy:
             price_data, universe, idx = t._make_market(n_stocks=4, n_days=420)
             res = dss.scan({{c: df[df.index <= idx[-1]] for c, df in price_data.items()}}, universe, idx[-1])
             out = dss.write_outputs(res, {str(tmp_path)!r})
+            res2 = dss.scan({{c: df[df.index <= idx[-1]] for c, df in price_data.items()}}, universe, idx[-1],
+                            positions=2)
+            assert res2["positions"] == 2 and "停利3.0倍ATR" in dss.render_telegram(res2)
             assert "scipy" not in sys.modules or sys.modules["scipy"] is None
             print("OK", len(res["signals"]))
         """)
@@ -380,6 +406,8 @@ class TestWithoutScipy:
         assert proc.returncode == 0, proc.stderr
         assert "OK" in proc.stdout
         assert (tmp_path / "latest.md").exists()
+        assert "設定：同時最多1檔｜停損1.5倍ATR｜停利4.0倍ATR｜限價收盤+2檔" in (tmp_path / "latest.md").read_text(encoding="utf-8")
+        assert "設定：同時最多1檔" in (tmp_path / "telegram.txt").read_text(encoding="utf-8")
 
 
 # ----------------------------------------------------------------------------
@@ -433,3 +461,239 @@ class TestTelegramMessage:
         monkeypatch.delenv("GITHUB_STEP_SUMMARY", raising=False)
         dss.write_outputs(_result_with([]), str(tmp_path))
         assert (tmp_path / "telegram.txt").read_text(encoding="utf-8").endswith("https://example.com/x.md")
+
+
+# ----------------------------------------------------------------------------
+# 實盤設定(SQUEEZE_KDJ_LIVE_SETTINGS)：--positions 1/2
+# ----------------------------------------------------------------------------
+BOUNDARY_CLOSES = (9.99, 49.95, 99.9, 499.5, 999.0)
+
+
+class TestLimitMatchesBacktestAcrossTickBoundaries:
+    """在價位級距邊界上，用真的回測引擎(execution_model="limit_ticks"、entry_limit_ticks=2、實盤設定)
+    確認掃描器算的限價就是回測實際用的限價：開盤=掃描器限價 → 回測剛好在限價成交；開盤=限價+1檔 → 回測不追。
+    同時確認回測的停損/停利倍數跟掃描器一致。"""
+
+    def _backtest(self, df, positions, next_bar):
+        code = "2330"
+        next_day = df.index[-1] + pd.offsets.BDay(1)
+        full = pd.concat([df, pd.DataFrame([next_bar], index=[next_day])])
+        price_data = {code: full}
+        universe = {code: STOCK_FUTURES_UNIVERSE[code]}
+        features = precompute_squeeze_kdj_features_by_code(price_data, universe)
+        pre = precompute_squeeze_kdj_backtest_arrays(price_data, features, atr_period=14)
+        i = len(full) - 1
+        assert (code, i) in pre["events_by_date"][next_day]
+        assert pre["per_code"][code]["trigger_close"][i] == df["Close"].iloc[-1]  # 回測的參考價 = 掃描器的收盤
+        st = cb.SQUEEZE_KDJ_LIVE_SETTINGS[positions]
+        trades, diag = run_squeeze_kdj_capital_constrained_backtest(
+            price_data, universe, pd.DatetimeIndex([next_day]), 10_000_000, variant=st["variant"],
+            lots=st["lots"], top_n=st["top_n"], max_concurrent_positions=st["max_concurrent_positions"],
+            atr_stop_mult=st["atr_stop_mult"], atr_target_mult=st["atr_target_mult"], atr_period=st["atr_period"],
+            max_hold_days=st["max_hold_days"], ranking_rule=st["ranking_rule"], entry_filter=st["entry_filter"],
+            features_by_code=features, precomputed=pre, return_diagnostics=True,
+            execution_model=st["execution_model"], entry_limit_ticks=st["entry_limit_ticks"])
+        return trades, diag, pre["per_code"][code]["trigger_close"][i]
+
+    @pytest.mark.parametrize("close", BOUNDARY_CLOSES)
+    @pytest.mark.parametrize("positions", [1, 2])
+    def test_fill_at_scanner_limit_and_target_matches(self, close, positions):
+        df = _single_stock_signal_df(close)
+        row = dss.compute_signal_row("2330", df, capital=10_000_000, positions=positions)
+        assert row is not None and row["close"] == close
+        lim, atr = row["limit_price"], row["atr"]
+        # 開盤剛好=掃描器限價、當天漲很多 → 回測在限價成交、打到停利
+        trades, diag, trig_close = self._backtest(
+            df, positions, {"Open": lim, "High": lim + 10 * atr, "Low": lim, "Close": lim, "Volume": 1e4})
+        assert row["limit_raw"] == squeeze_kdj_entry_limit_price(trig_close, "limit_ticks", entry_limit_ticks=2)
+        assert diag["skipped_limit_not_filled"] == 0
+        assert len(trades) == 1 and trades[0]["exit_reason"] == "target"
+        assert trades[0]["e_price"] == pytest.approx(lim, abs=1e-9)
+        target_mult = {1: 4.0, 2: 3.0}[positions]
+        assert trades[0]["exit_price"] == pytest.approx(lim + target_mult * atr, rel=1e-9)
+        assert row["target_dist"] == pytest.approx(target_mult * atr)
+
+    @pytest.mark.parametrize("close", BOUNDARY_CLOSES)
+    def test_stop_matches_backtest(self, close):
+        df = _single_stock_signal_df(close)
+        row = dss.compute_signal_row("2330", df, capital=10_000_000, positions=1)
+        lim, atr = row["limit_price"], row["atr"]
+        trades, diag, _ = self._backtest(
+            df, 1, {"Open": lim, "High": lim, "Low": max(lim - 10 * atr, 0.01), "Close": lim, "Volume": 1e4})
+        assert len(trades) == 1 and trades[0]["exit_reason"] == "stop"
+        raw_stop = lim - 1.5 * atr
+        # 回測：停損是市價型出場，多付1檔
+        assert trades[0]["exit_price"] == pytest.approx(raw_stop - taiwan_tick_size(raw_stop), rel=1e-9)
+        assert row["stop_dist"] == pytest.approx(1.5 * atr)
+
+    @pytest.mark.parametrize("close", BOUNDARY_CLOSES)
+    def test_open_one_tick_above_scanner_limit_is_not_chased(self, close):
+        df = _single_stock_signal_df(close)
+        row = dss.compute_signal_row("2330", df, capital=10_000_000)
+        above = dss.round_to_tick(row["limit_price"] + taiwan_tick_size(row["limit_price"]))
+        trades, diag, _ = self._backtest(
+            df, 1, {"Open": above, "High": above, "Low": above, "Close": above, "Volume": 1e4})
+        assert trades == [] and diag["skipped_limit_not_filled"] == 1
+
+
+class TestLiveSettings:
+    def test_live_settings_constant(self):
+        s1, s2 = cb.SQUEEZE_KDJ_LIVE_SETTINGS[1], cb.SQUEEZE_KDJ_LIVE_SETTINGS[2]
+        assert set(cb.SQUEEZE_KDJ_LIVE_SETTINGS) == {1, 2}
+        for s in (s1, s2):
+            assert s["atr_stop_mult"] == 1.5 and s["entry_limit_ticks"] == 2 and s["execution_model"] == "limit_ticks"
+            assert s["variant"] == "B" and s["atr_period"] == 14 and s["max_hold_days"] == 20
+            assert s["ranking_rule"] == "trigger_return" and s["entry_filter"] is None
+            assert s["top_n"] == 3 and s["lots"] == 1
+        assert (s1["atr_target_mult"], s1["max_concurrent_positions"]) == (4.0, 1)
+        assert (s2["atr_target_mult"], s2["max_concurrent_positions"]) == (3.0, 2)
+        # 舊模式依賴的舊設定沒動
+        assert cb.SQUEEZE_KDJ_FIXED_SETTING["atr_stop_mult"] == 1.0
+        assert cb.SQUEEZE_KDJ_FIXED_SETTING["atr_target_mult"] == 3.0
+        assert cb.SQUEEZE_KDJ_FIXED_SETTING["max_concurrent_positions"] == 3
+
+    def test_positions_1_target_4_stop_1_5(self):
+        row = dss.compute_signal_row("2330", _single_stock_signal_df(100.0), capital=200_000, positions=1)
+        assert row["atr_target_mult"] == 4.0 and row["atr_stop_mult"] == 1.5
+        assert row["target_dist"] == pytest.approx(4.0 * row["atr"])
+        assert row["stop_dist"] == pytest.approx(1.5 * row["atr"])
+        assert row["target_if_fill_at_limit"] == dss.floor_to_tick(row["limit_price"] + 4.0 * row["atr"])
+        assert row["stop_if_fill_at_limit"] == dss.floor_to_tick(row["limit_price"] - 1.5 * row["atr"])
+        assert row["target_dist_ntd_per_lot"] == pytest.approx(4.0 * row["atr"] * row["multiplier"])
+
+    def test_positions_2_target_3(self):
+        df = _single_stock_signal_df(100.0)
+        r1 = dss.compute_signal_row("2330", df, capital=200_000, positions=1)
+        r2 = dss.compute_signal_row("2330", df, capital=200_000, positions=2)
+        assert r2["atr_target_mult"] == 3.0 and r2["atr_stop_mult"] == 1.5
+        assert r2["target_dist"] == pytest.approx(3.0 * r2["atr"])
+        assert r2["target_if_fill_at_limit"] == dss.floor_to_tick(r2["limit_price"] + 3.0 * r2["atr"])
+        # 限價/停損/ATR跟positions無關
+        for k in ("limit_price", "stop_if_fill_at_limit", "atr", "stop_dist"):
+            assert r1[k] == r2[k]
+
+    def test_default_is_one_position(self):
+        df = _single_stock_signal_df(100.0)
+        assert dss.compute_signal_row("2330", df, capital=200_000)["atr_target_mult"] == 4.0
+        assert dss.parse_args([]).positions == 1
+
+    @pytest.mark.parametrize("bad", [0, 3, -1, True, "1", 1.5])
+    def test_invalid_positions_rejected(self, bad, market):
+        with pytest.raises(ValueError):
+            dss.live_setting(bad)
+        with pytest.raises(ValueError):
+            dss.compute_signal_row("2330", _single_stock_signal_df(100.0), capital=200_000, positions=bad)
+        price_data, universe, idx = market
+        with pytest.raises(ValueError):
+            dss.scan(price_data, universe, idx[400], positions=bad)
+
+    @pytest.mark.parametrize("bad", ["0", "3", "x"])
+    def test_invalid_positions_rejected_by_cli(self, bad):
+        with pytest.raises(SystemExit):
+            dss.parse_args(["--positions", bad])
+
+    def test_cli_positions_2_reaches_rows_and_csv(self, market, monkeypatch, tmp_path):
+        price_data, universe, idx = market
+        features = precompute_squeeze_kdj_features_by_code(price_data, universe)
+        flags = pd.DataFrame({c: f["EntryFlag"] for c, f in features.items()})
+        busy = flags.index[(flags.sum(axis=1) >= 1) & (flags.index >= idx[300])][0]
+        out = _run_main(monkeypatch, tmp_path, price_data, busy, list(universe), extra=("--positions", "2"))
+        res = out["result"]
+        assert res["positions"] == 2 and res["signals"]
+        assert all(r["atr_target_mult"] == 3.0 for r in res["signals"])
+        assert "設定：同時最多2檔｜停損1.5倍ATR｜停利3.0倍ATR｜限價收盤+2檔" in out["markdown"]
+        csv = pd.read_csv(tmp_path / f"{busy.date().isoformat()}.csv", dtype={"code": str})
+        assert set(csv["positions"]) == {2} and set(csv["atr_target_mult"]) == {3.0}
+        assert set(csv["atr_stop_mult"]) == {1.5} and set(csv["entry_limit_ticks"]) == {2}
+        tg = (tmp_path / "telegram.txt").read_text(encoding="utf-8")
+        assert "設定：同時最多2檔｜停損1.5倍ATR｜停利3.0倍ATR｜限價收盤+2檔" in tg
+
+
+class TestHeadersAndRules:
+    def _row(self, positions):
+        row = dss.compute_signal_row("2330", _single_stock_signal_df(100.0), capital=200_000, positions=positions)
+        return {**row, "rank": 1}
+
+    @pytest.mark.parametrize("positions,label", [
+        (1, "設定：同時最多1檔｜停損1.5倍ATR｜停利4.0倍ATR｜限價收盤+2檔"),
+        (2, "設定：同時最多2檔｜停損1.5倍ATR｜停利3.0倍ATR｜限價收盤+2檔"),
+    ])
+    def test_headers_show_setting(self, positions, label):
+        assert dss.setting_label(positions) == label
+        res = {**_result_with([self._row(positions)]), "positions": positions}
+        md = dss.render_markdown(res)
+        assert md.splitlines()[2] == f"**{label}**"  # 標題下面第一行
+        tg = dss.render_telegram(res)
+        assert tg.splitlines()[1] == label
+        target = {1: "4", 2: "3"}[positions]
+        assert f"({target}×ATR)" in tg and "(1.5×ATR)" in tg and "收盤+2檔" in tg
+
+    def test_stale_and_no_signal_telegram_still_show_setting(self):
+        assert dss.render_telegram(_result_with([])).splitlines()[1].startswith("設定：同時最多1檔")
+        assert dss.render_telegram(_result_with([], fresh=False)).splitlines()[1].startswith("設定：")
+
+    @pytest.mark.parametrize("positions", [1, 2])
+    def test_rules_text(self, positions):
+        rules = "\n".join(dss._rules_section(positions))
+        assert "PF≈0.67" not in rules and "2018–2023" not in rules
+        assert "+2檔" in rules and "開盤高於限價就不追" in rules
+        assert "1.5×ATR" in rules and f"{ {1: 4, 2: 3}[positions] }×ATR" in rules
+        assert f"空位上限={positions}檔(你設定的N檔)" in rules
+        assert f"{dss.COOLDOWN_CALENDAR_DAYS}個日曆天" in rules and "NT$30,000" in rules
+        assert "30筆" in rules and "PF<1" in rules and "最長持有到期日" in rules
+        assert "從來沒有通過專案的正式驗證" in rules and "約28個" in rules
+        assert "1.33" in rules and "1.09" in rules and "2026" in rules and "部位保持最小" in rules
+        assert f"資金的{ {1: 35, 2: 70}[positions] }%" in rules
+
+    def test_signal_block_shows_two_ticks(self):
+        md = dss.render_markdown({**_result_with([self._row(1)]), "positions": 1})
+        assert "+2檔)，開盤高於此價不追" in md and "(4×ATR)" in md
+
+    def test_old_mode_reports_no_longer_claim_scanner_uses_fixed_setting(self):
+        note = cb._squeeze_kdj_live_scanner_note()
+        assert "SQUEEZE_KDJ_LIVE_SETTINGS" in note and "停利4.0倍ATR" in note and "停利3.0倍ATR" in note
+        with open(cb.__file__, encoding="utf-8") as f:
+            assert "仍然沿用SQUEEZE_KDJ_FIXED_SETTING" not in f.read()
+
+
+class TestWorkflowPositionsInput:
+    WF_PATH = os.path.join(REPO_DIR, ".github", "workflows", "daily_squeeze_signals.yml")
+
+    def _text(self):
+        with open(self.WF_PATH, encoding="utf-8") as f:
+            return f.read()
+
+    def test_text_wiring(self):
+        text = self._text()
+        assert "POSITIONS: ${{ github.event.inputs.positions || '1' }}" in text
+        assert '--positions ${POSITIONS:-1}' in text
+        assert "同時最多持有幾檔：1=停利4倍ATR、2=停利3倍ATR" in text
+        assert "default改成'2'" in text  # 提醒長期改2檔要改這裡
+
+    def _scan_step(self):
+        yaml = pytest.importorskip("yaml")
+        wf = yaml.safe_load(self._text())
+        on = wf.get("on", wf.get(True))
+        steps = wf["jobs"]["scan"]["steps"]
+        # 注意：Pre-flight步驟的run裡也有「test_daily_squeeze_signals.py」，要比對完整的「python daily_squeeze_signals.py」
+        return on, next(s for s in steps if "python daily_squeeze_signals.py" in s.get("run", ""))
+
+    def test_dispatch_input_is_choice_default_1(self):
+        on, _ = self._scan_step()
+        inp = on["workflow_dispatch"]["inputs"]["positions"]
+        assert inp["type"] == "choice" and inp["options"] == ["1", "2"] and inp["default"] == "1"
+        assert "schedule" in on
+
+    @pytest.mark.parametrize("positions_env,expected", [("", "1"), ("1", "1"), ("2", "2")])
+    def test_run_script_passes_positions(self, positions_env, expected, tmp_path):
+        """把Scan signals的run腳本拿來實際用bash跑(python換成echo)：排程沒有inputs時POSITIONS是空字串 → 1。"""
+        _, step = self._scan_step()
+        script = step["run"].replace("python daily_squeeze_signals.py", "echo")
+        env = {"PATH": os.environ.get("PATH", ""), "AS_OF": "", "CAPITAL": "", "POSITIONS": positions_env}
+        assert "pytest" not in script
+        proc = subprocess.run(["bash", "-c", script], capture_output=True, text=True, env=env, timeout=30)
+        assert proc.returncode == 0, proc.stderr
+        args = proc.stdout.split()
+        assert args[args.index("--positions") + 1] == expected
+        # env裡的GitHub表達式：沒有inputs(排程)時 || '1' 生效
+        assert "|| '1'" in step["env"]["POSITIONS"]
