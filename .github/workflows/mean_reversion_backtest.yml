@@ -71,36 +71,32 @@ on:
         description: '單一訊號混搭搜尋模式(--combo-search)：跟simple_combo不同的是，這裡仍然會先用單一訊號拆解(逐一測試每個訊號，含開啟with_chip_confirm時的籌碼相關訊號)，並排測試兩個「混搭」候選：候選1用PF>1且交易數夠多的訊號等權重組成(select_winning_signals，沒有任何訊號PF>1時退回總損益前3名並標記探索性選擇)；候選2把這次消融測過的「全部」單一訊號(含with_chip_confirm時的籌碼訊號)不篩選、直接等權重混在一起。兩個候選各自固定下來後，突破窗口/突破風格/結構門檻/ATR倍數/出場配置都不再搜尋，直接套用ADX趨勢強度濾網+大盤氛圍regime濾網+移動停利，各自比照simple_combo跑三組累加門檻比較+最終樣本內/樣本外(IS/OOS)+bootstrap驗證，結果輸出到combo_search_variants.csv/trades_OOS_combo_search_filtered.csv(候選1)跟combo_search_variants_allsignals.csv/trades_OOS_combo_search_allsignals.csv(候選2)，summary.txt用並排表格直接比較兩者的OOS表現。簡單說：simple_combo測的是一組使用者已經確認過、完全寫死的訊號組合；combo_search仍然會搜尋「哪些單一訊號該混搭在一起」，而且一次測兩種挑法，比完整6階段流程的多重比較風險低很多。開啟後，上面max_stocks/starting_capital/atr_stop_mult/trailing_atr_mult/start_date/end_date/with_chip_confirm仍然有效(with_chip_confirm開啟時，候選2的「全部混搭」也會把籌碼訊號一起混進去)，其餘跟突破窗口/突破風格/門檻/ATR/出場配置自動搜尋相關的選項會被忽略(對應的階段整個不會執行)'
         required: false
         default: 'false'
-      squeeze_kdj_only:
-        description: '只驗證squeeze+KDJ模式(--squeeze-kdj-only)：只跑布林+Keltner擠壓+KDJ訊號的IS/OOS+bootstrap驗證，跳過突破窗口比較/突破風格比較/訊號自動搜尋/門檻網格/ATR網格/出場配置網格這整套6階段流程——squeeze+KDJ驗證本來就不依賴那6個階段選出的任何東西(它是獨立對universe逐檔股票模擬，訊號本身的進場/出場規則寫死在squeeze_kdj_signal.py裡)，開這個選項可以不用等前面不相關的流程跑完，直接看這個訊號的IS/OOS/bootstrap結果，跑起來比simple_combo/combo_search更快。開啟後，上面max_stocks/starting_capital/atr_stop_mult/trailing_atr_mult/start_date/end_date仍然有效，其餘跟訊號/門檻/突破窗口/出場配置自動搜尋相關的選項在這裡不適用'
+      squeeze_mode:
+        description: |
+          squeeze+KDJ模式(一次只能選一個；none=不跑squeeze模式，照上面的設定跑原本的突破流程)：
+          only = 只驗證squeeze+KDJ訊號本身的IS/OOS+bootstrap(資金無限，--squeeze-kdj-only)
+          capital_constrained = 接上資金/部位管理的資金受限版驗證(--squeeze-kdj-capital-constrained)
+          grid = 風控x交易管理x進場方式1440組混搭網格，只用IS選贏家(--squeeze-kdj-grid)
+          fixed = 你選定的固定設定長歷史回測，1口/2口 x 理想/限價1檔(--squeeze-kdj-fixed，start_date建議2018-01-01)
+          filters = 事先登錄的4個進場濾網F0~F3小測試(--squeeze-kdj-filters，start_date必須2018-01-01、max_stocks設0)
+          stops = 事先登錄的停損寬度N1~N3/S1~S3小測試(--squeeze-kdj-stops，start_date必須2018-01-01、max_stocks設0)
+          exits = 以N2為基準的出場方式E0~E4小測試(--squeeze-kdj-exits，start_date必須2018-01-01、max_stocks設0)
+          stop_target_grid = 停損1.0/1.5/2.0 x 停利2.0/3.0/4.0倍ATR的3x3穩健度地圖+高原檢查(--squeeze-kdj-stop-target-grid，start_date必須2018-01-01、max_stocks設0)
         required: false
-        default: 'false'
-      squeeze_kdj_capital_constrained:
-        description: '資金/部位受限版squeeze+KDJ驗證(--squeeze-kdj-capital-constrained)：squeeze_kdj_only驗證的是「每個觸發訊號都能無限制同時成交」這個樂觀假設下的訊號品質(變體A/B的OOS PF分別約5.01/3.44)，這個選項回答squeeze_kdj_only刻意沒有回答的問題——拿掉這個樂觀假設、把同一套進場/出場訊號接上這個repo「真正會拿去模擬實戰」的資金/部位管理框架(top_n排名+max_concurrent_positions持倉上限+保證金查表，固定max_concurrent_positions=3/top_n=3)之後，真實帳戶實際能拿到的PF還剩多少(撐住/打折/崩潰，summary.txt會明確對照squeeze_kdj_only的數字講清楚)。同樣跳過突破窗口比較/突破風格比較/訊號自動搜尋/門檻網格/ATR網格/出場配置網格這6階段流程，只是比squeeze_kdj_only多了一層資金管理的現實限制，跑起來比squeeze_kdj_only慢一點(day-by-day逐日競爭有限名額，不是每檔股票獨立一次性模擬)但仍然比完整6階段流程快很多。開啟後，上面max_stocks/starting_capital/start_date/end_date仍然有效，其餘跟訊號/門檻/突破窗口/出場配置自動搜尋相關的選項在這裡不適用；注意這個選項跟squeeze_kdj_only目前是互斥的(main()依序檢查，squeeze_kdj_only若同時開啟會先被處理並直接return，這個選項就不會執行)，兩個都想看的話請分兩次分別執行'
-        required: false
-        default: 'false'
-      squeeze_kdj_grid:
-        description: 'squeeze+KDJ資金受限版混搭網格搜尋(--squeeze-kdj-grid)：把風控、交易管理、進場方式混在一起找最佳組合——出場方式10種(變體A原規則1種、變體B固定ATR停損1.0/1.5/2.0倍x停利2.0/3.0倍共6種、變體B移動停利1.5/2.0/3.0倍ATR共3種)x最多同時持倉1/3/5檔x部位大小(固定1口/固定2口/每筆風險1%/每筆風險2%)x最長持有10/20/60天x同日多檔排名規則(觸發K棒漲幅/量比)x進場濾網(無/站上60日均線)，一共1440組。方法論是事先定死的：全部組合只在樣本內(IS)跑，用IS的PF選出唯一一個贏家(IS交易筆數至少30筆才有資格，同PF比IS總損益)，只有這個贏家才拿去樣本外(OOS)跑一次+bootstrap 1000次，當作誠實的頭條數字，並直接判定有沒有過專案門檻(bootstrap正報酬比例>80%且p值<0.2)；另外報告IS前10名在OOS的PF、IS PF跟OOS PF的Spearman排名相關(看IS排名到底能不能轉移到OOS，接近0或負代表選出來的「最佳」很可能只是雜訊)、全部1440組OOS PF的分布(只看分布，刻意不印也不該去挑「OOS最好的組合」，那等於拿OOS做選擇)。⚠️一次測1440組有嚴重的多重比較(multiple comparisons)風險，IS贏家的IS數字一定偏樂觀，summary.txt會醒目提醒；而且這段OOS在上一輪squeeze_kdj_capital_constrained已經看過一次，不是完全沒碰過的資料。起始資金不是網格維度(它是你真實帳戶的規模，用上面starting_capital設定)。輸出squeeze_kdj_grid_all_combos.csv(每組一列、中文欄名，含IS/OOS統計跟「名額已滿/保證金上限/風險口數不足1口/濾網擋掉」等診斷計數)+summary.txt。效能：回測已改成預先計算共用，合成資料實測1440組x(IS+OOS)在50檔約5秒、249檔(全部標的)約11秒就跑完，時間主要花在下載資料，max_stocks設0(全部)也遠低於步驟150分鐘上限，不需要另外限制max_stocks。開啟後，上面max_stocks/starting_capital/start_date/end_date仍然有效，其餘跟訊號/門檻/突破窗口/出場配置自動搜尋相關的選項在這裡不適用；跟squeeze_kdj_only/squeeze_kdj_capital_constrained互斥(main()依序檢查，那兩個若同時開啟會先執行並直接return，這個選項就不會執行)'
-        required: false
-        default: 'false'
-      squeeze_kdj_fixed:
-        description: 'squeeze+KDJ固定設定長歷史回測(--squeeze-kdj-fixed)：1440組網格(squeeze_kdj_grid)沒有選出通過驗證的設定之後，你自己選定的那一組——變體B固定ATR停損1.0倍/停利3.0倍、最多同時持有3檔、最長持有20天、同日多檔用觸發K棒漲幅排名、無進場濾網、top_n=3、ATR14天——拉長歷史重新檢驗。一共跑4個情境：固定1口/固定2口 x 成交模型(①理想成交：隔天開盤價成交、無滑價；②限價：用訊號那天的收盤價+1檔掛限價單，隔天開盤價超過限價就不追、等下一個訊號，有成交時進場多付1檔滑價(但不超過限價)，停損/跳空停損/持有到期強制平倉這類市價出場也多付1檔，固定價位停利是掛好的限價單不加滑價；1檔的大小依台股升降單位級距，股票期貨比照標的股票)。每個情境在整段期間連續回測一次(只有一組固定設定、沒有挑選，不需要切IS/OOS；連續跑才是真實帳戶的路徑)，再依進場日切成兩段：進場日早於2023-10-06的是「未見過區段」(網格跟你挑設定時完全沒看過的年份，這是報告裡最誠實的數字，會單獨做bootstrap 1000次並判定有沒有過專案門檻：PF>1且bootstrap正報酬比例>80%)，2023-10-06之後的是「已見過區段」(偏樂觀，只當對照)；另外輸出逐年表(交易筆數/PF/勝率/損益/年內最大回撤/拿掉最大3筆後損益)、診斷計數(含限價沒成交被略過幾次、佔多少比例)、權益路徑(期末權益/最大回撤金額與佔起始資金比例/最長連續虧損筆數)。⚠️請搭配「回測起始日期」(start_date)=2018-01-01、掃描股票數量(max_stocks)=0(全部標的)執行；起始日期留空(預設最近3年)會沒有未見過區段，summary會提醒你重跑。輸出squeeze_kdj_fixed_scenarios.csv/squeeze_kdj_fixed_yearly.csv/squeeze_kdj_fixed_trades.csv(中文欄名)+summary.txt。開啟後，上面max_stocks/starting_capital/start_date/end_date仍然有效，其餘跟訊號/門檻/突破窗口/出場配置自動搜尋相關的選項在這裡不適用；跟squeeze_kdj_only/squeeze_kdj_capital_constrained/squeeze_kdj_grid互斥(main()依序檢查，那幾個若同時開啟會先執行並直接return，這個選項就不會執行)。從2018年開始要下載約8.75年x全部標的的日K，第一次執行(沒有快取)下載會比3年多花幾分鐘，回測本身只要幾十秒，遠低於步驟150分鐘上限'
-        required: false
-        default: 'false'
-      squeeze_kdj_filters:
-        description: 'squeeze+KDJ進場濾網小測試(--squeeze-kdj-filters)：你目前實盤的固定設定在2018年起的長回測是賠的(PF約0.70，2018、2022空頭年最差)，訊號又多到一半排不到名額，所以測「加一個濾網挑比較好的訊號」有沒有用。為了不重蹈1440組網格過度擬合的覆轍，只測事先寫死的4個變體：F0不加濾網(基準)、F1大盤濾網(觸發K棒那天加權指數^TWII收盤在60日均線/季線之上才進場)、F2個股趨勢濾網(那檔股票收盤在自己120日均線/半年線之上才進場)、F3兩個都要。執行設定固定成你實際打算的：1口、最多同時持有2檔(另外跑1檔當敏感度對照，不參與挑選)、限價1檔不追價、top_n=3、出場沿用固定設定(B停損1.0/停利3.0倍ATR、ATR14、最長20天)。規則事先定好：挑選期2018-01-01~2022-12-31、驗證期2023-01-01之後各自獨立重跑；只看挑選期，交易筆數>=60的變體裡挑PF最高的一個；選定後才看驗證期，驗證期PF>1、bootstrap正報酬比例>80%、PF比F0高，三個都成立才算通過；另外列出每個濾網跟F0比「勝率、PF在兩段是不是都變好」。⚠️請搭配「回測起始日期」(start_date)=2018-01-01、掃描股票數量(max_stocks)=0執行，起始日期晚於2018-06會在summary最上面警告這次測試無效。指數抓不到^TWII時依序改用0050.TW、台積電2330當代理並明確警告。股價跟指數會往前多抓200個日曆天當均線暖身(第一次執行會重新下載一次股價)。輸出squeeze_kdj_filters_summary.csv/squeeze_kdj_filters_yearly.csv/squeeze_kdj_filters_trades.csv(中文欄名)+summary.txt。跟squeeze_kdj_only/squeeze_kdj_capital_constrained/squeeze_kdj_grid/squeeze_kdj_fixed互斥(main()依序檢查，那幾個若同時開啟會先執行並直接return，這個選項就不會執行)'
-        required: false
-        default: 'false'
-      squeeze_kdj_stops:
-        description: 'squeeze+KDJ停損寬度小測試(--squeeze-kdj-stops)：進場濾網測試選出F2(個股收盤在120日均線上)但仍只打平，逐筆看到大部分虧損是進場後1~3天就被1.0倍ATR停損掉、手續費也吃掉很多，所以測6個事先登錄的變體(停利都是3.0倍ATR)：N1停損1.0倍不加濾網(=目前實盤)、N2停損1.5倍不加濾網、N3停損2.0倍不加濾網、S1停損1.0倍+F2、S2停損1.5倍+F2、S3停損2.0倍+F2，6個全部可以被挑選。執行設定跟squeeze_kdj_filters相同(1口、最多2檔+1檔敏感度對照、限價1檔、top_n=3、最長20天)，規則也相同：挑選期2018-01-01~2022-12-31、驗證期2023-01-01之後各自獨立重跑；6個裡挑選期筆數>=60者挑PF最高(同分比損益，再同分依N1,N2,N3,S1,S2,S3順序)；選定後驗證期PF>1、bootstrap正報酬>80%、PF勝過N1(目前實盤)才算通過。比較的變體從3個變成6個，多重比較風險略增。每個變體另外列出平均獲利/平均虧損、每筆損益、持有1/3/5天內出場的比例與損益、出場原因(停利/停損/跳空停損/到期)、逐年表、最大回撤、拿掉最大3筆後損益、手續費+期交稅合計、平均每筆停損風險(停損越寬、1口固定時每筆賠越多)，並把N1、S1用舊成本(200元/口/單邊、不計稅)重跑並排，看手續費更正本身的影響。交易成本用下面的commission_per_lot_side(每口單邊手續費)，期交稅固定十萬分之二(每邊)。⚠️請搭配「回測起始日期」(start_date)=2018-01-01、掃描股票數量(max_stocks)=0執行。輸出squeeze_kdj_stops_summary.csv/squeeze_kdj_stops_yearly.csv/squeeze_kdj_stops_trades.csv(中文欄名)+summary.txt。只是回測，不會改每日掃描的設定。跟squeeze_kdj_only/squeeze_kdj_capital_constrained/squeeze_kdj_grid/squeeze_kdj_fixed/squeeze_kdj_filters互斥(main()依序檢查，那幾個若同時開啟會先執行並直接return，這個選項就不會執行)'
-        required: false
-        default: 'false'
-      squeeze_kdj_exits:
-        description: 'squeeze+KDJ出場方式小測試(--squeeze-kdj-exits)：停損寬度測試裡N2(停損1.5倍ATR、停利3.0倍ATR、不加濾網)兩段都贏過目前實盤N1但還沒通過驗證，逐筆看到只有約32%打到停利、約17%持有20天到期出場、週五進場常常一進場就吃週末跳空，所以以N2為基準測5個事先登錄的變體(停損都是1.5倍ATR、不加濾網)：E0=N2原樣(基準)、E1停利縮到2.25倍ATR(1.5R)、E2停利放到4.5倍ATR(3R)、E3停利3.0倍+保本(某天收盤漲到進場價+1.5倍ATR=1R之後，隔天起停損移到進場價，出場原因標成「保本停損」)、E4停利3.0倍+週五不進場(這條是看N2依星期分組的結果才想到的，資料挖掘、先驗最弱)，5個全部可以被挑選。執行設定跟squeeze_kdj_stops相同(1口、最多2檔+1檔敏感度對照、限價1檔、top_n=3、最長20天)，規則也相同：挑選期2018-01-01~2022-12-31、驗證期2023-01-01之後各自獨立重跑；5個裡挑選期筆數>=60者挑PF最高(同分比損益，再同分依E0~E4順序)；選定後驗證期PF>1、bootstrap正報酬>80%、PF勝過E0(N2)才算通過。5個變體是多重比較。每個變體列出勝率、PF、損益、平均獲利/虧損、出場原因(停利/停損/跳空停損/保本停損/到期)、到期出場筆數與損益、持有1/3/5天內出場、平均持有天數、最大回撤、拿掉最大3筆後損益、bootstrap、逐年表、依進場星期分組、診斷(含進場星期略過)、手續費+期交稅合計。交易成本用下面的commission_per_lot_side。⚠️請搭配「回測起始日期」(start_date)=2018-01-01、掃描股票數量(max_stocks)=0、每口單邊手續費(commission_per_lot_side)=50執行。輸出squeeze_kdj_exits_summary.csv/squeeze_kdj_exits_yearly.csv/squeeze_kdj_exits_trades.csv(中文欄名)+summary.txt。只是回測，不會改每日掃描的設定。跟其他squeeze模式互斥(main()依序檢查，前面的若同時開啟會先執行並直接return，這個選項就不會執行)，一次只開一個'
-        required: false
-        default: 'false'
+        type: choice
+        default: 'none'
+        options:
+          - none
+          - only
+          - capital_constrained
+          - grid
+          - fixed
+          - filters
+          - stops
+          - exits
+          - stop_target_grid
       commission_per_lot_side:
-        description: '每口單邊手續費(新台幣)：進場、出場各付一次，預設50代表一口來回100元；如果你的50元已經是來回，請填25。目前只有squeeze_kdj_stops/squeeze_kdj_exits使用，其他模式仍是舊假設200元/口/單邊'
+        description: '每口單邊手續費(新台幣)：進場、出場各付一次，預設50代表一口來回100元；如果你的50元已經是來回，請填25。目前只有squeeze_mode=stops/exits/stop_target_grid使用，其他模式仍是舊假設200元/口/單邊'
         required: false
         default: '50'
 
@@ -179,27 +175,18 @@ jobs:
           if [ "${{ github.event.inputs.combo_search }}" = "true" ]; then
             ARGS="$ARGS --combo-search"
           fi
-          if [ "${{ github.event.inputs.squeeze_kdj_only }}" = "true" ]; then
-            ARGS="$ARGS --squeeze-kdj-only"
-          fi
-          if [ "${{ github.event.inputs.squeeze_kdj_capital_constrained }}" = "true" ]; then
-            ARGS="$ARGS --squeeze-kdj-capital-constrained"
-          fi
-          if [ "${{ github.event.inputs.squeeze_kdj_grid }}" = "true" ]; then
-            ARGS="$ARGS --squeeze-kdj-grid"
-          fi
-          if [ "${{ github.event.inputs.squeeze_kdj_fixed }}" = "true" ]; then
-            ARGS="$ARGS --squeeze-kdj-fixed"
-          fi
-          if [ "${{ github.event.inputs.squeeze_kdj_filters }}" = "true" ]; then
-            ARGS="$ARGS --squeeze-kdj-filters"
-          fi
-          if [ "${{ github.event.inputs.squeeze_kdj_stops }}" = "true" ]; then
-            ARGS="$ARGS --squeeze-kdj-stops"
-          fi
-          if [ "${{ github.event.inputs.squeeze_kdj_exits }}" = "true" ]; then
-            ARGS="$ARGS --squeeze-kdj-exits"
-          fi
+          case "${{ github.event.inputs.squeeze_mode }}" in
+            ""|none) ;;
+            only) ARGS="$ARGS --squeeze-kdj-only" ;;
+            capital_constrained) ARGS="$ARGS --squeeze-kdj-capital-constrained" ;;
+            grid) ARGS="$ARGS --squeeze-kdj-grid" ;;
+            fixed) ARGS="$ARGS --squeeze-kdj-fixed" ;;
+            filters) ARGS="$ARGS --squeeze-kdj-filters" ;;
+            stops) ARGS="$ARGS --squeeze-kdj-stops" ;;
+            exits) ARGS="$ARGS --squeeze-kdj-exits" ;;
+            stop_target_grid) ARGS="$ARGS --squeeze-kdj-stop-target-grid" ;;
+            *) echo "未知的squeeze_mode：${{ github.event.inputs.squeeze_mode }}"; exit 1 ;;
+          esac
           if [ -n "${{ github.event.inputs.commission_per_lot_side }}" ]; then
             ARGS="$ARGS --commission-per-lot-side ${{ github.event.inputs.commission_per_lot_side }}"
           fi
