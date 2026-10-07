@@ -63,7 +63,7 @@ import numpy as np
 
 from mean_reversion_engine import (
     compute_bollinger, compute_atr_correct, DEFAULT_MARGIN_CAP_RATIO, STOP_LOSS_COOLDOWN_DAYS,
-    _process_mr_day, _close_mr_trade,
+    _process_mr_day, _close_mr_trade, COMMISSION_PER_LOT_PER_LEG,
 )
 from taifex_universe import estimate_margin, get_contract_multiplier
 
@@ -782,6 +782,43 @@ def _row_at(arrs: dict, i: int) -> dict:
     return {"Open": arrs["open"][i], "High": arrs["high"][i], "Low": arrs["low"][i], "Close": arrs["close"][i]}
 
 
+def apply_squeeze_kdj_trade_costs(trade: dict, commission_per_lot_side: float = None,
+                                  futures_tax_rate: float = 0.0) -> dict:
+    """
+    把_close_mr_trade()產生的一筆交易，改用自訂的交易成本重算pnl_ntd/return_pct(就地修改並回傳同一個dict)，
+    另外加上commission_ntd(手續費合計)、tax_ntd(期交稅合計)兩個欄位。不修改mean_reversion_engine。
+
+      價差損益 = (出場價 - 進場價) x 合約乘數 x 口數(空單反過來)，合約乘數用get_contract_multiplier(代號, 進場價)
+                ——跟_close_mr_trade()同一個查表、同一個價位參數；
+      手續費   = commission_per_lot_side x 口數 x 2(進場、出場各一次「單邊」)；
+                commission_per_lot_side=None時沿用舊假設COMMISSION_PER_LOT_PER_LEG(200元/口/單邊)；
+      期交稅   = futures_tax_rate x (進場合約價值 + 出場合約價值)，合約價值 = 成交價 x 合約乘數 x 口數；
+      pnl_ntd  = 價差損益 - 手續費 - 期交稅；return_pct = pnl_ntd / 進場合約價值(跟_close_mr_trade()同一個分母)。
+
+    期交稅的認知(我們的理解，不是法規原文)：台灣股票期貨的期貨交易稅是「每一邊」(買進、賣出各一次)
+    按契約價值課徵十萬分之二(0.002% = 0.00002)，所以一買一賣共課兩次；股票期貨不是現股，沒有千分之三證交稅。
+    手續費則是每家期貨商自己訂的，這裡的commission_per_lot_side是「每口、單邊」(一進一出要付兩次)。
+    """
+    code, lots, side = trade["code"], trade["lots"], trade["side"]
+    e_price, exit_price = trade["e_price"], trade["exit_price"]
+    mult = get_contract_multiplier(code, e_price)
+    if side == "long":
+        price_pnl = (exit_price - e_price) * mult * lots
+    else:
+        price_pnl = (e_price - exit_price) * mult * lots
+    per_side = COMMISSION_PER_LOT_PER_LEG if commission_per_lot_side is None else commission_per_lot_side
+    commission = per_side * lots * 2
+    entry_value = e_price * mult * lots
+    exit_value = exit_price * mult * lots
+    tax = futures_tax_rate * (entry_value + exit_value)
+    pnl_ntd = price_pnl - commission - tax
+    trade["pnl_ntd"] = pnl_ntd
+    trade["return_pct"] = pnl_ntd / entry_value
+    trade["commission_ntd"] = commission
+    trade["tax_ntd"] = tax
+    return trade
+
+
 def run_squeeze_kdj_capital_constrained_backtest(price_data: dict, universe: dict,
                                                    master_calendar: pd.DatetimeIndex,
                                                    starting_capital: float, variant: str = "B",
@@ -799,7 +836,9 @@ def run_squeeze_kdj_capital_constrained_backtest(price_data: dict, universe: dic
                                                    return_diagnostics: bool = False,
                                                    precomputed: dict = None,
                                                    execution_model: str = "open",
-                                                   market_series: pd.Series = None):
+                                                   market_series: pd.Series = None,
+                                                   commission_per_lot_side: float = None,
+                                                   futures_tax_rate: float = 0.0):
     """
     擠壓+KDJ訊號的「資金/部位受限版」完整day-by-day walk-forward回測，只做多方
     (見模組docstring)。跟run_squeeze_kdj_exit_style_comparison()/
@@ -952,10 +991,20 @@ def run_squeeze_kdj_capital_constrained_backtest(price_data: dict, universe: dic
         - 邊界上的小近似(偏保守)：出場「往下1檔」的tick用出場價本身的級距算，剛好落在級距
           邊界時(例如100元)真實的下一檔是99.9，這裡算成99.5，多扣了一點，影響極小。
 
+    交易成本(--squeeze-kdj-stops新增，預設維持舊版行為)：
+      commission_per_lot_side=None且futures_tax_rate=0(預設)：完全不動，損益就是_close_mr_trade()算的
+        (手續費200元/口/單邊、不計期交稅)，trade dict也不會多出任何欄位——跟舊版逐筆完全相同。
+      任一個有給(commission_per_lot_side不是None，或futures_tax_rate != 0)：每一筆交易在「出場當下」
+        (逐日迴圈裡、_close_mr_trade()剛append之後，含limit_1tick市價型出場重算那條路徑)立刻用
+        apply_squeeze_kdj_trade_costs()重算pnl_ntd/return_pct，並加上commission_ntd/tax_ntd欄位；
+        所以迴圈中任何讀已實現損益的邏輯(risk_pct_per_trade的帳戶權益)看到的都是新成本下的損益。
+        commission_per_lot_side=None但有給futures_tax_rate時，手續費仍是200元/口/單邊。
+        公式與期交稅(十萬分之二、每邊各一次)的說明見apply_squeeze_kdj_trade_costs()。
+
     回傳：trades list(或見return_diagnostics)，每筆trade dict的形狀跟
     mean_reversion_engine._close_mr_trade()產生的完全一樣(code/side/entry_date/exit_date/
     e_price/exit_price/exit_reason/lots/pnl_ntd/return_pct/hold_days)，可以直接餵
-    summarize_mr()/bootstrap_resample_pnl()。
+    summarize_mr()/bootstrap_resample_pnl()；有給自訂交易成本時另外多commission_ntd/tax_ntd。
     """
     if variant not in VALID_CAPITAL_CONSTRAINED_VARIANTS:
         raise ValueError(f"variant必須是{VALID_CAPITAL_CONSTRAINED_VARIANTS}其中之一，收到{variant!r}")
@@ -973,6 +1022,12 @@ def run_squeeze_kdj_capital_constrained_backtest(price_data: dict, universe: dic
     if limit_1tick and slippage_pct != 0:
         raise ValueError("execution_model='limit_1tick'已經內建1檔滑價，slippage_pct必須是0"
                          f"(收到{slippage_pct!r})，不要兩種滑價疊加")
+    if commission_per_lot_side is not None and not (np.isfinite(commission_per_lot_side)
+                                                    and commission_per_lot_side >= 0):
+        raise ValueError(f"commission_per_lot_side必須是>=0的數字或None，收到{commission_per_lot_side!r}")
+    if not (np.isfinite(futures_tax_rate) and futures_tax_rate >= 0):
+        raise ValueError(f"futures_tax_rate必須是>=0的數字，收到{futures_tax_rate!r}")
+    custom_costs = commission_per_lot_side is not None or futures_tax_rate != 0
 
     if precomputed is None:
         if features_by_code is None:
@@ -1017,6 +1072,9 @@ def run_squeeze_kdj_capital_constrained_backtest(price_data: dict, universe: dic
                 raw_exit = closed["exit_price"]
                 _close_mr_trade(position, raw_exit - taiwan_tick_size(raw_exit),
                                 closed["exit_reason"], date, trades)
+        if custom_costs and len(trades) == n_trades_before + 1:
+            # 出場當下立刻換成自訂交易成本(在上面limit_1tick重算之後，所以用的是最終成交價)
+            apply_squeeze_kdj_trade_costs(trades[-1], commission_per_lot_side, futures_tax_rate)
         return updated
 
     for date in master_calendar:

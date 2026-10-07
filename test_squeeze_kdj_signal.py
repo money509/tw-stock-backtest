@@ -1666,3 +1666,161 @@ class TestPureFilterFunctionMatchesBacktestArrays:
         assert squeeze_kdj_entry_filter_allows("market_ma60_and_stock_ma120", df["Close"], market, t) is False
         with pytest.raises(ValueError):
             squeeze_kdj_entry_filter_allows("above_ma60", df["Close"], market, t)
+
+
+# ============================================================================
+# 自訂交易成本(commission_per_lot_side/futures_tax_rate，--squeeze-kdj-stops新增)
+# ============================================================================
+from squeeze_kdj_signal import apply_squeeze_kdj_trade_costs
+
+MINI_CODE = "1477"      # has_mini=True → 合約乘數100
+STANDARD_CODE = "1101"  # has_mini=False → 合約乘數2000
+
+
+class TestCustomTradeCostsDefaultsUnchanged:
+    @pytest.mark.parametrize("scenario", _SNAPSHOT_SCENARIOS[:4])
+    def test_explicit_defaults_identical_to_legacy_and_no_new_fields(self, scenario):
+        seed, variant, mcp, lots, capital, slip, top_n, hold, cal = scenario
+        price_data, universe, idx = _make_synthetic_market(seed=seed)
+        calendar = {"full": idx, "is": idx[:280], "oos": idx[280:]}[cal]
+        features_by_code = precompute_squeeze_kdj_features_by_code(price_data, universe)
+        kwargs = dict(variant=variant, lots=lots, top_n=top_n, max_concurrent_positions=mcp,
+                      max_hold_days=hold, slippage_pct=slip, features_by_code=features_by_code)
+        legacy = _legacy_capital_constrained_backtest(price_data, universe, calendar, capital, **kwargs)
+        new = run_squeeze_kdj_capital_constrained_backtest(
+            price_data, universe, calendar, capital, commission_per_lot_side=None, futures_tax_rate=0.0, **kwargs)
+        assert len(legacy) > 0 and new == legacy
+        assert all("commission_ntd" not in t and "tax_ntd" not in t for t in new)
+
+    def test_old_cost_given_explicitly_matches_default_pnl_and_adds_fields(self):
+        price_data, universe, idx = _make_synthetic_market(seed=0)
+        kw = dict(variant="B", lots=2, top_n=3, max_concurrent_positions=3, execution_model="limit_1tick")
+        base = run_squeeze_kdj_capital_constrained_backtest(price_data, universe, idx, 1_000_000, **kw)
+        explicit = run_squeeze_kdj_capital_constrained_backtest(
+            price_data, universe, idx, 1_000_000, commission_per_lot_side=200, futures_tax_rate=0.0, **kw)
+        assert len(base) > 0 and len(explicit) == len(base)
+        for a, b in zip(base, explicit):
+            assert b["pnl_ntd"] == pytest.approx(a["pnl_ntd"], abs=1e-9)
+            assert b["return_pct"] == pytest.approx(a["return_pct"], abs=1e-12)
+            assert b["commission_ntd"] == 200 * 2 * 2 and b["tax_ntd"] == 0.0
+            assert {k: v for k, v in b.items() if k not in ("commission_ntd", "tax_ntd", "pnl_ntd", "return_pct")} == \
+                {k: v for k, v in a.items() if k not in ("pnl_ntd", "return_pct")}
+
+    def test_costs_never_change_which_trades_happen(self):
+        price_data, universe, idx = _make_synthetic_market(seed=1)
+        kw = dict(variant="B", lots=1, top_n=3, max_concurrent_positions=2, execution_model="limit_1tick")
+        a = run_squeeze_kdj_capital_constrained_backtest(price_data, universe, idx, 1_000_000, **kw)
+        b = run_squeeze_kdj_capital_constrained_backtest(price_data, universe, idx, 1_000_000,
+                                                         commission_per_lot_side=50, futures_tax_rate=0.00002, **kw)
+        key = lambda t: (t["code"], t["entry_date"], t["exit_date"], t["e_price"], t["exit_price"], t["exit_reason"])
+        assert [key(t) for t in a] == [key(t) for t in b] and len(a) > 0
+        for x, y in zip(a, b):
+            # 舊：-200x2；新：-50x2 - 稅 → 差 = 300 - 稅
+            assert y["pnl_ntd"] - x["pnl_ntd"] == pytest.approx(300 - y["tax_ntd"])
+
+    @pytest.mark.parametrize("bad", [dict(commission_per_lot_side=-1), dict(futures_tax_rate=-0.1),
+                                     dict(commission_per_lot_side=float("nan"))])
+    def test_invalid_cost_params_raise(self, bad):
+        df = _limit_df()
+        features = _make_fixed_features(df, entry_idx=20, prior_low=np.nan)
+        with pytest.raises(ValueError):
+            _run_limit(df, features, **bad)
+
+
+class TestCustomTradeCostsHandComputed:
+    """進場都是idx21開盤100 → 限價模型成交100.5，停損98.5、停利106.5(變體B，ATR=2)；2口。
+    手續費50/口/單邊 → 50x2口x2邊=200；期交稅 = 0.00002 x (進場價+出場價) x 乘數 x 2口。"""
+    COSTS = dict(commission_per_lot_side=50, futures_tax_rate=0.00002)
+
+    def _df_features(self):
+        df = _limit_df()
+        return df, _make_fixed_features(df, entry_idx=20, prior_low=np.nan)
+
+    def test_mini_stop_exit_via_limit_reclose_path(self):
+        df, features = self._df_features()
+        df.iloc[23, df.columns.get_loc("Low")] = 90.0
+        trades, _ = _run_limit(df, features, code=MINI_CODE, **self.COSTS)
+        assert len(trades) == 1
+        t = trades[0]
+        assert t["exit_reason"] == "stop" and t["exit_price"] == pytest.approx(98.4)
+        # 價差 (98.4-100.5)x100x2 = -420；手續費200；稅 0.00002x(100.5+98.4)x100x2 = 0.7956
+        assert t["commission_ntd"] == pytest.approx(200.0)
+        assert t["tax_ntd"] == pytest.approx(0.7956)
+        assert t["pnl_ntd"] == pytest.approx(-620.7956)
+        assert t["return_pct"] == pytest.approx(-620.7956 / (100.5 * 100 * 2))
+
+    def test_mini_target_exit(self):
+        df, features = self._df_features()
+        df.iloc[23, df.columns.get_loc("High")] = 110.0
+        trades, _ = _run_limit(df, features, code=MINI_CODE, **self.COSTS)
+        t = trades[0]
+        assert t["exit_reason"] == "target" and t["exit_price"] == pytest.approx(106.5)
+        # 價差 6x100x2 = 1200；稅 0.00002x207x200 = 0.828
+        assert t["pnl_ntd"] == pytest.approx(1200 - 200 - 0.828)
+        assert t["return_pct"] == pytest.approx((1200 - 200 - 0.828) / 20100)
+
+    def test_standard_forced_close(self):
+        df, features = self._df_features()
+        trades, _ = _run_limit(df, features, code=STANDARD_CODE, max_hold_days=3, **self.COSTS)
+        t = trades[0]
+        assert t["exit_reason"] == "forced_close" and t["exit_price"] == pytest.approx(99.5)
+        # 價差 (99.5-100.5)x2000x2 = -4000；稅 0.00002x200x2000x2 = 16
+        assert t["tax_ntd"] == pytest.approx(16.0)
+        assert t["pnl_ntd"] == pytest.approx(-4000 - 200 - 16)
+        assert t["return_pct"] == pytest.approx(-4216 / (100.5 * 2000 * 2))
+
+    def test_standard_stop_gap_via_reclose(self):
+        df, features = self._df_features()
+        df.iloc[23, df.columns.get_loc("Open")] = 97.0
+        df.iloc[23, df.columns.get_loc("Low")] = 96.0
+        trades, _ = _run_limit(df, features, code=STANDARD_CODE, **self.COSTS)
+        t = trades[0]
+        assert t["exit_reason"] == "stop_gap" and t["exit_price"] == pytest.approx(96.9)
+        price = (96.9 - 100.5) * 2000 * 2
+        tax = 0.00002 * (100.5 + 96.9) * 2000 * 2
+        assert t["pnl_ntd"] == pytest.approx(price - 200 - tax)
+
+    def test_open_model_stop_without_reclose_standard(self):
+        df, features = self._df_features()
+        df.iloc[23, df.columns.get_loc("Low")] = 90.0
+        trades, _ = _run_limit(df, features, code=STANDARD_CODE, execution_model="open", lots=1,
+                               commission_per_lot_side=75, futures_tax_rate=0.0001)
+        t = trades[0]
+        assert t["e_price"] == pytest.approx(100.0) and t["exit_reason"] == "stop"
+        assert t["exit_price"] == pytest.approx(98.0)
+        price = (98.0 - 100.0) * 2000
+        tax = 0.0001 * (100.0 + 98.0) * 2000
+        assert t["commission_ntd"] == pytest.approx(150.0)
+        assert t["pnl_ntd"] == pytest.approx(price - 150 - tax)
+
+    def test_tax_only_keeps_old_commission(self):
+        df, features = self._df_features()
+        df.iloc[23, df.columns.get_loc("High")] = 110.0
+        trades, _ = _run_limit(df, features, code=MINI_CODE, futures_tax_rate=0.00002)
+        t = trades[0]
+        assert t["commission_ntd"] == COMMISSION_PER_LOT_PER_LEG * 2 * 2
+        assert t["pnl_ntd"] == pytest.approx(1200 - 800 - 0.828)
+
+    def test_short_side_formula(self):
+        t = {"code": MINI_CODE, "side": "short", "lots": 1, "e_price": 100.0, "exit_price": 90.0,
+             "pnl_ntd": None, "return_pct": None}
+        apply_squeeze_kdj_trade_costs(t, 50, 0.00002)
+        assert t["pnl_ntd"] == pytest.approx(10 * 100 - 100 - 0.00002 * 190 * 100)
+
+    def test_adjusted_pnl_visible_inside_loop(self, monkeypatch):
+        """出場當下就換成新成本：之後每一天的逐日處理看到的trades(=risk_pct_per_trade算權益用的那份)
+        已經是新成本的損益，不是事後才改。"""
+        df = _limit_df(n=40)
+        df.iloc[23, df.columns.get_loc("High")] = 110.0   # 第1筆在idx23停利
+        features = _make_fixed_features(df, entry_idx=20, prior_low=np.nan)
+        features.iloc[30, features.columns.get_loc("EntryFlag")] = True  # 第2筆idx31進場
+        seen = []
+
+        def _spy(position, row, date, trades, max_hold_days, cooldown_until, slippage_pct=0.0):
+            seen.append([t["pnl_ntd"] for t in trades])
+            return _process_mr_day(position, row, date, trades, max_hold_days, cooldown_until,
+                                   slippage_pct=slippage_pct)
+        monkeypatch.setattr(skd, "_process_mr_day", _spy)
+        trades, _ = _run_limit(df, features, code=MINI_CODE, max_hold_days=3, **self.COSTS)
+        assert len(trades) == 2
+        assert seen[-1] == [pytest.approx(1200 - 200 - 0.828)]

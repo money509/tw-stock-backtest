@@ -1706,3 +1706,318 @@ class TestSqueezeKdjFiltersCliMode:
         assert "這次測試無效" in summary and "2018-01-01" in summary
         assert summary.index("這次測試無效") < summary.index("【挑選結果與判定】")
         assert out["index_info"]["symbol"] == "2330" and "台積電" in summary
+
+
+# ============================================================================
+# --squeeze-kdj-stops：事先登錄的停損寬度小測試
+# ============================================================================
+def _stops_args(start="2018-01-01", end="2026-10-06", **extra):
+    return argparse.Namespace(start=start, end=end, starting_capital=1_000_000, refresh=False, **extra)
+
+
+class TestSqueezeKdjStopsSelectionRule:
+    def test_variants_are_exactly_the_six_preregistered(self):
+        assert [(v[0], v[2], v[3], v[4]) for v in cb.SQUEEZE_KDJ_STOP_VARIANTS] == [
+            ("N1", 1.0, 3.0, None), ("N2", 1.5, 3.0, None), ("N3", 2.0, 3.0, None),
+            ("S1", 1.0, 3.0, "stock_ma120"), ("S2", 1.5, 3.0, "stock_ma120"), ("S3", 2.0, 3.0, "stock_ma120")]
+        assert cb.SQUEEZE_KDJ_STOP_SELECTABLE == ("N1", "N2", "N3", "S1", "S2", "S3")
+        assert cb.SQUEEZE_KDJ_STOP_BASELINE == "N1"
+        assert not hasattr(cb, "SQUEEZE_KDJ_STOP_REFERENCE")
+        assert cb.SQUEEZE_KDJ_STOPS_OLD_COST_VARIANTS == ("N1", "S1")
+        assert cb.SQUEEZE_KDJ_STOPS_DEFAULT_COMMISSION_PER_LOT_SIDE == 50.0
+        assert cb.SQUEEZE_KDJ_STOPS_DEFAULT_FUTURES_TAX_RATE == 0.00002
+        assert cb.SQUEEZE_KDJ_STOPS_OLD_COMMISSION_PER_LOT_SIDE == 200.0
+
+    def _all(self, **override):
+        base = {v: _stats(100, 0.8) for v in cb.SQUEEZE_KDJ_STOP_SELECTABLE}
+        base.update(override)
+        return base
+
+    def test_highest_train_pf_among_all_six_eligible(self):
+        sel, reason = cb.select_squeeze_kdj_stop_variant(self._all(N3=_stats(60, 1.3), S2=_stats(100, 1.2),
+                                                                   S3=_stats(59, 5.0)))
+        assert sel == "N3"
+        assert "S3" in reason and "排除" in reason
+        sel, _ = cb.select_squeeze_kdj_stop_variant(self._all(S2=_stats(100, 1.2)))
+        assert sel == "S2"
+
+    def test_n1_is_selectable(self):
+        sel, _ = cb.select_squeeze_kdj_stop_variant(self._all(N1=_stats(300, 1.05)))
+        assert sel == "N1"
+
+    def test_unknown_ids_ignored(self):
+        sel, _ = cb.select_squeeze_kdj_stop_variant(self._all(R0=_stats(500, 99.0), S1=_stats(100, 1.1)))
+        assert sel == "S1"
+
+    def test_tie_breaks_by_pnl_then_list_order(self):
+        sel, _ = cb.select_squeeze_kdj_stop_variant(self._all(N2=_stats(100, 1.1, pnl=100), S1=_stats(100, 1.1, pnl=300)))
+        assert sel == "S1"
+        tied = {v: _stats(100, 1.1, pnl=100) for v in cb.SQUEEZE_KDJ_STOP_SELECTABLE}
+        assert cb.select_squeeze_kdj_stop_variant(tied)[0] == "N1"
+        tied.pop("N1")
+        tied["N1"] = _stats(10, 1.1, pnl=100)  # 筆數不足
+        assert cb.select_squeeze_kdj_stop_variant(tied)[0] == "N2"
+
+    def test_none_eligible(self):
+        sel, reason = cb.select_squeeze_kdj_stop_variant({v: _stats(59, 2.0) for v in cb.SQUEEZE_KDJ_STOP_SELECTABLE})
+        assert sel is None and "無法挑選" in reason
+
+    def _seg(self, n, pf, pct):
+        return {"stats": _stats(n, pf), "bootstrap": {"pct_positive": pct, "p_value": 1 - pct / 100}}
+
+    def test_verdict_branches_vs_n1(self):
+        n1 = self._seg(80, 0.9, 30.0)
+        v = cb.squeeze_kdj_stop_verdict("S2", {"N1": n1, "S2": self._seg(70, 1.4, 90.0)})
+        assert v["passed"] and v["text"].startswith("✅")
+        v = cb.squeeze_kdj_stop_verdict("N2", {"N1": n1, "N2": self._seg(70, 1.4, 75.0)})
+        assert not v["passed"] and "bootstrap" in v["text"] and "PF>1" not in v["text"]
+        v = cb.squeeze_kdj_stop_verdict("S3", {"N1": self._seg(80, 1.6, 95.0), "S3": self._seg(70, 1.4, 90.0)})
+        assert not v["passed"] and "勝過N1" in v["text"]
+        v = cb.squeeze_kdj_stop_verdict("S3", {"N1": n1, "S3": self._seg(70, 0.8, 20.0)})
+        assert not v["passed"] and "PF>1" in v["text"]
+        # S1好過N1也算(比較基準是N1，不是S1)
+        v = cb.squeeze_kdj_stop_verdict("S1", {"N1": n1, "S1": self._seg(70, 1.3, 85.0)})
+        assert v["passed"]
+        v = cb.squeeze_kdj_stop_verdict("N1", {"N1": self._seg(80, 2.0, 99.0)})
+        assert not v["passed"] and "維持現狀" in v["text"]
+        assert cb.squeeze_kdj_stop_verdict(None, {"N1": n1})["passed"] is False
+
+    def test_filter_verdict_wording_unchanged_after_refactor(self):
+        seg = self._seg(50, 2.0, 99.0)
+        v = cb.squeeze_kdj_filter_verdict("F0", {"F0": seg})
+        assert v["text"] == ("❌ 不通過：挑選期PF最高的是F0(不加濾網)——3個濾網在挑選期都沒有勝過不過濾，"
+                             "依事先登錄的規則，這次的結論是「不採用任何濾網」。")
+        assert v["checks"][2][0] == "驗證期PF勝過F0不加濾網(選出的2.00 vs F0的2.00)——選出的就是F0本身，這條不可能成立"
+
+    def test_improvement_table_every_variant_vs_n1(self):
+        def seg(wr, pf):
+            return {"stats": {"trade_count": 10, "win_rate": wr, "profit_factor": pf}}
+        by = {"N1": {"train": seg(40, 0.8), "test": seg(45, 1.0)},
+              "N2": {"train": seg(42, 0.9), "test": seg(46, 1.1)},
+              "N3": {"train": seg(50, 0.7), "test": seg(55, 1.2)},
+              "S1": {"train": seg(41, 0.85), "test": seg(46, 1.05)},
+              "S2": {"train": seg(30, 0.6), "test": seg(35, 0.7)},
+              "S3": {"train": seg(40, 0.8), "test": seg(45, 1.0)}}
+        rows = {r["variant"]: r for r in cb.squeeze_kdj_stop_improvement_table(by)}
+        assert set(rows) == {"N2", "N3", "S1", "S2", "S3"}
+        assert rows["N2"]["both_periods_better"] is True and rows["S1"]["both_periods_better"] is True
+        assert rows["N3"]["both_periods_better"] is False and rows["N3"]["train_win_rate_better"] is True
+        assert rows["S2"]["both_periods_better"] is False
+        assert rows["S3"]["both_periods_better"] is False  # 同分不算變好
+
+
+class TestSqueezeKdjStopTradeBreakdown:
+    def test_buckets_reasons_costs_and_risk(self):
+        def t(hold, reason, pnl, comm=100.0, tax=1.0, risk=500.0):
+            return {"hold_days": hold, "exit_reason": reason, "pnl_ntd": pnl, "commission_ntd": comm,
+                    "tax_ntd": tax, "stop_risk_ntd": risk}
+        trades = [t(1, "stop_gap", -700), t(2, "stop", -600), t(3, "stop", -600),
+                  t(5, "target", 1500, risk=float("nan")), t(20, "forced_close", 100, risk=700.0)]
+        b = cb.squeeze_kdj_stop_trade_breakdown(trades)
+        assert b["early"][1] == {"count": 1, "pct": 20.0, "pnl_ntd": -700.0}
+        assert b["early"][3] == {"count": 3, "pct": 60.0, "pnl_ntd": -1900.0}
+        assert b["early"][5]["count"] == 4 and b["early"][5]["pnl_ntd"] == -400.0
+        assert b["reasons"]["stop"] == {"count": 2, "pct": 40.0, "pnl_ntd": -1200.0}
+        assert b["reasons"]["stop_gap"]["count"] == 1 and b["reasons"]["target"]["pnl_ntd"] == 1500.0
+        assert b["reasons"]["forced_close"]["count"] == 1 and b["reasons"]["other"]["count"] == 0
+        assert b["commission_ntd"] == 500.0 and b["tax_ntd"] == 5.0 and b["cost_ntd"] == 505.0
+        assert b["avg_pnl_ntd"] == pytest.approx(-60.0)
+        assert b["avg_stop_risk_ntd"] == pytest.approx((500 * 3 + 700) / 4)  # NaN不算進平均
+        empty = cb.squeeze_kdj_stop_trade_breakdown([])
+        assert empty["early"][3]["pct"] == 0.0 and np.isnan(empty["avg_stop_risk_ntd"])
+
+    def test_stop_risk_annotation_uses_entry_atr_and_multiplier(self):
+        idx = pd.bdate_range("2020-01-01", periods=5)
+        per_code = {"1101": {"date_to_idx": {d: i for i, d in enumerate(idx)},
+                             "atr": np.array([1.0, 2.0, 3.0, 4.0, 5.0])}}
+        trades = [{"code": "1101", "entry_date": idx[2], "e_price": 100.0, "lots": 1},
+                  {"code": "1101", "entry_date": pd.Timestamp("2030-01-01"), "e_price": 100.0, "lots": 1}]
+        cb._annotate_squeeze_kdj_stop_risk(trades, per_code, 1.5)
+        assert trades[0]["stop_risk_ntd"] == pytest.approx(1.5 * 3.0 * 2000)  # 1101是標準契約2000股
+        assert np.isnan(trades[1]["stop_risk_ntd"])
+
+
+class TestSqueezeKdjStopsModeSelectionIgnoresTest:
+    TRAIN = {(1.0, None): (300, 0.8), (1.5, None): (100, 1.1), (2.0, None): (40, 9.0),
+             (1.0, "stock_ma120"): (100, 0.9), (1.5, "stock_ma120"): (100, 1.2), (2.0, "stock_ma120"): (59, 4.0)}
+
+    def _run(self, monkeypatch, tmp_path, test_pf, **arg_extra):
+        """假回測：挑選期N3/S3 PF最高但筆數不足(40/59筆) → 6個裡符合資格的PF最高是S2；驗證期由test_pf決定。"""
+        calls = []
+
+        def _fake_backtest(**kw):
+            calls.append(kw)
+            cal = kw["master_calendar"]
+            key = (kw["atr_stop_mult"], kw["entry_filter"])
+            if cal[0] < pd.Timestamp("2023-01-01"):
+                n, pf = self.TRAIN[key]
+                trades = _make_pf_trades(n, pf, 2019)
+            else:
+                trades = _make_pf_trades(80, test_pf[key], 2024)
+            return trades, dict.fromkeys(cb.CAPITAL_CONSTRAINED_DIAGNOSTIC_KEYS, 0)
+        monkeypatch.setattr(cb, "run_squeeze_kdj_capital_constrained_backtest", _fake_backtest)
+
+        def _boom(*a, **k):
+            raise AssertionError("--squeeze-kdj-stops不需要大盤指數")
+        monkeypatch.setattr(cb, "load_index_series", _boom)
+        monkeypatch.setattr(cb, "load_squeeze_kdj_market_index", _boom)
+        monkeypatch.setattr(cb, "RESULTS_DIR", str(tmp_path))
+        codes = ["1101", "2330"]
+        price_data, idx = _make_regime_switching_market(codes, start="2018-01-01", n_days=2300)
+        universe = {c: STOCK_FUTURES_UNIVERSE[c] for c in codes}
+        out = cb.run_squeeze_kdj_stops_mode(_stops_args(**arg_extra), price_data, universe, idx)
+        return out, calls
+
+    def test_selection_uses_train_only_and_costs_are_passed(self, monkeypatch, tmp_path):
+        # 驗證期N2/S3最好、S2最差 → 照樣選S2，不通過
+        bad = {(1.0, None): 1.0, (1.5, None): 5.0, (2.0, None): 5.0,
+               (1.0, "stock_ma120"): 1.0, (1.5, "stock_ma120"): 0.5, (2.0, "stock_ma120"): 5.0}
+        out, calls = self._run(monkeypatch, tmp_path, bad)
+        assert out["selected"] == "S2"
+        assert not out["verdict"]["passed"]
+        assert len(calls) == 2 * 6 * 2 + 2 * 2  # 主要+敏感度 x 6變體 x 2期間 ＋ 舊成本對照(N1、S1 x 2期間)
+        new_cost = [kw for kw in calls if kw["commission_per_lot_side"] == 50.0]
+        old_cost = [kw for kw in calls if kw["commission_per_lot_side"] == 200.0]
+        assert len(new_cost) == 24 and len(old_cost) == 4
+        assert all(kw["futures_tax_rate"] == 0.00002 for kw in new_cost)
+        assert all(kw["futures_tax_rate"] == 0.0 and kw["max_concurrent_positions"] == 2 for kw in old_cost)
+        assert {(kw["atr_stop_mult"], kw["entry_filter"]) for kw in old_cost} == {(1.0, None), (1.0, "stock_ma120")}
+        for kw in calls:
+            assert kw["lots"] == 1 and kw["top_n"] == 3 and kw["execution_model"] == "limit_1tick"
+            assert kw["variant"] == "B" and kw["atr_target_mult"] == 3.0
+            assert kw["max_hold_days"] == 20 and kw["atr_period"] == 14 and kw["ranking_rule"] == "trigger_return"
+            assert kw["max_concurrent_positions"] in (1, 2) and "slippage_pct" not in kw
+            assert "market_series" not in kw
+        train_cals = [kw["master_calendar"] for kw in calls if kw["master_calendar"][0] < pd.Timestamp("2023-01-01")]
+        assert all(c[-1] <= pd.Timestamp("2022-12-31") for c in train_cals)
+        # 換一組驗證期(S2好過N1)，選擇不變、判定通過
+        good = {(1.0, None): 1.5, (1.5, None): 0.5, (2.0, None): 0.5,
+                (1.0, "stock_ma120"): 5.0, (1.5, "stock_ma120"): 3.0, (2.0, "stock_ma120"): 0.5}
+        out2, _ = self._run(monkeypatch, tmp_path, good)
+        assert out2["selected"] == "S2" and out2["verdict"]["passed"]
+        assert "✅ 通過" in (tmp_path / "summary.txt").read_text(encoding="utf-8")
+        # 驗證期S2沒有勝過N1 → 不通過(比較基準是N1)
+        worse = dict(good)
+        worse[(1.0, None)] = 4.0
+        out3, _ = self._run(monkeypatch, tmp_path, worse)
+        assert out3["selected"] == "S2" and not out3["verdict"]["passed"]
+        assert "勝過N1" in out3["verdict"]["text"]
+
+    def test_custom_commission_from_args(self, monkeypatch, tmp_path):
+        tp = {k: 1.0 for k in self.TRAIN}
+        out, calls = self._run(monkeypatch, tmp_path, tp, commission_per_lot_side=25.0, futures_tax_rate=0.0)
+        assert out["commission_per_lot_side"] == 25.0 and out["futures_tax_rate"] == 0.0
+        assert sum(kw["commission_per_lot_side"] == 25.0 for kw in calls) == 24
+        summary = (tmp_path / "summary.txt").read_text(encoding="utf-8")
+        assert "每口單邊NT$25(一進一出共NT$50/口)" in summary
+
+
+class TestSqueezeKdjStopsCliMode:
+    def test_skips_full_pipeline_writes_outputs_without_scipy(self, monkeypatch, tmp_path):
+        import data_loader
+        import chip_data_loader
+        monkeypatch.setitem(sys.modules, "scipy", None)
+        monkeypatch.setitem(sys.modules, "scipy.stats", None)
+
+        codes = list(STOCK_FUTURES_UNIVERSE)[:12]
+        price_data, idx = _make_regime_switching_market(codes + ["2330"], start="2017-06-15", n_days=1950, seed=3)
+        load_calls = []
+
+        def _fake_load(universe, start, end, refresh=False):
+            load_calls.append((start, end))
+            return price_data
+        monkeypatch.setattr(cb, "load_price_data", _fake_load)
+
+        def _boom(*args, **kwargs):
+            raise AssertionError("--squeeze-kdj-stops模式不該呼叫這個")
+        monkeypatch.setattr(cb, "load_index_series", _boom)
+        monkeypatch.setattr(data_loader, "load_price_data", _boom)
+        monkeypatch.setattr(data_loader, "load_index_series", _boom)
+        monkeypatch.setattr(chip_data_loader, "load_chip_data", _boom)
+        TestSqueezeKdjFixedCliMode()._patch_heavy_stages_to_explode(monkeypatch)
+        monkeypatch.setattr(cb, "run_squeeze_kdj_fixed_mode", _boom)
+        monkeypatch.setattr(cb, "run_squeeze_kdj_filters_mode", _boom)
+        monkeypatch.setattr(cb, "RESULTS_DIR", str(tmp_path))
+
+        mode_calls = []
+        real_mode = cb.run_squeeze_kdj_stops_mode
+
+        def _spy(*args, **kwargs):
+            mode_calls.append(args)
+            return real_mode(*args, **kwargs)
+        monkeypatch.setattr(cb, "run_squeeze_kdj_stops_mode", _spy)
+
+        argv = ["compare_breakout.py", "--squeeze-kdj-stops", "--max-stocks", "12",
+                "--start", "2018-01-01", "--end", "2024-11-15", "--starting-capital", "1000000"]
+        monkeypatch.setattr(sys, "argv", argv)
+        cb.main()
+
+        assert load_calls == [("2017-06-15", "2024-11-15")]  # 股價往前多抓200個日曆天
+        assert len(mode_calls) == 1
+        args, cal = mode_calls[0][0], mode_calls[0][3]
+        assert args.commission_per_lot_side == 50.0 and args.futures_tax_rate == 0.00002
+        assert cal.equals(idx[idx >= pd.Timestamp("2018-01-01")])
+
+        summ = pd.read_csv(tmp_path / "squeeze_kdj_stops_summary.csv", encoding="utf-8-sig")
+        assert len(summ) == 24  # 2種最多持倉數 x 6變體 x 2期間
+        for col in ("最多同時持倉數", "用途", "變體代號", "可被挑選", "停損ATR倍數", "期間", "交易筆數", "勝率(%)",
+                    "獲利因子PF", "總損益(NT$)", "平均每筆損益(NT$)", "平均獲利(NT$/筆)", "平均虧損(NT$/筆)",
+                    "平均停損風險(NT$/筆，停損距離x乘數x口數)", "最大回撤(NT$)", "拿掉最大3筆後損益(NT$)",
+                    "手續費合計(NT$)", "期交稅合計(NT$)", "交易成本合計(NT$)", "持有<=1天出場比例(%)",
+                    "持有<=3天出場損益(NT$)", "持有<=5天出場筆數", "出場_停利筆數", "出場_停損比例(%)",
+                    "出場_跳空停損損益(NT$)", "出場_到期筆數", "bootstrap正報酬比例(%)", "被挑選規則選中",
+                    "手續費假設(NT$/口/單邊)", "期交稅率(每邊)"):
+            assert col in summ.columns, col
+        assert set(summ["變體代號"]) == {"N1", "N2", "N3", "S1", "S2", "S3"}
+        assert summ["可被挑選"].all()
+        assert summ["被挑選規則選中"].sum() <= 1
+        assert summ["交易筆數"].sum() > 0, "合成資料要有交易，測試才有意義"
+        assert (summ.loc[summ["變體代號"].str.startswith("N"), "診斷_進場濾網擋掉"] == 0).all()
+        assert (summ.loc[summ["變體代號"].str.startswith("S"), "診斷_進場濾網擋掉"].sum()) > 0
+        # 手續費 = 50 x 1口 x 2邊 x 筆數
+        assert (summ["手續費合計(NT$)"] == 100.0 * summ["交易筆數"]).all()
+        # 停損越寬，平均停損風險越大(同一期間、同一持倉數)
+        for (mp, per), g in summ.groupby(["最多同時持倉數", "期間"]):
+            r = dict(zip(g["變體代號"], g["平均停損風險(NT$/筆，停損距離x乘數x口數)"]))
+            for lo, hi in (("S1", "S3"), ("N1", "N3")):
+                if all(np.isfinite(r[v]) for v in (lo, hi)):
+                    assert r[hi] > r[lo]
+        # 出場原因加總 = 全部筆數
+        reason_cols = [f"出場_{lab}筆數" for lab in ("停利", "停損", "跳空停損", "到期")]
+        assert (summ[reason_cols].sum(axis=1) == summ["交易筆數"]).all()
+
+        yearly = pd.read_csv(tmp_path / "squeeze_kdj_stops_yearly.csv", encoding="utf-8-sig")
+        assert list(yearly.columns) == cb.SQUEEZE_KDJ_FILTER_YEARLY_COLUMNS
+        trades = pd.read_csv(tmp_path / "squeeze_kdj_stops_trades.csv", encoding="utf-8-sig")
+        assert list(trades.columns) == cb.SQUEEZE_KDJ_STOPS_TRADE_COLUMNS
+        assert len(trades) == summ["交易筆數"].sum()
+        assert (trades["手續費(NT$)"] == 100.0).all() and (trades["期交稅(NT$)"] > 0).all()
+
+        summary = (tmp_path / "summary.txt").read_text(encoding="utf-8")
+        assert "--squeeze-kdj-stops模式" in summary
+        assert (summary.index("【事先登錄的規則") < summary.index("【交易成本假設】")
+                < summary.index("【挑選結果與判定】") < summary.index("【並排總表"))
+        assert "每口單邊NT$50(一進一出共NT$100/口)" in summary and "十萬分之二" in summary
+        assert "【手續費更正本身的影響" in summary and "舊成本" in summary
+        assert "【停損放寬的代價：每筆風險" in summary
+        assert "daily_squeeze_signals.py" in summary and "不會改掃描器" in summary
+        assert "結論：" in summary and "兩段都變好" in summary and "N1(停損1.0倍無濾網,實盤)" in summary
+        assert "6個變體，事先登錄" in summary and "從3個變成6個" in summary
+        assert "R0" not in summary
+        table = summary[summary.index("【並排總表｜敏感度對照"):summary.index("【手續費更正本身的影響")]
+        assert sum(f"{v}(" in table for v in cb.SQUEEZE_KDJ_STOP_SELECTABLE) == 6
+        assert "多重比較" in summary and "倖存者偏差" in summary and "偏樂觀" in summary and "基差" in summary
+        assert "這次測試無效" not in summary
+        assert "[階段0]" not in summary
+
+    def test_invalid_start_prints_big_warning(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(cb, "RESULTS_DIR", str(tmp_path))
+        codes = ["1101", "2330"]
+        price_data, idx = _make_regime_switching_market(codes, start="2021-06-01", n_days=600)
+        universe = {c: STOCK_FUTURES_UNIVERSE[c] for c in codes}
+        out = cb.run_squeeze_kdj_stops_mode(_stops_args(start="2021-06-01", end="2023-09-01"),
+                                            price_data, universe, idx)
+        summary = (tmp_path / "summary.txt").read_text(encoding="utf-8")
+        assert "這次測試無效" in summary and "2018-01-01" in summary
+        assert summary.index("這次測試無效") < summary.index("【挑選結果與判定】")
+        assert out["validity_warnings"]
