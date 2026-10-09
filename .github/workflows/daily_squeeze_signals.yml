@@ -3,7 +3,8 @@ name: 擠壓+KDJ 每日訊號(收盤後掃描)
 # 每個交易日收盤後掃一次全部股票期貨標的，結果寫進 signals/latest.md(隔天開盤前用手機看)，
 # 同時保留 signals/YYYY-MM-DD.md / .csv 當歷史紀錄，並commit回repo。
 # 同一批訊號產生兩個清單：個股期貨清單(期貨流動性夠的才列，資料來自期交所)、現股清單(固定金額買現股，參考用)。
-# Telegram每天送兩則：signals/telegram_futures.txt(期貨，主要)、signals/telegram_stock.txt(現股)。
+# Telegram每天送三則：signals/telegram_futures.txt(期貨，主要)、signals/telegram_stock.txt(現股)、
+# signals/telegram_tx.txt(台指期小台日線訊號，tx_daily_signal.py；凍結變體的紙上交易，詳見signals/tx_latest.md)。
 # 期交所資料的原始回應/解析報告在 signals/debug/(每天覆寫，也會commit、也在artifact裡)，第一次跑完請檢查。
 #
 # 排程注意事項：
@@ -81,7 +82,7 @@ jobs:
 
       # 只跑掃描器自己的測試當開跑前檢查(包含「跟回測逐日一致」的比對)，不跑整套測試，保持快速。
       - name: Pre-flight test
-        run: python -m pytest -q test_daily_squeeze_signals.py test_taifex_futures_loader.py
+        run: python -m pytest -q test_daily_squeeze_signals.py test_taifex_futures_loader.py test_tx_daily_signal.py
 
       # 不使用 actions/cache：掃描器每次都強制重新下載(refresh)，避免讀到資料還沒更新時的舊快取。
       - name: Scan signals
@@ -105,31 +106,55 @@ jobs:
           fi
           python daily_squeeze_signals.py $ARGS
 
+      # 台指期(小台)日線訊號：凍結變體MA_5_20&DONCHIAN20｜只做多｜停損1.0/移動3.0(tx_daily_signal.py)。
+      # continue-on-error：這一步失敗也不影響上面個股的訊號commit/push；Telegram會改送「產生失敗」的通知。
+      # 先刪掉舊的telegram_tx.txt(signals/有commit進repo)，避免失敗時誤送前一天的內容。
+      - name: Scan TX signal
+        id: tx_scan
+        continue-on-error: true
+        env:
+          AS_OF: ${{ github.event.inputs.as_of }}
+          TX_SIGNALS_LINK: ${{ github.server_url }}/${{ github.repository }}/blob/${{ github.ref_name }}/signals/tx_latest.md
+        run: |
+          rm -f signals/telegram_tx.txt
+          ARGS="--output-dir signals"
+          if [ -n "$AS_OF" ]; then
+            ARGS="$ARGS --as-of $AS_OF"
+          fi
+          python tx_daily_signal.py $ARGS
+
       # Telegram推播：需要在repo的 Settings → Secrets and variables → Actions 新增兩個secret：
       #   TELEGRAM_BOT_TOKEN(@BotFather給的機器人金鑰)、TELEGRAM_CHAT_ID(你的聊天ID)。
       # 沒設定時這一步直接略過，不影響掃描本身。訊息用純文字送出(不設parse_mode)，避免特殊字元出錯。
       # 放在commit之前：就算之後commit/push失敗，推播一樣已經送出。
-      # 每天兩則：先送期貨清單(主要)，再送現股清單。其中一則失敗，另一則照送；這一步標紅但不讓整個job失敗。
+      # 每天三則：先送期貨清單(主要)，再送現股清單，最後台指期訊號。其中一則失敗，其他照送；這一步標紅但不讓整個job失敗。
+      # 台指期那一步失敗(或沒產生telegram_tx.txt) → 改送一則「台指期訊號產生失敗，請看Actions紀錄」。
       - name: Send Telegram messages
         continue-on-error: true
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          TX_OUTCOME: ${{ steps.tx_scan.outcome }}
         run: |
           if [ -z "$TELEGRAM_BOT_TOKEN" ] || [ -z "$TELEGRAM_CHAT_ID" ]; then
             echo "沒有設定TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID，略過Telegram推播"
             exit 0
           fi
           FAILED=0
-          for f in signals/telegram_futures.txt signals/telegram_stock.txt; do
-            if [ ! -s "$f" ]; then
+          for f in signals/telegram_futures.txt signals/telegram_stock.txt signals/telegram_tx.txt; do
+            if [ "$f" = "signals/telegram_tx.txt" ] && { [ "$TX_OUTCOME" != "success" ] || [ ! -s "$f" ]; }; then
+              echo "台指期訊號步驟結果：${TX_OUTCOME:-未知}，改送失敗通知"
+              TEXT_ARG="text=台指期訊號產生失敗，請看Actions紀錄"
+            elif [ ! -s "$f" ]; then
               echo "找不到 $f 或是空的，略過"
               FAILED=1
               continue
+            else
+              TEXT_ARG="text@${f}"
             fi
             RESP=$(curl -sS -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
               --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
-              --data-urlencode "text@${f}" \
+              --data-urlencode "${TEXT_ARG}" \
               --data-urlencode "disable_web_page_preview=true") || true
             if echo "$RESP" | grep -q '"ok":true'; then
               echo "Telegram推播成功：$f"
