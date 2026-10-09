@@ -1,0 +1,31 @@
+{
+  "as_of": "2026-10-08",
+  "ok": false,
+  "error": "stockLists頁面找不到「證券代號＋股票期貨代碼」的表格(找到2個表格)",
+  "stock_lists": {
+    "url": "https://www.taifex.com.tw/cht/2/stockLists",
+    "method": "GET",
+    "fetch_error": null,
+    "encoding": "utf-8",
+    "bytes": 314098
+  },
+  "fut_data_down": {
+    "url": "https://www.taifex.com.tw/cht/3/futDataDown",
+    "method": "POST",
+    "form": {
+      "down_type": "1",
+      "commodity_id": "all",
+      "commodity_id2": "",
+      "queryStartDate": "2026/09/24",
+      "queryEndDate": "2026/10/08"
+    }
+  },
+  "coverage": {},
+  "stats": {},
+  "thresholds": {
+    "MIN_MAPPING_COVERAGE": 0.5,
+    "MIN_CSV_CONTRACT_SHARE": 0.2,
+    "AVG_DAYS": 5,
+    "MIN_DAYS": 3
+  }
+}
