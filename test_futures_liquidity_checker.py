@@ -102,5 +102,22 @@ class TestSummarizeLiquidityCoverage(unittest.TestCase):
         self.assertAlmostEqual(summary["low_liquidity_pct_of_known"], 0.0)
 
 
+
+
+class TestFromTaifexLoader(unittest.TestCase):
+    def test_loader_result_to_volume_dict(self):
+        liq = {"ok": True, "traded": {"2330": "QFF", "1101": "ABF", "2303": None},
+               "stats": {"QFF": {"avg_volume": 1234.0}}}
+        self.assertEqual(flc.futures_volume_by_code_from_loader(liq), {"2330": 1234.0})
+
+    def test_failed_loader_means_unknown_not_liquid(self):
+        liq = {"ok": False, "traded": {"2330": "QFF"}, "stats": {"QFF": {"avg_volume": 1234.0}}}
+        self.assertEqual(flc.futures_volume_by_code_from_loader(liq), {})
+        self.assertEqual(flc.futures_volume_by_code_from_loader(None), {})
+        annotated = flc.annotate_trades_with_liquidity(
+            [{"code": "2330"}], futures_volume_by_code=flc.futures_volume_by_code_from_loader(liq))
+        self.assertFalse(annotated[0]["liquidity_known"])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -16,7 +16,13 @@ import numpy as np
 import pandas as pd
 import pytest
 
+import requests
+
 import daily_squeeze_signals as dss
+import taifex_futures_loader as tfl
+from test_taifex_futures_loader import (
+    fake_liquidity, fake_codes, install_fake_http, make_stock_lists_html, make_fut_csv_bytes,
+)
 from squeeze_kdj_signal import (
     compute_squeeze_kdj_features, precompute_squeeze_kdj_features_by_code,
     precompute_squeeze_kdj_backtest_arrays, taiwan_tick_size, taiwan_add_ticks,
@@ -26,6 +32,19 @@ import compare_breakout as cb
 from taifex_universe import STOCK_FUTURES_UNIVERSE, estimate_margin
 
 REPO_DIR = os.path.dirname(os.path.abspath(__file__))
+
+
+@pytest.fixture(autouse=True)
+def _offline(monkeypatch):
+    """全部離線：真實HTTP一律失敗；main()裡的期交所loader預設換成「全部流動性都夠」的假結果
+    (個別測試要測真的loader時，自己把dss.load_futures_liquidity換回tfl.load_futures_liquidity + 假HTTP)。"""
+    def boom(*a, **k):
+        raise AssertionError("測試不可以連網路")
+    monkeypatch.setattr(requests.Session, "request", boom)
+    monkeypatch.setattr(requests, "get", boom)
+    monkeypatch.setattr(requests, "post", boom)
+    monkeypatch.setattr(dss, "load_futures_liquidity",
+                        lambda as_of, universe, **kw: fake_liquidity(list(universe)))
 
 
 def _make_market(n_stocks=10, n_days=700, seed=0, common=0.85):
@@ -313,6 +332,7 @@ class TestContractAndMargin:
                "downloaded": 1, "failed_codes": [], "usable": 1, "stale_codes": [],
                "latest_date": pd.Timestamp(row["signal_date"]), "latest_source": "x", "data_fresh": True,
                "signals": [{**row, "rank": 1}], "entry_date": pd.Timestamp(row["entry_date"])}
+        res = dss.build_tracks(res, fake_liquidity(["1101"]))
         md = dss.render_markdown(res)
         assert "超過單筆保證金上限，回測會略過，不建議下單" in md
         assert "⛔" in md
@@ -411,12 +431,18 @@ class TestWithoutScipy:
 
 
 # ----------------------------------------------------------------------------
-def _result_with(rows, fresh=True, as_of="2026-10-05"):
+def _result_with(rows, fresh=True, as_of="2026-10-05", liq="ok", **track_kw):
+    """liq="ok"：訊號的期貨流動性全部夠；None：沒有期貨資料(fail closed)；或直接給一份loader結果。
+    現股成交值門檻預設0(合成資料的成交量很小)。"""
     as_of = pd.Timestamp(as_of)
-    return {"as_of": as_of, "capital": 200_000, "universe_size": 249, "downloaded": 249, "failed_codes": [],
-            "usable": 249, "stale_codes": [], "latest_date": as_of if fresh else as_of - pd.Timedelta(days=3),
-            "latest_source": "2330", "data_fresh": fresh, "signals": rows,
-            "entry_date": dss.next_business_day(as_of)}
+    res = {"as_of": as_of, "capital": 200_000, "universe_size": 249, "downloaded": 249, "failed_codes": [],
+           "usable": 249, "stale_codes": [], "latest_date": as_of if fresh else as_of - pd.Timedelta(days=3),
+           "latest_source": "2330", "data_fresh": fresh, "signals": rows,
+           "entry_date": dss.next_business_day(as_of)}
+    if liq == "ok":
+        liq = fake_liquidity(sorted({r["code"] for r in rows}))
+    track_kw.setdefault("stock_min_turnover", 0)
+    return dss.build_tracks(res, liq, **track_kw)
 
 
 class TestTelegramMessage:
@@ -697,3 +723,368 @@ class TestWorkflowPositionsInput:
         assert args[args.index("--positions") + 1] == expected
         # env裡的GitHub表達式：沒有inputs(排程)時 || '1' 生效
         assert "|| '1'" in step["env"]["POSITIONS"]
+
+
+# ----------------------------------------------------------------------------
+# 兩個清單：個股期貨清單 / 現股清單
+# ----------------------------------------------------------------------------
+def _busy_day(market, min_signals=2):
+    price_data, universe, idx = market
+    features = precompute_squeeze_kdj_features_by_code(price_data, universe)
+    flags = pd.DataFrame({c: f["EntryFlag"] for c, f in features.items()})
+    return flags.index[(flags.sum(axis=1) >= min_signals) & (flags.index >= idx[300])][0]
+
+
+def _sig_row(code, price, rank, turnover=1e9, capital=10_000_000, trigger=None):
+    row = dss.compute_signal_row(code, _single_stock_signal_df(price), capital=capital)
+    row = {**row, "rank": rank, "turnover_20d": turnover}
+    if trigger is not None:
+        row["trigger_return"] = trigger
+    return row
+
+
+def _futures_part(md):
+    return md.split("## 📈 個股期貨清單")[1].split("## 🧾 現股清單")[0]
+
+
+def _stock_part(md):
+    return md.split("## 🧾 現股清單")[1].split("## 每日操作規則")[0]
+
+
+class TestTwoListsEndToEnd:
+    """真的loader(taifex_futures_loader)+ 假HTTP(stockLists HTML、Big5 CSV)，從main()一路跑到輸出檔。"""
+
+    def _setup(self, market, monkeypatch, csv_status=200, illiquid_top=True):
+        price_data, universe, idx = market
+        busy = _busy_day(market)
+        sigs = dss.scan({c: df[df.index <= busy] for c, df in price_data.items()}, universe, busy)["signals"]
+        top = sigs[0]["code"]
+        contracts = {}
+        for c in universe:
+            std, mini = fake_codes(c)
+            fut = mini if STOCK_FUTURES_UNIVERSE[c]["has_mini"] else std
+            low = illiquid_top and c == top
+            contracts[fut] = {"near": 5 if low else 300, "far": 1, "night": 2, "oi": 900}
+        dates = pd.bdate_range(end=busy, periods=7)
+        install_fake_http(monkeypatch, html=make_stock_lists_html(list(universe)),
+                          csv=make_fut_csv_bytes(contracts, dates), csv_status=csv_status)
+        monkeypatch.setattr(dss, "load_futures_liquidity", tfl.load_futures_liquidity)
+        return busy, sigs, top
+
+    def test_liquid_only_in_futures_list_and_all_outputs(self, market, monkeypatch, tmp_path):
+        price_data, universe, idx = market
+        busy, sigs, top = self._setup(market, monkeypatch)
+        out = _run_main(monkeypatch, tmp_path, price_data, busy, list(universe), extra=("--stock-min-turnover", "0"))
+        res, md = out["result"], out["markdown"]
+        ft, stt = res["futures_track"], res["stock_track"]
+        assert ft["ok"], ft["error"]
+        # 期貨清單：去掉流動性不夠的第1名，其餘照原本順序、自己重新排名
+        assert [r["code"] for r in ft["rows"]] == [s["code"] for s in sigs[1:]]
+        assert [r["rank"] for r in ft["rows"]] == list(range(1, len(sigs)))
+        assert [e["code"] for e in ft["excluded"]] == [top]
+        assert ft["rows"][0]["fut_avg_volume"] == pytest.approx(303) and ft["rows"][0]["fut_near_oi"] == 900
+        assert ft["rows"][0]["fut_spread_ticks"] >= 1
+        # 現股清單：同一批訊號、同樣順序(門檻設0)
+        assert [r["code"] for r in stt["rows"]] == [s["code"] for s in sigs]
+        # 限價/停損/停利跟原本的訊號一模一樣
+        by = {s["code"]: s for s in sigs}
+        for r in ft["rows"] + stt["rows"]:
+            for k in ("limit_price", "stop_if_fill_at_limit", "target_if_fill_at_limit", "atr", "trigger_return"):
+                assert r[k] == by[r["code"]][k]
+        # markdown兩個區塊 + 排除的代碼只在md
+        assert "## 📈 個股期貨清單(主要)" in md and "## 🧾 現股清單(參考)" in md
+        assert md.index("## 📈 個股期貨清單") < md.index("## 🧾 現股清單")
+        assert "另有1檔訊號因期貨成交量不足未列出" in md and f"：{top}" in md
+        assert "期貨流動性：" in _futures_part(md) and "5日均量 303口" in _futures_part(md)
+        # Telegram兩則
+        tg_f = (tmp_path / "telegram_futures.txt").read_text(encoding="utf-8")
+        tg_s = (tmp_path / "telegram_stock.txt").read_text(encoding="utf-8")
+        assert tg_f.startswith("【個股期貨清單】") and tg_s.startswith("【現股清單】")
+        assert tg_f.splitlines()[1] == tg_s.splitlines()[1] == dss.setting_label(1)
+        assert "另有1檔訊號因期貨成交量不足未列出" in tg_f
+        assert not any(line.startswith(f"{i}. {top}") for line in tg_f.splitlines() for i in range(1, 20))
+        assert any(line.startswith(f"1. {top}") for line in tg_s.splitlines())
+        assert len(tg_f) <= 4096 and len(tg_s) <= 4096
+        assert (tmp_path / "telegram.txt").read_text(encoding="utf-8") == tg_f
+        # 診斷檔
+        assert set(os.listdir(tmp_path / "debug")) == set(tfl.DEBUG_FILES)
+        # CSV
+        csv = pd.read_csv(tmp_path / f"{busy.date().isoformat()}.csv", dtype={"code": str})
+        assert list(csv.columns) == dss.CSV_COLUMNS
+        assert dict(zip(csv["code"], csv["fut_listed"]))[top] == False  # noqa: E712
+        assert csv["stock_listed"].all()
+
+    def test_fail_closed_futures_list_empty_stock_list_unaffected(self, market, monkeypatch, tmp_path):
+        price_data, universe, idx = market
+        busy, sigs, top = self._setup(market, monkeypatch, csv_status=500)
+        out = _run_main(monkeypatch, tmp_path, price_data, busy, list(universe), extra=("--stock-min-turnover", "0"))
+        res, md = out["result"], out["markdown"]
+        assert res["futures_track"]["ok"] is False and res["futures_track"]["rows"] == []
+        assert "HTTP 500" in res["futures_track"]["error"]
+        fut = _futures_part(md)
+        assert tfl.FAILURE_MESSAGE in fut and "### " not in fut and "限價買進" not in fut
+        assert len(res["stock_track"]["rows"]) == len(sigs) and "### 1. " in _stock_part(md)
+        tg_f = (tmp_path / "telegram_futures.txt").read_text(encoding="utf-8")
+        tg_s = (tmp_path / "telegram_stock.txt").read_text(encoding="utf-8")
+        assert tfl.FAILURE_MESSAGE in tg_f and "限價買" not in tg_f and "今天沒有訊號" not in tg_f
+        assert "限價買" in tg_s
+        rep = (tmp_path / "debug" / "parse_report.json").read_text(encoding="utf-8")
+        assert '"ok": false' in rep
+
+    def test_loader_crash_is_fail_closed(self, market, monkeypatch, tmp_path):
+        price_data, universe, idx = market
+        busy = _busy_day(market)
+
+        def crash(*a, **k):
+            raise RuntimeError("boom")
+        monkeypatch.setattr(dss, "load_price_data", _fake_loader(price_data))
+        monkeypatch.setattr(dss, "build_universe", lambda max_stocks=0: dict(universe))
+        monkeypatch.delenv("GITHUB_STEP_SUMMARY", raising=False)
+        monkeypatch.setattr(dss, "load_futures_liquidity", crash)
+        out = dss.main(["--as-of", busy.date().isoformat(), "--output-dir", str(tmp_path)])
+        assert out["result"]["futures_track"]["ok"] is False
+        assert "boom" in out["result"]["futures_track"]["error"]
+        assert tfl.FAILURE_MESSAGE in out["markdown"]
+
+    def test_no_futures_data_given_means_fail_closed(self, market):
+        price_data, universe, idx = market
+        busy = _busy_day(market)
+        res = dss.scan({c: df[df.index <= busy] for c, df in price_data.items()}, universe, busy)
+        assert res["signals"] and res["futures_track"]["ok"] is False and res["futures_track"]["rows"] == []
+        assert tfl.FAILURE_MESSAGE in dss.render_telegram_futures(res)
+
+    def test_cli_thresholds_reach_tracks(self, market, monkeypatch, tmp_path):
+        price_data, universe, idx = market
+        busy = _busy_day(market)
+        out = _run_main(monkeypatch, tmp_path, price_data, busy, list(universe),
+                        extra=("--fut-min-volume", "2000", "--stock-amount", "50000", "--stock-min-turnover", "0"))
+        ft, stt = out["result"]["futures_track"], out["result"]["stock_track"]
+        assert ft["min_volume"] == 2000 and ft["rows"] == [] and len(ft["excluded"]) == len(out["result"]["signals"])
+        assert "期貨清單今天沒有可下單的標的" in out["markdown"]
+        assert stt["amount"] == 50000 and all(r["stock_amount"] == 50000 for r in stt["rows"])
+
+
+class TestIndependentRanking:
+    def test_each_list_filters_and_reranks_independently(self):
+        a = _sig_row("2330", 100.0, 1)
+        b = _sig_row("1101", 100.0, 2, turnover=1e6)   # 現股成交值不夠
+        c = _sig_row("2303", 100.0, 3)
+        liq = fake_liquidity(["2330", "1101", "2303"], overrides={"2330": {"avg_volume": 10}})  # 2330期貨量不夠
+        res = _result_with([a, b, c], liq=liq, stock_min_turnover=dss.DEFAULT_STOCK_MIN_TURNOVER)
+        ft, stt = res["futures_track"], res["stock_track"]
+        assert [(r["code"], r["rank"], r["signal_rank"]) for r in ft["rows"]] == [("1101", 1, 2), ("2303", 2, 3)]
+        assert [(r["code"], r["rank"], r["signal_rank"]) for r in stt["rows"]] == [("2330", 1, 1), ("2303", 2, 3)]
+        assert [e["code"] for e in stt["excluded"]] == ["1101"]
+        md = dss.render_markdown(res)
+        assert "另有1檔訊號因現股20日均成交值不足未列出：1101" in md
+        assert "另有1檔訊號因期貨成交量不足未列出" in md and "2330" in _futures_part(md).split("另有")[1]
+        assert "另有1檔訊號因現股20日均成交值不足未列出" in dss.render_telegram_stock(res)
+        # 原本的訊號列不被改動
+        assert [a["rank"], b["rank"], c["rank"]] == [1, 2, 3]
+
+
+class TestStockTrack:
+    @pytest.mark.parametrize("shares,text", [(2663, "2張663股"), (3000, "3張"), (800, "800股(零股)"),
+                                             (1000, "1張"), (1, "1股(零股)"), (0, "0股")])
+    def test_fmt_shares(self, shares, text):
+        assert dss.fmt_shares(shares) == text
+
+    def test_sizing_and_costs(self):
+        r = {**_sig_row("2330", 100.0, 1), "limit_price": 37.55}
+        s = dss.stock_sizing(r, 100_000)
+        assert s["stock_shares"] == 2663 and s["stock_lots"] == 2 and s["stock_odd_shares"] == 663
+        assert s["stock_cost"] == pytest.approx(2663 * 37.55)
+        assert s["stock_fee_buy"] == pytest.approx(2663 * 37.55 * 0.001425)
+        assert s["stock_tax"] == pytest.approx(2663 * 37.55 * 0.003)
+        assert s["stock_roundtrip_cost"] == pytest.approx(2663 * 37.55 * (0.001425 * 2 + 0.003))
+        assert s["stock_stop_ntd"] == pytest.approx(r["stop_dist"] * 2663)
+        assert s["stock_target_ntd"] == pytest.approx(r["target_dist"] * 2663)
+        assert s["stock_blocked"] is False
+
+    def test_exact_multiple_not_lost_to_float(self):
+        r = {**_sig_row("2330", 100.0, 1), "limit_price": 0.1}
+        assert dss.stock_sizing(r, 100_000)["stock_shares"] == 1_000_000
+
+    def test_less_than_one_share_is_blocked(self):
+        r = {**_sig_row("2330", 100.0, 1), "limit_price": 150_000.0}
+        res = _result_with([r])
+        row = res["stock_track"]["rows"][0]
+        assert row["stock_shares"] == 0 and row["stock_blocked"] and "買不到1股" in row["stock_block_reason"]
+        md = dss.render_markdown(res)
+        assert "### 1. 2330 台積電 ⛔" in _stock_part(md) and "不要下單" in _stock_part(md)
+        tg = dss.render_telegram_stock(res)
+        assert "⛔ 不要下(NT$100,000買不到1股)" in tg and "限價買" not in tg and "不用下單" in tg
+
+    def test_turnover_filter_and_average(self):
+        df = _single_stock_signal_df(100.0)
+        exp = (df["Close"] * df["Volume"]).tail(20).mean()
+        assert dss.average_turnover(df) == pytest.approx(exp)
+        assert np.isnan(dss.average_turnover(df.drop(columns=["Volume"])))
+        row = dss.compute_signal_row("2330", df, capital=200_000)
+        assert row["turnover_20d"] == pytest.approx(exp)
+        lo = _result_with([{**row, "rank": 1}], stock_min_turnover=exp + 1)
+        hi = _result_with([{**row, "rank": 1}], stock_min_turnover=exp)
+        assert lo["stock_track"]["rows"] == [] and len(hi["stock_track"]["rows"]) == 1
+        nan = _result_with([{**row, "rank": 1, "turnover_20d": np.nan}])
+        assert nan["stock_track"]["rows"] == []  # 沒有成交量資料 → 不列(fail closed)
+
+    def test_markdown_stock_section_text(self):
+        r = {**_sig_row("2330", 100.0, 1), "limit_price": 37.55}
+        md = dss.render_markdown(_result_with([r]))
+        part = _stock_part(md)
+        assert "PF≈1.12" in part and "PF≈1.02" in part and "約1.0" in part and "大約只是打平" in part
+        assert "盤中零股" in part and "0.1425%" in part and "0.3%" in part and "很多券商有折扣" in part
+        assert "股數 **2張663股**" in part and "來回成本約 NT$" in part and "停損約 −NT$" in part
+        tg = dss.render_telegram_stock(_result_with([r]))
+        assert "2張663股" in tg and "零股" in tg and "PF≈1.0–1.1" in tg
+
+    def test_invalid_stock_amount(self):
+        with pytest.raises(ValueError):
+            _result_with([], stock_amount=0)
+        with pytest.raises(SystemExit):
+            dss.parse_args(["--stock-amount", "0"])
+
+    def test_cli_defaults(self):
+        a = dss.parse_args([])
+        assert (a.stock_amount, a.stock_min_turnover, a.fut_min_volume, a.fut_min_oi) == (100_000, 50_000_000, 100, 300)
+
+
+class TestFuturesTrackRendering:
+    def test_futures_block_shows_liquidity_and_existing_info(self):
+        res = _result_with([_sig_row("2330", 100.0, 1)])
+        md = dss.render_markdown(res)
+        fut = _futures_part(md)
+        assert "小型契約 100股" in fut and "保證金約" in fut
+        assert "5日均量 1,000口" in fut and "近月(202610)未平倉 5,000口" in fut and "價差 1檔" in fut
+        tg = dss.render_telegram_futures(res)
+        assert f"期貨{fake_codes('2330')[1]}：5日均量1,000口｜近月未平倉5,000口｜買賣價差1檔" in tg
+
+    def test_stale_futures_data_warns(self):
+        liq = fake_liquidity(["2330"], latest_date="2026-10-02")
+        res = _result_with([_sig_row("2330", 100.0, 1)], liq=liq)
+        assert "期貨資料最新日期是 2026-10-02" in dss.render_markdown(res)
+        assert "期貨流動性資料最新是2026-10-02" in dss.render_telegram_futures(res)
+
+    def test_failure_message_in_both_outputs(self):
+        res = _result_with([_sig_row("2330", 100.0, 1)], liq=tfl.failed_liquidity("HTTP 503"))
+        md, tg = dss.render_markdown(res), dss.render_telegram_futures(res)
+        assert tfl.FAILURE_MESSAGE == "期貨流動性資料抓取/解析失敗，今天期貨清單不列任何標的(不是沒有訊號)"
+        assert tfl.FAILURE_MESSAGE in md and "原因：HTTP 503" in md and "期貨清單：資料失敗、不列" in md
+        assert tfl.FAILURE_MESSAGE in tg and "現股清單見另一則" in tg
+        assert "限價買" in dss.render_telegram_stock(res)
+
+    def test_both_telegrams_truncated_under_limit(self):
+        base = _sig_row("2330", 37.55, 1)
+        rows = [{**base, "rank": i} for i in range(1, 80)]
+        res = _result_with(rows)
+        for fn in (dss.render_telegram_futures, dss.render_telegram_stock):
+            txt = fn(res, link="https://example.com/latest.md")
+            assert len(txt) <= 4096 and "其餘請看完整版" in txt and txt.endswith("https://example.com/latest.md")
+
+    def test_rules_mention_per_list_slots_and_double_exposure(self):
+        rules = "\n".join(dss._rules_section(1))
+        assert "每個清單各自計算" in rules and "曝險加倍" in rules
+
+    def test_write_outputs_writes_both_telegram_files(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("SIGNALS_LINK", "https://example.com/x.md")
+        monkeypatch.delenv("GITHUB_STEP_SUMMARY", raising=False)
+        out = dss.write_outputs(_result_with([_sig_row("2330", 100.0, 1)]), str(tmp_path))
+        for name in ("telegram_futures.txt", "telegram_stock.txt", "telegram.txt"):
+            txt = (tmp_path / name).read_text(encoding="utf-8")
+            assert txt.endswith("https://example.com/x.md") and len(txt) <= 4096
+        assert out["telegram_futures"].endswith("telegram_futures.txt")
+
+
+class TestWorkflowTwoLists:
+    WF_PATH = TestWorkflowPositionsInput.WF_PATH
+
+    def _wf(self):
+        yaml = pytest.importorskip("yaml")
+        with open(self.WF_PATH, encoding="utf-8") as f:
+            wf = yaml.safe_load(f.read())
+        return wf.get("on", wf.get(True)), wf["jobs"]["scan"]["steps"]
+
+    def test_dispatch_inputs_defaults(self):
+        on, _ = self._wf()
+        inp = on["workflow_dispatch"]["inputs"]
+        assert inp["stock_amount"]["default"] == "100000"
+        assert inp["fut_min_volume"]["default"] == "100"
+        assert inp["fut_min_oi"]["default"] == "300"
+        assert inp["positions"]["default"] == "1"
+
+    @pytest.mark.parametrize("env,expected", [
+        ({}, {"--stock-amount": "100000", "--fut-min-volume": "100", "--fut-min-oi": "300"}),
+        ({"STOCK_AMOUNT": "50000", "FUT_MIN_VOLUME": "250", "FUT_MIN_OI": "1000"},
+         {"--stock-amount": "50000", "--fut-min-volume": "250", "--fut-min-oi": "1000"}),
+    ])
+    def test_scan_step_passes_args(self, env, expected):
+        _, steps = self._wf()
+        step = next(s for s in steps if "python daily_squeeze_signals.py" in s.get("run", ""))
+        for k in ("STOCK_AMOUNT", "FUT_MIN_VOLUME", "FUT_MIN_OI"):
+            assert "github.event.inputs" in step["env"][k] and "||" in step["env"][k]
+        script = step["run"].replace("python daily_squeeze_signals.py", "echo")
+        full_env = {"PATH": os.environ.get("PATH", ""), "AS_OF": "", "CAPITAL": "", "POSITIONS": "",
+                    "STOCK_AMOUNT": "", "FUT_MIN_VOLUME": "", "FUT_MIN_OI": "", **env}
+        proc = subprocess.run(["bash", "-c", script], capture_output=True, text=True, env=full_env, timeout=30)
+        assert proc.returncode == 0, proc.stderr
+        args = proc.stdout.split()
+        for flag, val in expected.items():
+            assert args[args.index(flag) + 1] == val
+        dss.parse_args(args)  # CLI真的吃得下這些參數
+
+    def test_preflight_runs_loader_tests(self):
+        _, steps = self._wf()
+        pre = next(s for s in steps if s.get("name") == "Pre-flight test")
+        assert "test_taifex_futures_loader.py" in pre["run"] and "test_daily_squeeze_signals.py" in pre["run"]
+
+    def _telegram_step(self):
+        _, steps = self._wf()
+        return next(s for s in steps if "api.telegram.org" in s.get("run", ""))
+
+    def test_telegram_step_sends_both_files_futures_first(self):
+        step = self._telegram_step()
+        assert step["continue-on-error"] is True
+        run = step["run"]
+        assert run.index("signals/telegram_futures.txt") < run.index("signals/telegram_stock.txt")
+
+    @pytest.mark.parametrize("responses,exit_code", [(["ok", "ok"], 0), (["fail", "ok"], 1), (["ok", "fail"], 1)])
+    def test_telegram_script_one_failure_does_not_stop_other(self, tmp_path, responses, exit_code):
+        """用假的curl實際跑Telegram步驟的bash腳本：兩個檔案都要送；任一失敗→這一步exit 1
+        (workflow設了continue-on-error，所以整個job不會失敗)。"""
+        run = self._telegram_step()["run"]
+        sig = tmp_path / "signals"
+        sig.mkdir()
+        (sig / "telegram_futures.txt").write_text("期貨", encoding="utf-8")
+        (sig / "telegram_stock.txt").write_text("現股", encoding="utf-8")
+        bindir = tmp_path / "bin"
+        bindir.mkdir()
+        log = tmp_path / "curl.log"
+        state = tmp_path / "n"
+        state.write_text("0")
+        (bindir / "curl").write_text(
+            "#!/bin/bash\n"
+            f'echo "$@" >> {log}\n'
+            f"n=$(cat {state}); echo $((n+1)) > {state}\n"
+            f"if [ \"$n\" = 0 ]; then r={responses[0]}; else r={responses[1]}; fi\n"
+            'if [ "$r" = ok ]; then echo \'{"ok":true}\'; else echo \'{"ok":false}\'; exit 22; fi\n')
+        (bindir / "curl").chmod(0o755)
+        env = {"PATH": f"{bindir}:{os.environ.get('PATH', '')}", "TELEGRAM_BOT_TOKEN": "t", "TELEGRAM_CHAT_ID": "c"}
+        proc = subprocess.run(["bash", "-eo", "pipefail", "-c", run], capture_output=True, text=True,
+                              env=env, cwd=tmp_path, timeout=30)
+        assert proc.returncode == exit_code, proc.stdout + proc.stderr
+        sent = log.read_text().splitlines()
+        assert len(sent) == 2
+        assert "text@signals/telegram_futures.txt" in sent[0] and "text@signals/telegram_stock.txt" in sent[1]
+
+    def test_telegram_skipped_without_secrets(self, tmp_path):
+        run = self._telegram_step()["run"]
+        proc = subprocess.run(["bash", "-eo", "pipefail", "-c", run], capture_output=True, text=True,
+                              env={"PATH": os.environ.get("PATH", "")}, cwd=tmp_path, timeout=30)
+        assert proc.returncode == 0 and "略過" in proc.stdout
+
+    def test_debug_dir_committed_and_uploaded(self):
+        _, steps = self._wf()
+        commit = next(s for s in steps if "git commit" in s.get("run", ""))
+        assert "git add signals/" in commit["run"]
+        upload = next(s for s in steps if s.get("uses", "").startswith("actions/upload-artifact"))
+        assert upload["with"]["path"] == "signals/"

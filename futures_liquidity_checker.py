@@ -14,22 +14,21 @@ futures_liquidity_checker.py
 用理論價位成交」，跟現股的MIN_TURNOVER_VALUE濾網完全沒關係。
 
 這支模組能做的：
-  1. 提供資料結構跟flag邏輯，一旦有了「股票期貨本身」的日成交量/未平倉量
-     資料(需要另外從期交所公開資訊觀測站抓，例如
-     https://www.taifex.com.tw/cht/3/dlStockFOMarketDayReport 或期交所
-     OpenAPI，這支模組目前沒有內建下載器，需要另外建一支
-     futures_liquidity_loader.py 才能真正抓到這份資料並驗證格式)，
-     就能直接把回測交易紀錄跟這份資料串起來檢查。
-  2. 在還沒有那份資料的情況下，誠實回報「無法判斷」，而不是假裝現股濾網
-     已經足夠涵蓋期貨流動性風險——這是刻意的設計，寧可讓使用者清楚知道
-     這塊還沒補上，也不要用現股資料冒充期貨流動性資料，製造虛假的安全感。
+  1. 提供資料結構跟flag邏輯：有了「股票期貨本身」的日成交量資料，就能直接把回測交易紀錄
+     跟這份資料串起來檢查。
+  2. 在沒有那份資料的情況下，誠實回報「無法判斷」，而不是假裝現股濾網已經足夠涵蓋期貨
+     流動性風險——寧可讓使用者清楚知道這塊還沒補上，也不要用現股資料冒充期貨流動性資料。
 
-⚠️ 還沒完成的部分：真正抓期交所股票期貨日成交量/未平倉量的下載器
-(futures_liquidity_loader.py)還沒有建立，因為那份資料的實際API/報表格式
-需要在有網路的環境(例如GitHub Actions)實際打過一次才能確認欄位、驗證
-不會像chip_data_loader.py當初那樣因為格式假設錯誤而出錯——在還沒實際驗證過
-真實資料格式之前，貿然寫死一套解析邏輯風險很高，這支模組先只處理「資料
-串接+診斷」這一層，資料來源本身留給下一步。
+資料來源(更新)：期交所資料的下載器已經建立在 taifex_futures_loader.py
+(stockLists對照表 + futDataDown每日行情；每日訊號掃描daily_squeeze_signals.py的
+「個股期貨清單」就是用它)。用 futures_volume_by_code_from_loader(load_futures_liquidity(...)的結果)
+可以直接得到這裡要的 {code: 5日平均成交量}。
+
+⚠️ 限制(仍然成立)：
+  - 那支loader的網址/欄位格式還沒在真實環境驗證過(開發環境連不到期交所)，第一次在GitHub
+    Actions跑完要看 signals/debug/ 確認；它失敗時回傳ok=False，這裡就得到空dict(=全部「無法判斷」)。
+  - 它只抓「最近幾個交易日」，給的是「現在」的流動性，不是回測當年的流動性；拿來標記多年前的
+    回測交易只能當粗略參考(冷門合約多半一直冷門，但不保證)。
 """
 
 DEFAULT_MIN_DAILY_VOLUME = 50  # 口數/日，保守佔位值，未經真實資料校準，見下方annotate_trades_with_liquidity說明
@@ -71,6 +70,20 @@ def annotate_trades_with_liquidity(trades, futures_volume_by_code=None, min_dail
             new_t["futures_avg_daily_volume"] = None
         annotated.append(new_t)
     return annotated
+
+
+def futures_volume_by_code_from_loader(liquidity) -> dict:
+    """taifex_futures_loader.load_futures_liquidity()的結果 → {股票代號: 實際交易契約的5日平均成交量(口)}。
+    loader失敗(ok=False)或某檔對照不到/行情裡沒有 → 不放進dict(= annotate時liquidity_known=False，
+    「無法判斷」，不是「流動性沒問題」)。"""
+    if not liquidity or not liquidity.get("ok"):
+        return {}
+    out = {}
+    for code, fut in (liquidity.get("traded") or {}).items():
+        st = (liquidity.get("stats") or {}).get(fut) if fut else None
+        if st is not None:
+            out[code] = st["avg_volume"]
+    return out
 
 
 def summarize_liquidity_coverage(trades, futures_volume_by_code=None, min_daily_volume=None):
