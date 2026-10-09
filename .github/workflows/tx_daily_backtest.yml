@@ -1,15 +1,16 @@
-name: 台指期日線策略 預先登記測試(basic=8變體 / grid=1872變體網格，訓練2001-2012/測試2013-2023/近期指數代理)
+name: 台指期日線策略 預先登記測試(basic=8變體 / grid=1872變體網格 / refine=312變體walk-forward，訓練2001-2012/測試2013-2023/近期指數代理)
 
 on:
   workflow_dispatch:
     inputs:
       mode:
-        description: '模式：basic(既有8變體，預設)/grid(12訊號+66混搭 × 動能門檻有無 × 12出場 = 1872變體，含過度擬合診斷)'
+        description: 'basic(8變體)/grid(1872變體網格)/refine(MACD等5種候選 × MACD參數 × 只做多/多空 × 12出場 = 312變體，walk-forward驗證)'
         required: false
         type: choice
         options:
           - basic
           - grid
+          - refine
         default: basic
       contract:
         description: '契約：mini(小台MTX，NT$50/點，預設)/big(大台TX，NT$200/點)'
@@ -56,7 +57,7 @@ jobs:
 
       - name: 單元測試(先確認資料/引擎/比較邏輯沒壞，再花時間下載真實資料)
         run: |
-          python -m pytest -q test_tx_daily_engine.py test_tx_daily_data.py test_compare_tx_daily.py test_tx_daily_grid.py
+          python -m pytest -q test_tx_daily_engine.py test_tx_daily_data.py test_compare_tx_daily.py test_tx_daily_grid.py test_tx_daily_refine.py
 
       - name: Run TX daily pre-registered test
         timeout-minutes: 75
@@ -68,6 +69,9 @@ jobs:
           fi
           if [ "${{ github.event.inputs.mode }}" = "grid" ]; then
             ARGS="$ARGS --grid"
+          fi
+          if [ "${{ github.event.inputs.mode }}" = "refine" ]; then
+            ARGS="$ARGS --refine"
           fi
           python compare_tx_daily.py $ARGS
 
