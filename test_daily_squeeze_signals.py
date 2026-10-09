@@ -1049,7 +1049,7 @@ class TestWorkflowTwoLists:
 
     @pytest.mark.parametrize("responses,exit_code", [(["ok", "ok"], 0), (["fail", "ok"], 1), (["ok", "fail"], 1)])
     def test_telegram_script_one_failure_does_not_stop_other(self, tmp_path, responses, exit_code):
-        """用假的curl實際跑Telegram步驟的bash腳本：兩個檔案都要送；任一失敗→這一步exit 1
+        """用假的curl實際跑Telegram步驟的bash腳本：兩個檔案(+台指期第三則)都要送；任一失敗→這一步exit 1
         (workflow設了continue-on-error，所以整個job不會失敗)。"""
         run = self._telegram_step()["run"]
         sig = tmp_path / "signals"
@@ -1073,8 +1073,10 @@ class TestWorkflowTwoLists:
                               env=env, cwd=tmp_path, timeout=30)
         assert proc.returncode == exit_code, proc.stdout + proc.stderr
         sent = log.read_text().splitlines()
-        assert len(sent) == 2
+        # 第三則是台指期訊號(tx_daily_signal.py)；這裡沒有telegram_tx.txt、也沒有TX_OUTCOME → 送「產生失敗」通知
+        assert len(sent) == 3
         assert "text@signals/telegram_futures.txt" in sent[0] and "text@signals/telegram_stock.txt" in sent[1]
+        assert "台指期訊號產生失敗" in sent[2]
 
     def test_telegram_skipped_without_secrets(self, tmp_path):
         run = self._telegram_step()["run"]

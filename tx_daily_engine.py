@@ -543,11 +543,16 @@ def run_tx_daily_grid_backtest(arrs: dict, entry_sig: np.ndarray, raw_sig: np.nd
                                tax_rate: float = FUTURES_TAX_RATE,
                                max_hold_days: int = MAX_HOLD_DAYS,
                                starting_capital: float = STARTING_CAPITAL,
-                               variant_name: str = "") -> list:
+                               variant_name: str = "", state_out: dict = None) -> list:
     """網格版單一部位回測。exit_kind="trail"：移動停損exit_mult×ATR、無停利(跟
     run_tx_daily_backtest同邏輯)；exit_kind="target"：固定停利exit_mult×ATR、停損不移動。
     其餘(進出場時點、跳空、滑價、成本、換月、最長持有、期末)與run_tx_daily_backtest相同。
-    空手又沒有待進場時直接跳到下一個進場訊號日(結果不變，只是比較快)。"""
+    空手又沒有待進場時直接跳到下一個進場訊號日(結果不變，只是比較快)。
+    state_out(選配，給每日實盤訊號tx_daily_signal.py用；預設None = 行為完全不變)：傳一個dict進來時
+    「期末不強制平倉」，最後一天照一般收盤後流程更新移動停損/反向訊號/最長持有/進場訊號，然後把
+    期末狀態寫進state_out：position(持倉dict或None；stop = 下一個交易日要用的停損)、
+    pending_entry(+1/−1/0：下一個交易日開盤進場)、pending_exit(出場原因或None：下一個交易日開盤出場)、
+    last_index(最後一天的位置)。回傳的trades只含已平倉的交易。"""
     if exit_kind not in ("trail", "target"):
         raise ValueError(exit_kind)
     mult = CONTRACT_MULTIPLIER[contract]
@@ -595,6 +600,8 @@ def run_tx_daily_grid_backtest(arrs: dict, entry_sig: np.ndarray, raw_sig: np.nd
             # 空手、沒有待辦：下一件會發生的事就是下一個進場訊號(訊號在最後一天不會進場)
             k = int(nz.searchsorted(i, side="left"))
             if k >= len(nz) or nz[k] >= hi:
+                if state_out is not None and k < len(nz) and nz[k] == hi:
+                    pending_entry = int(es[hi])   # 最後一天出現進場訊號 → 下一個交易日開盤進場
                 break
             j = int(nz[k])
             pending_entry = es[j]
@@ -652,7 +659,7 @@ def run_tx_daily_grid_backtest(arrs: dict, entry_sig: np.ndarray, raw_sig: np.nd
                 pos = None
 
         # ---- 收盤 ----
-        if i == hi:
+        if i == hi and state_out is None:
             if pos is not None:
                 close_trade(i, c[i] - slip * pos["dir"], "期末平倉", i - pos["entry_idx"] + 1)
                 pos = None
@@ -675,5 +682,13 @@ def run_tx_daily_grid_backtest(arrs: dict, entry_sig: np.ndarray, raw_sig: np.nd
         else:
             if es[i] != 0:
                 pending_entry = int(es[i])
+        if i == hi:
+            break
         i += 1
+    if state_out is not None:
+        state_out.clear()
+        state_out.update({"position": dict(pos) if pos is not None else None,
+                          "pending_entry": int(pending_entry) if pos is None else 0,
+                          "pending_exit": pending_exit if pos is not None else None,
+                          "last_index": hi})
     return trades
