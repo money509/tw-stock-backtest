@@ -23,6 +23,8 @@ tx_daily_grid.py
     等級相關(不用scipy：先排名(同分取平均名次)再算Pearson)；測試PF分布(明講不能從裡面挑)；
     家族檢視(每個單一訊號 → 含它的所有變體裡訓練、測試PF都>1的比例)；出場檢視(每種出場
     設定的同一個比例)。分母一律是「訓練交易數 >= 40」的合格變體。
+tx_grid_all.csv / tx_grid_top20.csv 每段另有「平均持有天數」(每筆交易持有交易日數的平均)與
+「在場時間比例(%)」(持有天數加總 / 該段交易日數 × 100)，只報告、不參與選擇或判定。
 """
 import os
 import time
@@ -88,13 +90,35 @@ def grid_rules_lines(contract, commission, n_variants=None):
 # ---------------------------------------------------------------------------
 # 跑網格
 # ---------------------------------------------------------------------------
-def quick_stats(trades):
-    """網格每個(變體, 期間)用的輕量統計(PF定義跟summarize_mr相同；沒有bootstrap)。"""
+def period_n_days(dates, start, end):
+    """[start, end]內的交易日數(跟回測引擎切區間的方式完全相同)。"""
+    lo = 0 if start is None else int(dates.searchsorted(pd.Timestamp(start), side="left"))
+    hi = len(dates) - 1 if end is None else int(dates.searchsorted(pd.Timestamp(end), side="right")) - 1
+    return max(0, hi - lo + 1)
+
+
+def hold_stats(trades, n_days=None):
+    """平均持有天數(每筆trade的hold_days平均) 與 在場時間比例(%) = 持有天數加總 / 期間交易日數 × 100。
+    一次只有1口、出場當天不會再進場，所以持有天數不會重疊(<=100%)。沒給n_days → 比例為NaN。"""
+    hold = np.array([t["hold_days"] for t in trades], float)
+    avg = float(hold.mean()) if len(hold) else 0.0
+    if not n_days:
+        tim = float("nan")
+    else:
+        tim = float(hold.sum() / n_days * 100)
+    return {"avg_hold_days": avg, "time_in_market_pct": tim}
+
+
+def quick_stats(trades, n_days=None):
+    """網格每個(變體, 期間)用的輕量統計(PF定義跟summarize_mr相同；沒有bootstrap)。
+    n_days = 期間交易日數(算在場時間比例用)。"""
     n = len(trades)
     if n == 0:
-        return {"trade_count": 0, "profit_factor": 0.0, "total_pnl_ntd": 0.0, "win_rate": 0.0,
-                "max_drawdown_ntd": 0.0, "long_count": 0, "short_count": 0, "long_pnl_ntd": 0.0,
-                "short_pnl_ntd": 0.0, "pnl_excl_top3_ntd": 0.0}
+        out = {"trade_count": 0, "profit_factor": 0.0, "total_pnl_ntd": 0.0, "win_rate": 0.0,
+               "max_drawdown_ntd": 0.0, "long_count": 0, "short_count": 0, "long_pnl_ntd": 0.0,
+               "short_pnl_ntd": 0.0, "pnl_excl_top3_ntd": 0.0}
+        out.update(hold_stats(trades, n_days))
+        return out
     pnl = np.array([t["pnl_ntd"] for t in trades], float)
     is_long = np.array([t["side"] == "long" for t in trades], bool)
     gw = float(pnl[pnl > 0].sum())
@@ -102,11 +126,13 @@ def quick_stats(trades):
     pf = gw / gl if gl > 0 else (float("inf") if gw > 0 else 0.0)
     eq = STARTING_CAPITAL + np.concatenate([[0.0], np.cumsum(pnl)])
     dd = float((eq - np.maximum.accumulate(eq)).min())
-    return {"trade_count": n, "profit_factor": pf, "total_pnl_ntd": float(pnl.sum()),
-            "win_rate": float((pnl > 0).mean() * 100), "max_drawdown_ntd": dd,
-            "long_count": int(is_long.sum()), "short_count": int((~is_long).sum()),
-            "long_pnl_ntd": float(pnl[is_long].sum()), "short_pnl_ntd": float(pnl[~is_long].sum()),
-            "pnl_excl_top3_ntd": float(np.sort(pnl)[::-1][3:].sum())}
+    out = {"trade_count": n, "profit_factor": pf, "total_pnl_ntd": float(pnl.sum()),
+           "win_rate": float((pnl > 0).mean() * 100), "max_drawdown_ntd": dd,
+           "long_count": int(is_long.sum()), "short_count": int((~is_long).sum()),
+           "long_pnl_ntd": float(pnl[is_long].sum()), "short_pnl_ntd": float(pnl[~is_long].sum()),
+           "pnl_excl_top3_ntd": float(np.sort(pnl)[::-1][3:].sum())}
+    out.update(hold_stats(trades, n_days))
+    return out
 
 
 def grid_period_frames(ds):
@@ -151,6 +177,7 @@ def run_grid(ds, variants, contract="mini", commission=DEFAULT_COMMISSION_PER_SI
     for period in PERIOD_KEYS:
         arrs, _ = frames[period]
         start, end = _period_bounds(period)
+        n_days = period_n_days(arrs["dates"], start, end)
         tp = time.perf_counter()
         for (rule, gate), vs in by_rule_gate.items():
             es, rs = eng.grid_entry_signals(arrs, rule, gate)
@@ -158,7 +185,7 @@ def run_grid(ds, variants, contract="mini", commission=DEFAULT_COMMISSION_PER_SI
                 tr = eng.run_tx_daily_grid_backtest(arrs, es, rs, v["stop_atr"], v["exit_kind"], v["exit_mult"],
                                                     start=start, end=end, contract=contract,
                                                     commission_per_side=commission, variant_name=v["name"])
-                stats[(v["name"], period)] = quick_stats(tr)
+                stats[(v["name"], period)] = quick_stats(tr, n_days)
                 n_runs += 1
         if log:
             log(f"  網格：{PERIOD_LABEL[period]}段 {len(variants)}個變體完成，{time.perf_counter() - tp:.1f}秒")
@@ -530,6 +557,8 @@ def all_rows(variants, stats, cell_index, rank_of):
             row[f"{lab}多單損益(NT$)"] = round(s["long_pnl_ntd"], 0)
             row[f"{lab}空單損益(NT$)"] = round(s["short_pnl_ntd"], 0)
             row[f"{lab}拿掉前3筆損益(NT$)"] = round(s["pnl_excl_top3_ntd"], 0)
+            row[f"{lab}平均持有天數"] = round(s.get("avg_hold_days", float("nan")), 1)
+            row[f"{lab}在場時間比例(%)"] = round(s.get("time_in_market_pct", float("nan")), 1)
         row["訓練合格(>=40筆)"] = "是" if stats[(v["name"], "train")]["trade_count"] >= ctd.MIN_TRAIN_TRADES else "否"
         row["訓練排名"] = rank_of.get(v["name"], "")
         row["兩段PF都>1"] = "是" if _both_gt1(stats, v["name"]) else "否"

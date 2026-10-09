@@ -76,6 +76,8 @@ tx_daily_engine.py
   ATR一律取訊號日t的值；反向訊號 = 同一條進場規則的「未過濾」原始訊號(混搭就是混搭原始訊號)；
   最長持有/期末/成本/換月與上面8變體完全相同。
   「停損2.0 + 移動停損3.0」這一格就是上面8變體的出場規則(測試有驗證逐筆相同)。
+精煉模式(--refine，tx_daily_refine.py)沿用同一個網格引擎；MACD訊號改由macd_cross_signal(fast, slow, signal)
+產生(預設12/26/9 = 網格的sig_MACD，逐日相同)，出場網格由grid_exit_configs(停損倍數, 出場選項)帶參數產生。
 """
 import itertools
 
@@ -366,6 +368,15 @@ def _mask_warmup(sig: np.ndarray, n: int) -> np.ndarray:
     return out
 
 
+def macd_cross_signal(close: pd.Series, fast: int = MACD_FAST, slow: int = MACD_SLOW, signal: int = MACD_SIGNAL):
+    """MACD線(EMA fast − EMA slow)上穿/下穿訊號線(MACD線的EMA signal) → +1/−1；
+    前slow+signal根K棒暖身不出訊號。回傳(訊號ndarray, MACD線, 訊號線, 柱狀圖)。
+    預設參數(12,26,9)就是網格的sig_MACD(--refine另外用快8/17/9、慢19/39/9)。"""
+    macd, macd_sig, macd_hist = compute_macd(close, fast, slow, signal)
+    sig = _mask_warmup(cross_signal(macd, macd_sig), slow + signal)
+    return sig, macd, macd_sig, macd_hist
+
+
 def compute_kdj_d(k: pd.Series) -> pd.Series:
     """D_t = 2/3·D_(t−1) + 1/3·K_t，D的前一值起始=50(跟compute_kdj_k的K起始方式一致)。"""
     kv = k.to_numpy(float)
@@ -424,12 +435,12 @@ def grid_rule_list() -> list:
     return rules
 
 
-def grid_exit_configs() -> list:
+def grid_exit_configs(stop_mults=GRID_STOP_MULTS, exit_options=GRID_EXIT_OPTIONS) -> list:
     """12種出場設定(停損在外圈、出場方式在內圈)。每個 = {"exit_id", "stop_atr", "exit_kind",
-    "exit_mult", "stop_idx", "exit_idx", "label"}。"""
+    "exit_mult", "stop_idx", "exit_idx", "label"}。預設 = 網格的出場網格；--refine傳自己的出場選項。"""
     out = []
-    for si, s in enumerate(GRID_STOP_MULTS):
-        for ei, (kind, m) in enumerate(GRID_EXIT_OPTIONS):
+    for si, s in enumerate(stop_mults):
+        for ei, (kind, m) in enumerate(exit_options):
             tag = f"停利{m:.1f}" if kind == "target" else f"移動{m:.1f}"
             out.append({"exit_id": f"S{s:.1f}_{'T' if kind == 'target' else 'TR'}{m:.1f}",
                         "stop_atr": s, "exit_kind": kind, "exit_mult": m,
@@ -458,9 +469,9 @@ def compute_grid_indicators(df: pd.DataFrame) -> pd.DataFrame:
     ind["sig_MA_5_20"] = cross_signal(ind["MA5"], ind["MA20"])
     ind["sig_MA_20_60"] = ind["sig_MA_CROSS"].to_numpy(int)
 
-    macd, macd_sig, macd_hist = compute_macd(close, MACD_FAST, MACD_SLOW, MACD_SIGNAL)
+    sig_macd, macd, macd_sig, macd_hist = macd_cross_signal(close, MACD_FAST, MACD_SLOW, MACD_SIGNAL)
     ind["MACD"], ind["MACD_Signal"], ind["MACD_Hist"] = macd, macd_sig, macd_hist
-    ind["sig_MACD"] = _mask_warmup(cross_signal(macd, macd_sig), MACD_WARMUP)
+    ind["sig_MACD"] = sig_macd
     ind["sig_MACD_ZERO"] = _mask_warmup(cross_signal(macd, 0.0), MACD_WARMUP)
 
     ind["sig_BODY"] = body_signal(df, ind["ATR"])

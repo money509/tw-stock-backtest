@@ -481,6 +481,38 @@ class TestSelectionAndPlateau:
         assert not ok
 
 
+class TestHoldStats:
+    def test_quick_stats_hold_and_time_in_market(self):
+        tr = [{"pnl_ntd": 100.0, "side": "long", "hold_days": 3},
+              {"pnl_ntd": -50.0, "side": "short", "hold_days": 7},
+              {"pnl_ntd": 20.0, "side": "long", "hold_days": 2}]
+        s = grid.quick_stats(tr, n_days=40)
+        assert s["avg_hold_days"] == pytest.approx(4.0)
+        assert s["time_in_market_pct"] == pytest.approx(12 / 40 * 100)
+        assert np.isnan(grid.quick_stats(tr)["time_in_market_pct"])  # 沒給交易日數
+        e = grid.quick_stats([], n_days=40)
+        assert e["avg_hold_days"] == 0.0 and e["time_in_market_pct"] == 0.0
+        # 其他欄位跟以前一樣
+        assert s["trade_count"] == 3 and s["total_pnl_ntd"] == 70.0 and s["profit_factor"] == pytest.approx(2.4)
+
+    def test_period_n_days_matches_engine_slicing(self):
+        df = mk([100.0] * 30)
+        d = df.index
+        assert grid.period_n_days(d, None, None) == 30
+        assert grid.period_n_days(d, d[5], d[9]) == 5
+        assert grid.period_n_days(d, "2000-01-01", d[0]) == 1
+        assert grid.period_n_days(d, "2030-01-01", None) == 0
+
+    def test_backtest_time_in_market(self):
+        closes = [100.0] * 30
+        df = mk(closes)
+        tr = grun(df, {2: 1, 12: -1}, stop=1.0, kind="target", m=3.0, start=df.index[0], end=df.index[29])
+        s = grid.quick_stats(tr, grid.period_n_days(df.index, df.index[0], df.index[29]))
+        # 第3天開盤進場多單，第12天反向訊號 → 第13天開盤出場(持有10天)，不反手；之後沒有新訊號
+        assert [t["hold_days"] for t in tr] == [10]
+        assert s["time_in_market_pct"] == pytest.approx(10 / 30 * 100)
+
+
 class TestSpearman:
     def test_hand_calc(self):
         # y排名：[1, 2, 3.5, 5, 3.5]；x排名1..5 → Σd·d = 8，Σx² = 10，Σy² = 9.5 → 8/√95
@@ -638,6 +670,12 @@ class TestGridEndToEnd:
         assert printed.index("預先登記的規則") < printed.index("過度擬合診斷")
         allv = pd.read_csv(out / "tx_grid_all.csv", encoding="utf-8-sig")
         assert len(allv) == 1872 and {"變體", "訓練PF", "測試PF", "近期PF", "動能門檻", "相鄰出場格測試PF平均"} <= set(allv.columns)
+        for lab in ("訓練", "測試", "近期"):
+            assert {f"{lab}平均持有天數", f"{lab}在場時間比例(%)"} <= set(allv.columns)
+            tim = allv[f"{lab}在場時間比例(%)"]
+            assert ((tim >= 0) & (tim <= 100)).all() and (tim > 0).any()
+            has_tr = allv[f"{lab}交易數"] > 0
+            assert (allv.loc[has_tr, f"{lab}平均持有天數"] >= 1).all()
         top = pd.read_csv(out / "tx_grid_top20.csv", encoding="utf-8-sig")
         assert len(top) == 20 and (top["訓練交易數"] >= 40).all()
         assert list(top["訓練PF"]) == sorted(top["訓練PF"], reverse=True)

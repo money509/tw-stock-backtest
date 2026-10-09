@@ -18,6 +18,9 @@ tx_daily_trades.csv，以及tx_daily_data.write_diagnostics()寫的診斷檔。
 
 --grid：改跑網格模式(1872變體，見tx_daily_grid.py)，資料載入/驗證/備援跟這裡共用同一份；
 輸出summary_grid.txt與tx_grid_*.csv(不會寫summary.txt；不加--grid時行為跟以前完全一樣)。
+
+--refine：改跑精煉模式(MACD等5種候選 × MACD參數 × 只做多/多空 × 12出場 = 312變體，walk-forward驗證，
+見tx_daily_refine.py)，輸出summary_refine.txt與tx_refine_*.csv；不能跟--grid或--variants一起用。
 """
 import argparse
 import datetime
@@ -370,13 +373,22 @@ def parse_args(argv=None):
                     help="加權指數下載快取資料夾")
     ap.add_argument("--grid", action="store_true",
                     help="網格模式：(12單一訊號+66混搭)×動能門檻有/無×12出場 = 1872變體(見tx_daily_grid.py)")
+    ap.add_argument("--refine", action="store_true",
+                    help="精煉模式：MACD等5種候選 × MACD參數 × 只做多/多空 × 12出場 = 312變體，"
+                         "walk-forward驗證(見tx_daily_refine.py)")
     return ap.parse_args(argv)
 
 
 def main(argv=None):
     args = parse_args(argv)
+    if args.grid and args.refine:
+        print("--grid 與 --refine 不能同時使用(一次只跑一種模式)", file=sys.stderr)
+        return 2
     if args.grid and args.variants:
         print("--grid 模式不能搭配 --variants(網格的變體清單是事先登記、固定的)", file=sys.stderr)
+        return 2
+    if args.refine and args.variants:
+        print("--refine 模式不能搭配 --variants(精煉模式的變體清單是事先登記、固定的)", file=sys.stderr)
         return 2
     variants = variant_list()
     if args.variants:
@@ -391,6 +403,9 @@ def main(argv=None):
     if args.grid:
         import tx_daily_grid
         rules = tx_daily_grid.grid_rules_lines(args.contract, args.commission_per_side)
+    elif args.refine:
+        import tx_daily_refine
+        rules = tx_daily_refine.refine_rules_lines(args.contract, args.commission_per_side)
     else:
         rules = rules_lines(args.contract, args.commission_per_side)
     for line in rules:
@@ -402,13 +417,16 @@ def main(argv=None):
     if ds.get("main") is None:
         msg = [ds.get("source_line", "價格來源：無"), "", "資料完全取不到，回測沒有執行。",
                f"原因：{ds.get('fallback_reason')}"]
-        summary_name = "summary_grid.txt" if args.grid else "summary.txt"
+        summary_name = ("summary_grid.txt" if args.grid else
+                        "summary_refine.txt" if args.refine else "summary.txt")
         with open(os.path.join(args.results_dir, summary_name), "w", encoding="utf-8") as f:
             f.write("\n".join(msg) + "\n")
         print("\n".join(msg), flush=True)
         return 1
     if args.grid:
         return tx_daily_grid.run_grid_mode(args, ds)
+    if args.refine:
+        return tx_daily_refine.run_refine_mode(args, ds)
 
     res = run_all(ds, variants, contract=args.contract, commission=args.commission_per_side,
                   n_boot=args.n_bootstrap)
