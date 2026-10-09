@@ -2,6 +2,9 @@ name: 擠壓+KDJ 每日訊號(收盤後掃描)
 
 # 每個交易日收盤後掃一次全部股票期貨標的，結果寫進 signals/latest.md(隔天開盤前用手機看)，
 # 同時保留 signals/YYYY-MM-DD.md / .csv 當歷史紀錄，並commit回repo。
+# 同一批訊號產生兩個清單：個股期貨清單(期貨流動性夠的才列，資料來自期交所)、現股清單(固定金額買現股，參考用)。
+# Telegram每天送兩則：signals/telegram_futures.txt(期貨，主要)、signals/telegram_stock.txt(現股)。
+# 期交所資料的原始回應/解析報告在 signals/debug/(每天覆寫，也會commit、也在artifact裡)，第一次跑完請檢查。
 #
 # 排程注意事項：
 #  - GitHub的cron一律是UTC。"0 11 * * 1-5" = 週一~週五 UTC 11:00 = 台北時間 19:00(台灣沒有夏令時間)。
@@ -37,6 +40,19 @@ on:
           - '2'
         required: false
         default: '1'
+      # 兩個清單的參數(排程沒有inputs，一律用下面Scan signals步驟裡的預設值)。
+      stock_amount:
+        description: '現股清單：每筆固定金額(新台幣，可零股)'
+        required: false
+        default: '100000'
+      fut_min_volume:
+        description: '期貨清單：實際交易契約5日平均成交量下限(口，全部月份+一般/盤後加總)'
+        required: false
+        default: '100'
+      fut_min_oi:
+        description: '期貨清單：近月未平倉下限(口)'
+        required: false
+        default: '300'
 
 permissions:
   contents: write
@@ -65,7 +81,7 @@ jobs:
 
       # 只跑掃描器自己的測試當開跑前檢查(包含「跟回測逐日一致」的比對)，不跑整套測試，保持快速。
       - name: Pre-flight test
-        run: python -m pytest -q test_daily_squeeze_signals.py
+        run: python -m pytest -q test_daily_squeeze_signals.py test_taifex_futures_loader.py
 
       # 不使用 actions/cache：掃描器每次都強制重新下載(refresh)，避免讀到資料還沒更新時的舊快取。
       - name: Scan signals
@@ -74,9 +90,13 @@ jobs:
           CAPITAL: ${{ github.event.inputs.capital }}
           # 排程執行時github.event.inputs是空的 → 用1(同時最多1檔)。長期改2檔時這裡的 '1' 也要改成 '2'。
           POSITIONS: ${{ github.event.inputs.positions || '1' }}
+          STOCK_AMOUNT: ${{ github.event.inputs.stock_amount || '100000' }}
+          FUT_MIN_VOLUME: ${{ github.event.inputs.fut_min_volume || '100' }}
+          FUT_MIN_OI: ${{ github.event.inputs.fut_min_oi || '300' }}
           SIGNALS_LINK: ${{ github.server_url }}/${{ github.repository }}/blob/${{ github.ref_name }}/signals/latest.md
         run: |
           ARGS="--output-dir signals --positions ${POSITIONS:-1}"
+          ARGS="$ARGS --stock-amount ${STOCK_AMOUNT:-100000} --fut-min-volume ${FUT_MIN_VOLUME:-100} --fut-min-oi ${FUT_MIN_OI:-300}"
           if [ -n "$AS_OF" ]; then
             ARGS="$ARGS --as-of $AS_OF"
           fi
@@ -89,7 +109,8 @@ jobs:
       #   TELEGRAM_BOT_TOKEN(@BotFather給的機器人金鑰)、TELEGRAM_CHAT_ID(你的聊天ID)。
       # 沒設定時這一步直接略過，不影響掃描本身。訊息用純文字送出(不設parse_mode)，避免特殊字元出錯。
       # 放在commit之前：就算之後commit/push失敗，推播一樣已經送出。
-      - name: Send Telegram message
+      # 每天兩則：先送期貨清單(主要)，再送現股清單。其中一則失敗，另一則照送；這一步標紅但不讓整個job失敗。
+      - name: Send Telegram messages
         continue-on-error: true
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
@@ -99,17 +120,27 @@ jobs:
             echo "沒有設定TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID，略過Telegram推播"
             exit 0
           fi
-          RESP=$(curl -sS -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
-            --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
-            --data-urlencode "text@signals/telegram.txt" \
-            --data-urlencode "disable_web_page_preview=true")
-          if echo "$RESP" | grep -q '"ok":true'; then
-            echo "Telegram推播成功"
-          else
-            echo "Telegram推播失敗(Telegram回應)：$RESP"
-            exit 1
-          fi
+          FAILED=0
+          for f in signals/telegram_futures.txt signals/telegram_stock.txt; do
+            if [ ! -s "$f" ]; then
+              echo "找不到 $f 或是空的，略過"
+              FAILED=1
+              continue
+            fi
+            RESP=$(curl -sS -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+              --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
+              --data-urlencode "text@${f}" \
+              --data-urlencode "disable_web_page_preview=true") || true
+            if echo "$RESP" | grep -q '"ok":true'; then
+              echo "Telegram推播成功：$f"
+            else
+              echo "Telegram推播失敗($f，Telegram回應)：$RESP"
+              FAILED=1
+            fi
+          done
+          exit $FAILED
 
+      # signals/debug/(期交所原始回應前200行 + parse_report.json，每天覆寫、很小)也一起commit，方便檢查真實格式。
       - name: Commit signals back to repo
         env:
           AS_OF: ${{ github.event.inputs.as_of }}
