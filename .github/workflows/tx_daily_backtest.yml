@@ -1,0 +1,80 @@
+name: 台指期日線策略 預先登記測試(basic=8變體 / grid=1872變體網格，訓練2001-2012/測試2013-2023/近期指數代理)
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: '模式：basic(既有8變體，預設)/grid(12訊號+66混搭 × 動能門檻有無 × 12出場 = 1872變體，含過度擬合診斷)'
+        required: false
+        type: choice
+        options:
+          - basic
+          - grid
+        default: basic
+      contract:
+        description: '契約：mini(小台MTX，NT$50/點，預設)/big(大台TX，NT$200/點)'
+        required: false
+        type: choice
+        options:
+          - mini
+          - big
+        default: mini
+      commission_per_side:
+        description: '手續費(每口每邊，新台幣)'
+        required: false
+        default: '50'
+      refresh_data:
+        description: '強制重新下載Google Drive分鐘資料與加權指數(忽略快取)'
+        required: false
+        type: boolean
+        default: false
+
+jobs:
+  backtest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Restore Google Drive history cache (keyed on Drive file ids)
+        uses: actions/cache@v4
+        with:
+          path: taifex_history_cache
+          # key裡直接寫三個Drive檔案ID(2001_2010/2011_2020/2021_2023)：檔案換了ID才會重新下載
+          key: tx-history-raw-v1-1762OrBEo7q5B6YgM2DqXKY0J2ykIxBsw-1lsam29dX2n8oPOP25SfyZIgeMJAGKpeK-1VOqnu11Tarn1IVZrO6Y6sdX7_YwG1ZEP
+
+      - name: 單元測試(先確認資料/引擎/比較邏輯沒壞，再花時間下載真實資料)
+        run: |
+          python -m pytest -q test_tx_daily_engine.py test_tx_daily_data.py test_compare_tx_daily.py test_tx_daily_grid.py
+
+      - name: Run TX daily pre-registered test
+        timeout-minutes: 75
+        run: |
+          ARGS="--contract ${{ github.event.inputs.contract }}"
+          ARGS="$ARGS --commission-per-side ${{ github.event.inputs.commission_per_side }}"
+          if [ "${{ github.event.inputs.refresh_data }}" = "true" ]; then
+            ARGS="$ARGS --refresh-data"
+          fi
+          if [ "${{ github.event.inputs.mode }}" = "grid" ]; then
+            ARGS="$ARGS --grid"
+          fi
+          python compare_tx_daily.py $ARGS
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tx-daily-backtest-results
+          path: results_tx_daily/
+          if-no-files-found: warn
