@@ -1,0 +1,169 @@
+name: 強勢股(領頭股突破)每日訊號(收盤後，紙上交易)
+
+# leader_signal.py：使用者在 leader_breakout 回測後選定的變體 E_D｜X2｜K3｜無濾網(2026-10凍結，不調參數)。
+# 這是「紙上交易帳戶」：從 2026-10-12 起、起始資金 NT$200,000(手動執行可改 capital)，
+# 每次執行都從 2026-10-12 空手重播到今天(跟回測同一支模擬函式)，沒有會被改寫的狀態檔。
+# 輸出(commit回repo)：signals/leader_latest.md(完整版)、signals/telegram_leader.txt(Telegram純文字)、
+#   signals/leader_history/YYYY-MM-DD.md、signals/leader_paper_log.csv(每天一列)、signals/leader_trades_paper.csv(已平倉)。
+#
+# 排程注意事項：
+#  - GitHub的cron一律是UTC。"20 11 * * 1-5" = 週一~週五 UTC 11:20 = 台北時間 19:20(台灣沒有夏令時間)。
+#    比擠壓+KDJ每日訊號(19:00)晚20分鐘，兩個workflow都會commit到 signals/，所以commit步驟會 git pull --rebase 並重試。
+#  - GitHub排程常常延遲(幾分鐘到一小時以上)，偶爾會漏跑；早上看到 leader_latest.md 的日期不是上一個交易日，
+#    請到Actions頁面按 Run workflow 手動補跑(as_of 留空 = 今天)。
+#  - 國定假日也會照跑：沒有新K棒 → 報告最上面「⚠️ 資料還沒更新」，不給買進指示，忽略即可。
+#  - 排程只會在預設分支上執行；這個檔案合併進預設分支後才會開始自動跑。
+#  - 第一次跑(沒有快取)要抓約16個月的月營收(每頁間隔2秒)+約2,000檔股價，大約15~25分鐘；之後月營收讀快取(最近2個月一律重抓)。
+
+on:
+  schedule:
+    - cron: "20 11 * * 1-5"
+  workflow_dispatch:
+    inputs:
+      as_of:
+        description: '訊號日(YYYY-MM-DD)，留空=今天(台北時間)；用來回補或測試某一天'
+        required: false
+        default: ''
+      capital:
+        description: '紙上帳戶起始資金(新台幣)'
+        required: false
+        default: '200000'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: leader-daily-signal
+  cancel-in-progress: false
+
+jobs:
+  signal:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      # 只跑這支訊號自己的測試(全部合成資料，含「跟回測逐筆一致」的比對)，保持快速。
+      - name: Pre-flight test
+        run: python -m pytest -q test_leader_signal.py
+
+      - name: 計算快取月份(台北時間)
+        id: date
+        run: echo "month=$(TZ=Asia/Taipei date +%Y-%m)" >> "$GITHUB_OUTPUT"
+
+      # 快取：月營收(過去月份)+股票清單(檔名含月份，每月重抓一次)。股價不快取，每次重新下載。
+      - name: Restore data cache
+        uses: actions/cache/restore@v4
+        with:
+          path: leader_signal_cache
+          key: leader-signal-${{ steps.date.outputs.month }}-${{ github.run_id }}
+          restore-keys: |
+            leader-signal-${{ steps.date.outputs.month }}-
+            leader-signal-
+
+      # continue-on-error：失敗時後面仍會送Telegram「產生失敗」通知、上傳artifact，最後一步再把job標成失敗。
+      # 先刪掉舊的 telegram_leader.txt(signals/有commit進repo)，避免失敗時誤送前一天的內容。
+      - name: Run leader signal
+        id: run
+        continue-on-error: true
+        timeout-minutes: 40
+        env:
+          AS_OF: ${{ github.event.inputs.as_of }}
+          CAPITAL: ${{ github.event.inputs.capital }}
+          LEADER_SIGNALS_LINK: ${{ github.server_url }}/${{ github.repository }}/blob/${{ github.ref_name }}/signals/leader_latest.md
+        run: |
+          rm -f signals/telegram_leader.txt
+          ARGS="--output-dir signals --cache-dir leader_signal_cache --debug-dir leader_signal_debug --capital ${CAPITAL:-200000}"
+          if [ -n "$AS_OF" ]; then
+            ARGS="$ARGS --as-of $AS_OF"
+          fi
+          echo "參數：$ARGS"
+          python leader_signal.py $ARGS
+
+      - name: Save data cache
+        if: ${{ always() && hashFiles('leader_signal_cache/**') != '' }}
+        uses: actions/cache/save@v4
+        with:
+          path: leader_signal_cache
+          key: leader-signal-${{ steps.date.outputs.month }}-${{ github.run_id }}
+
+      # Telegram推播：跟擠壓+KDJ每日訊號共用 secrets TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID；沒設定就略過。
+      # 純文字送出(不設parse_mode)。訊號步驟失敗或沒產生 telegram_leader.txt → 改送「強勢股訊號產生失敗，請看Actions紀錄」。
+      - name: Send Telegram message
+        continue-on-error: true
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          RUN_OUTCOME: ${{ steps.run.outcome }}
+        run: |
+          if [ -z "$TELEGRAM_BOT_TOKEN" ] || [ -z "$TELEGRAM_CHAT_ID" ]; then
+            echo "沒有設定TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID，略過Telegram推播"
+            exit 0
+          fi
+          f=signals/telegram_leader.txt
+          if [ "$RUN_OUTCOME" != "success" ] || [ ! -s "$f" ]; then
+            echo "強勢股訊號步驟結果：${RUN_OUTCOME:-未知}，改送失敗通知"
+            TEXT_ARG="text=強勢股訊號產生失敗，請看Actions紀錄"
+          else
+            TEXT_ARG="text@${f}"
+          fi
+          RESP=$(curl -sS -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
+            --data-urlencode "${TEXT_ARG}" \
+            --data-urlencode "disable_web_page_preview=true") || true
+          if echo "$RESP" | grep -q '"ok":true'; then
+            echo "Telegram推播成功"
+          else
+            echo "Telegram推播失敗(Telegram回應)：$RESP"
+            exit 1
+          fi
+
+      # 只commit leader_* 這幾個檔案；擠壓+KDJ workflow 也會commit signals/ → pull --rebase 後重試。
+      - name: Commit signals back to repo
+        if: ${{ steps.run.outcome == 'success' }}
+        env:
+          AS_OF: ${{ github.event.inputs.as_of }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add signals/leader_latest.md signals/telegram_leader.txt signals/leader_history/ \
+            signals/leader_paper_log.csv signals/leader_trades_paper.csv
+          if git diff --cached --quiet; then
+            echo "leader訊號檔沒有變更，不commit"
+            exit 0
+          fi
+          git commit -m "強勢股每日訊號 ${AS_OF:-$(TZ=Asia/Taipei date +%F)}"
+          for i in 1 2 3 4 5; do
+            git pull --rebase origin "${GITHUB_REF_NAME}" && git push origin "HEAD:${GITHUB_REF_NAME}" && exit 0
+            echo "push失敗，第${i}次重試 ..."
+            sleep $((5 * i))
+          done
+          exit 1
+
+      - name: Upload signals
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: leader-daily-signal
+          path: |
+            signals/leader_*
+            signals/telegram_leader.txt
+            leader_signal_debug/
+          if-no-files-found: warn
+
+      - name: Mark failure
+        if: ${{ steps.run.outcome != 'success' }}
+        run: |
+          echo "強勢股訊號產生失敗(上面 Run leader signal 步驟)，請看紀錄"
+          exit 1
