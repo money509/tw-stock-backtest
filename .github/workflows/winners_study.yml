@@ -1,0 +1,119 @@
+name: 大漲股共同點研究(描述性，最近兩年/歷史區間)
+
+# winners_study.py：上市+上櫃全部普通股，找出區間內漲1倍/2倍的股票，
+# 分析起點當下(point-in-time)的特徵lift(技術面/籌碼面/基本面/產業，含雙條件組合與洗牌基準)、
+# 贏家的上漲路徑、幾個事先登錄的簡單規則能抓到多少。
+# 籌碼(三大法人/融資融券/外資持股)、估值、季財報只抓起點需要的日期(約120次請求，每次間隔3秒)，
+# 任何一個來源失敗都不會中斷，summary最上面【資料來源狀態】會列出來。
+# 這是描述性研究，不是選股建議；「最近兩年」就是被研究的那段行情(樣本內)，
+# 請用 window 選 2022-2023 / 2020-2021 / 2018-2019 重跑，在不同區間都站得住的結論才有參考價值。
+# 第一次跑完請下載 artifact，檢查 results_winners/debug/ 裡的
+#   universe_report.txt(ISIN清單解析)、revenue_parse_report.csv / mops_sample_*.html(月營收解析)、price_failures.csv、
+#   extra_report.csv / extra_sample_*(籌碼、估值、季財報的原始回應與解析結果；TPEx與MOPS季報格式是推測的)。
+
+on:
+  workflow_dispatch:
+    inputs:
+      window:
+        description: '研究區間：最近兩年 / 2022-2023 / 2020-2021 / 2018-2019(下面start/end有填就以start/end為準)'
+        type: choice
+        options:
+          - '最近兩年'
+          - '2022-2023'
+          - '2020-2021'
+          - '2018-2019'
+        required: false
+        default: '最近兩年'
+      start:
+        description: '自訂區間起點(YYYY-MM-DD)，留空=依window(最近兩年=end往前2年)'
+        required: false
+        default: ''
+      end:
+        description: '自訂區間終點(YYYY-MM-DD)，留空=依window(最近兩年=最新資料)'
+        required: false
+        default: ''
+      refresh_data:
+        description: '忽略快取、全部重新下載(股票清單/股價/月營收)'
+        type: boolean
+        required: false
+        default: false
+
+jobs:
+  study:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      # 研究本身的測試(全部是合成資料)先跑，沒過就不下載資料。
+      - name: Pre-flight test
+        run: python -m pytest -q test_winners_study.py test_winners_extra.py
+
+      - name: 計算快取日期(台北時間)
+        id: date
+        run: echo "today=$(TZ=Asia/Taipei date +%F)" >> "$GITHUB_OUTPUT"
+
+      # 快取依日期區分；refresh_data=true 時不還原快取(程式也會加 --refresh)。
+      - name: Restore data cache
+        if: ${{ github.event.inputs.refresh_data != 'true' }}
+        uses: actions/cache/restore@v4
+        with:
+          path: winners_cache
+          key: winners-data-${{ steps.date.outputs.today }}-${{ github.run_id }}
+          restore-keys: |
+            winners-data-${{ steps.date.outputs.today }}-
+            winners-data-
+
+      - name: Run winners study
+        timeout-minutes: 80
+        env:
+          WINDOW: ${{ github.event.inputs.window }}
+          START: ${{ github.event.inputs.start }}
+          END: ${{ github.event.inputs.end }}
+          REFRESH: ${{ github.event.inputs.refresh_data }}
+        run: |
+          case "$WINDOW" in
+            "2022-2023") S="2022-01-01"; E="2023-12-31" ;;
+            "2020-2021") S="2020-01-01"; E="2021-12-31" ;;
+            "2018-2019") S="2018-01-01"; E="2019-12-31" ;;
+            *) S=""; E="" ;;
+          esac
+          if [ -n "$START" ]; then S="$START"; fi
+          if [ -n "$END" ]; then E="$END"; fi
+          ARGS="--output-dir results_winners --cache-dir winners_cache"
+          if [ -n "$S" ]; then
+            ARGS="$ARGS --start $S"
+          fi
+          if [ -n "$E" ]; then
+            ARGS="$ARGS --end $E"
+          fi
+          if [ "$REFRESH" = "true" ]; then
+            ARGS="$ARGS --refresh"
+          fi
+          echo "參數：$ARGS"
+          python winners_study.py $ARGS
+
+      - name: Save data cache
+        if: ${{ always() && hashFiles('winners_cache/**') != '' }}
+        uses: actions/cache/save@v4
+        with:
+          path: winners_cache
+          key: winners-data-${{ steps.date.outputs.today }}-${{ github.run_id }}
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: winners-study-results
+          path: results_winners/
