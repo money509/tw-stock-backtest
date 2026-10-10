@@ -1,0 +1,89 @@
+name: 領頭股突破(投資組合回測，2018-最新)
+
+# leader_breakout.py：把「大漲股共同點研究」的發現變成有資金限制的投資組合回測
+# (預設NT$200,000、現金帳戶、可買零股、最多同時持有K=1或3檔)，2018-01-01 到最新。
+# 事先登錄 38 個變體(4種突破進場×2出場×2K×大盤濾網有無 + 大跌後買領頭股E_CRASH×2出場×2K + 成交金額排序對照組)，
+# 全期與 2018-2019 / 2020-2021 / 2022-2023 / 2024-最新 四段分別報告，並列出事先登錄的PASS檢查。
+# 資料沿用 winners_study.py 的下載器：ISIN股票清單、yfinance股價(2016-06起，252日暖機)、MOPS月營收(2016-06起，PIT)、^TWII、0050。
+# ⚠️ 只有目前仍上市櫃的股票(存活者偏誤)；2024-最新是winners研究過的行情(樣本內)。
+# 第一次跑(沒有快取)要抓約 2,000 檔股價 + 約 500 頁月營收(每頁間隔2秒)，大約 40~60 分鐘；之後讀快取。
+# 跑完請下載 artifact，看 results_leader/summary_leader.txt，以及 debug/ 裡的
+#   universe_report.txt、price_failures.csv、revenue_parse_report.csv(資料是否完整)。
+
+on:
+  workflow_dispatch:
+    inputs:
+      capital:
+        description: '起始資金(新台幣)'
+        required: false
+        default: '200000'
+      refresh_data:
+        description: '忽略快取、全部重新下載(股票清單/股價/月營收)'
+        type: boolean
+        required: false
+        default: false
+
+jobs:
+  backtest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      # 回測本身的測試(全部是合成資料)先跑，沒過就不下載資料。
+      - name: Pre-flight test
+        run: python -m pytest -q test_leader_breakout.py
+
+      - name: 計算快取日期(台北時間)
+        id: date
+        run: echo "today=$(TZ=Asia/Taipei date +%F)" >> "$GITHUB_OUTPUT"
+
+      # 快取依日期區分；refresh_data=true 時不還原快取(程式也會加 --refresh)。
+      - name: Restore data cache
+        if: ${{ github.event.inputs.refresh_data != 'true' }}
+        uses: actions/cache/restore@v4
+        with:
+          path: leader_cache
+          key: leader-data-${{ steps.date.outputs.today }}-${{ github.run_id }}
+          restore-keys: |
+            leader-data-${{ steps.date.outputs.today }}-
+            leader-data-
+
+      - name: Run leader breakout backtest
+        timeout-minutes: 110
+        env:
+          CAPITAL: ${{ github.event.inputs.capital }}
+          REFRESH: ${{ github.event.inputs.refresh_data }}
+        run: |
+          C="${CAPITAL:-200000}"
+          ARGS="--output-dir results_leader --cache-dir leader_cache --start 2018-01-01 --capital $C"
+          if [ "$REFRESH" = "true" ]; then
+            ARGS="$ARGS --refresh"
+          fi
+          echo "參數：$ARGS"
+          python leader_breakout.py $ARGS
+
+      - name: Save data cache
+        if: ${{ always() && hashFiles('leader_cache/**') != '' }}
+        uses: actions/cache/save@v4
+        with:
+          path: leader_cache
+          key: leader-data-${{ steps.date.outputs.today }}-${{ github.run_id }}
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: leader-breakout-results
+          path: results_leader/
