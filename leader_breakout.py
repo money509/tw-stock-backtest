@@ -332,7 +332,7 @@ def rank_order(cols: np.ndarray, primary: np.ndarray, secondary: np.ndarray) -> 
 
 
 def simulate_portfolio(P: dict, sig: np.ndarray, i0: int, i1: int, exit_kind: str, k: int,
-                       capital: float = DEFAULT_CAPITAL, rank: str = "RS") -> dict:
+                       capital: float = DEFAULT_CAPITAL, rank: str = "RS", state_out: dict = None) -> dict:
     """
     日迴圈(只在[i0, i1])：
       開盤：(1)前一天收盤跌破MA60的部位以開盤價出場；(2)開盤已低於停損 → 開盤價出場(跳空)；
@@ -341,6 +341,9 @@ def simulate_portfolio(P: dict, sig: np.ndarray, i0: int, i1: int, exit_kind: st
       收盤：更新最高收盤/移動停損(隔天生效)、X3檢查、以收盤(沒有成交就用最近收盤)計算權益；
             產生今天的訊號(只在 t < i1)。
     權益 = 現金 + Σ股數×收盤(不扣未來賣出成本)。訊號日權益(=進場前一天收盤)拿來算部位大小。
+    state_out(選配，給每日實盤訊號 leader_signal.py 用)：傳入dict時，填入最後一天(i1)收盤後的狀態
+    {positions(還沒平倉的部位，含隔天要用的停損)、pending(i1收盤的訊號依排序，= 隔天開盤要補的候選)、
+    cash、equity}。不影響回傳值與回測結果(期末部位本來就只是估值，沒有強制平倉)。
     """
     A = P["A"]
     o, h, l, c, cff = A["open"], A["high"], A["low"], A["close"], A["close_ff"]
@@ -438,6 +441,7 @@ def simulate_portfolio(P: dict, sig: np.ndarray, i0: int, i1: int, exit_kind: st
             j = p["j"]
             if not valid[t, j]:
                 continue
+            p["stop_before_close"] = p["stop"]
             p["hc"] = max(p["hc"], c[t, j])
             if exit_kind == "X2":
                 p["stop"] = max(p["stop"], p["hc"] * (1 - X2_TRAIL_PCT))
@@ -455,6 +459,12 @@ def simulate_portfolio(P: dict, sig: np.ndarray, i0: int, i1: int, exit_kind: st
             if len(row):
                 cnt["signals"] += len(row)
                 pending = rank_order(row, prim[t, row], sec[t, row])
+    if state_out is not None:
+        row = np.flatnonzero(sig[i1])
+        state_out.update({
+            "positions": [dict(p) for p in positions],
+            "pending": rank_order(row, prim[i1, row], sec[i1, row]) if len(row) else np.array([], dtype=int),
+            "cash": float(cash), "equity": float(eq_prev), "i0": i0, "i1": i1, "k": k})
     open_pos = []
     for p in positions:
         j = p["j"]
